@@ -1,0 +1,59 @@
+[settings]
+base_url = "https://api.cantex.io"
+execution_mode = "sequential"
+max_concurrency = 1
+min_cc_reserve = "5"
+swap_delay_seconds = { min = 20.0, max = 100.0 }
+full_24h_mode = false
+full_24h_min_gap_minutes = 5
+full_24h_auto_restart = false
+full_24h_schedule_log_limit = 12
+random_seed = ""
+telegram_enabled = false
+telegram_bot_token = "env:TELEGRAM_BOT_TOKEN"
+telegram_chat_id = ""
+telegram_update_min_interval_seconds = 5
+telegram_latest_logs_limit = 6
+activity_enabled = false
+activity_items_limit = 5
+dry_run = false
+log_level = "INFO"
+route_mode = "auto"
+default_continue_on_low_balance = false
+max_retries = 3
+retry_base_delay = 5.0
+
+[defaults]
+strategy = "3"
+rounds = { min = 10, max = 15 }
+amounts = { CC = { min = "11", max = "13" }, USDCx = { min = "1.5", max = "1.7" }, CBTC = { min = "0.000023", max = "0.000025" } }
+
+[[accounts]]
+name = "wallet-1"
+enabled = true
+operator_key = "env:CANTEX_OPERATOR_KEY_1"
+trading_key = "env:CANTEX_TRADING_KEY_1"
+proxy_label = "No proxy"
+allow_continue_on_low_balance = false
+auto_create_intent_account = true
+
+[[accounts]]
+name = "wallet-2"
+enabled = true
+operator_key = "env:CANTEX_OPERATOR_KEY_2"
+trading_key = "env:CANTEX_TRADING_KEY_2"
+proxy_label = "No proxy"
+allow_continue_on_low_balance = false
+auto_create_intent_account = true
+
+[[accounts]]
+name = "wallet-3"
+enabled = false
+operator_key = "env:CANTEX_OPERATOR_KEY_3"
+trading_key = "env:CANTEX_TRADING_KEY_3"
+proxy_label = "No proxy"
+strategy = "7"
+rounds = { min = 6, max = 9 }
+amounts = { CC = { min = "7", max = "9" }, USDCx = { min = "7", max = "9" }, CBTC = { min = "0.0003", max = "0.0006" } }
+allow_continue_on_low_balance = true
+auto_create_intent_account = true

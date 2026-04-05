@@ -1,0 +1,40 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and local config (use accounts.example.toml + env vars)
+config/accounts.toml
+.env
+.env.*
+!.env.example
+
+# Local key files referenced by config
+.secrets/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Cursor / local tooling (optional; remove lines if you want these in the repo)
+.cursor/
+mcps/
