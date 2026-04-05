@@ -4,12 +4,12 @@ execution_mode = "sequential"
 max_concurrency = 1
 min_cc_reserve = "5"
 swap_delay_seconds = { min = 20.0, max = 100.0 }
-full_24h_mode = false
+full_24h_mode = true
 full_24h_min_gap_minutes = 5
-full_24h_auto_restart = false
+full_24h_auto_restart = true
 full_24h_schedule_log_limit = 12
 random_seed = ""
-telegram_enabled = false
+telegram_enabled = true
 telegram_bot_token = "env:TELEGRAM_BOT_TOKEN"
 telegram_chat_id = ""
 telegram_update_min_interval_seconds = 5
