@@ -4,6 +4,8 @@ execution_mode = "sequential"
 max_concurrency = 1
 min_cc_reserve = "5"
 swap_delay_seconds = { min = 20.0, max = 100.0 }
+max_network_fee_cc_per_execution = "0.12"
+network_fee_poll_seconds = 30
 full_24h_mode = true
 full_24h_min_gap_minutes = 5
 full_24h_auto_restart = true
@@ -19,13 +21,13 @@ activity_items_limit = 5
 dry_run = false
 log_level = "INFO"
 route_mode = "auto"
-default_continue_on_low_balance = false
+default_continue_on_low_balance = true
 max_retries = 3
 retry_base_delay = 5.0
 
 [defaults]
-strategy = "3"
-rounds = { min = 10, max = 15 }
+strategy = "7"
+rounds = { min = 70, max = 72 }
 amounts = { CC = { min = "11", max = "13" }, USDCx = { min = "1.5", max = "1.7" }, CBTC = { min = "0.000023", max = "0.000025" } }
 
 [[accounts]]
@@ -34,7 +36,6 @@ enabled = true
 operator_key = "env:CANTEX_OPERATOR_KEY_1"
 trading_key = "env:CANTEX_TRADING_KEY_1"
 proxy_label = "No proxy"
-allow_continue_on_low_balance = false
 auto_create_intent_account = true
 
 [[accounts]]

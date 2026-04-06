@@ -35,6 +35,8 @@ class TelegramCardState:
     current_round_number: int = 0
     phase: str = "STARTING"
     balances: dict[str, Decimal] = field(default_factory=dict)
+    total_network_fee: dict[str, Decimal] = field(default_factory=dict)
+    total_swap_fee: dict[str, Decimal] = field(default_factory=dict)
     swap_transactions: int = 0
     pair_completed: dict[str, int] = field(default_factory=dict)
     activity_summary: ActivitySummary | None = None
@@ -138,6 +140,20 @@ class TelegramMonitor:
         if card is None:
             return
         card.balances.update(balances)
+        await self._publish(card, force=force)
+
+    async def update_fee_totals(
+        self,
+        card: TelegramCardState | None,
+        *,
+        total_network_fee: dict[str, Decimal],
+        total_swap_fee: dict[str, Decimal],
+        force: bool = False,
+    ) -> None:
+        if card is None:
+            return
+        card.total_network_fee = dict(total_network_fee)
+        card.total_swap_fee = dict(total_swap_fee)
         await self._publish(card, force=force)
 
     async def record_round_completed(
@@ -250,6 +266,7 @@ class TelegramMonitor:
             f"Status: {html.escape(self._build_status_line(card))}",
             f"Uptime: {html.escape(self._format_duration(datetime.now(timezone.utc) - card.session_started_utc))}",
             html.escape(self._build_balances_line(card)),
+            html.escape(self._build_fee_line(card)),
             html.escape(self._build_swaps_line(card)),
             f"Proxy: {html.escape(card.proxy_label)}",
             html.escape(self._build_reward_line(card)),
@@ -278,6 +295,14 @@ class TelegramMonitor:
         usdcx = self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 4)
         cbtc = self._fmt_balance(card.balances.get("CBTC", Decimal("0")), 8)
         return f"CC: {cc} | USDCx: {usdcx} | CBTC: {cbtc}"
+
+    def _build_fee_line(self, card: TelegramCardState) -> str:
+        total_fee = self._merge_amount_maps(card.total_network_fee, card.total_swap_fee)
+        return (
+            f"Fee Total: net={self._format_amount_map(card.total_network_fee)} | "
+            f"swap={self._format_amount_map(card.total_swap_fee)} | "
+            f"total={self._format_amount_map(total_fee)}"
+        )
 
     def _build_swaps_line(self, card: TelegramCardState) -> str:
         parts = [f"Swaps: Total: {card.swap_transactions}"]
@@ -378,3 +403,19 @@ class TelegramMonitor:
         if len(text) <= 3900:
             return text
         return text[:3600] + "\n<i>Message trimmed</i>"
+
+    def _format_amount_map(self, values: dict[str, Decimal]) -> str:
+        if not values:
+            return "-"
+        return ", ".join(f"{symbol}={amount}" for symbol, amount in sorted(values.items()))
+
+    def _merge_amount_maps(
+        self,
+        left: dict[str, Decimal],
+        right: dict[str, Decimal],
+    ) -> dict[str, Decimal]:
+        merged: dict[str, Decimal] = {}
+        for source in (left, right):
+            for symbol, amount in source.items():
+                merged[symbol] = merged.get(symbol, Decimal("0")) + amount
+        return merged

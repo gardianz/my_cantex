@@ -27,6 +27,9 @@ python run_bot.py --config config\accounts.toml
 - Account tetap bisa override nilai dari `[defaults]` secara per-account bila diperlukan.
 - `full_24h_mode = true` akan mengaktifkan sesi scheduler 24 jam penuh berbasis UTC untuk semua account aktif.
 - Saat `full_24h_mode = true`, `swap_delay_seconds` diabaikan sepenuhnya.
+- `max_network_fee_cc_per_execution` membatasi network fee per round dalam satuan `CC`. Jika estimasi fee saat itu lebih tinggi, bot akan menunggu sampai fee turun.
+- `network_fee_poll_seconds` mengatur interval cek ulang fee saat bot sedang menunggu network fee turun.
+- `max_retries` dan `retry_base_delay` juga dipakai untuk retry swap hop di level bot. Jika seluruh retry gagal, round tersebut di-skip.
 - `full_24h_min_gap_minutes` mengatur jarak minimum antar jadwal swap dalam mode 24 jam agar pola tidak terlalu rapat.
 - `full_24h_auto_restart = true` akan memulai sesi 24 jam berikutnya otomatis setelah sesi sebelumnya selesai. Cocok untuk VPS yang ingin jalan terus.
 - `full_24h_schedule_log_limit` membatasi berapa banyak item jadwal random yang ditampilkan di log agar tidak terlalu panjang.
@@ -36,6 +39,7 @@ python run_bot.py --config config\accounts.toml
 - `telegram_chat_id` adalah chat / group / channel ID tujuan monitor.
 - `telegram_update_min_interval_seconds` membatasi frekuensi edit pesan agar tidak kena rate limit Telegram.
 - `telegram_latest_logs_limit` menentukan jumlah log terbaru yang disimpan di kartu Telegram.
+- Kegagalan swap hop sekarang akan dicoba ulang sampai batas `max_retries`. Jika masih gagal, round itu di-skip dan account lanjut ke round berikutnya.
 - `strategy` menerima nilai `1-9`. Mapping strateginya:
 - `1`: `CC -> USDCx`
 - `2`: `USDCx -> CC`

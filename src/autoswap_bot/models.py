@@ -93,12 +93,14 @@ class AccountResult:
     strategy_label: str
     requested_rounds: int
     completed_rounds: int = 0
+    skipped_rounds: int = 0
     swap_transactions: int = 0
     aborted: bool = False
     error: str | None = None
     stop_reason: str | None = None
     estimated_network_fee_by_symbol: dict[str, Decimal] = field(default_factory=dict)
     used_network_fee_by_symbol: dict[str, Decimal] = field(default_factory=dict)
+    used_swap_fee_by_symbol: dict[str, Decimal] = field(default_factory=dict)
     final_balances: dict[str, Decimal] = field(default_factory=dict)
     activity_summary: ActivitySummary | None = None
 

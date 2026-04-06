@@ -167,6 +167,8 @@ class RuntimeConfig:
     max_concurrency: int
     min_cc_reserve: Decimal
     swap_delay_seconds_range: FloatRange
+    max_network_fee_cc_per_execution: Decimal | None
+    network_fee_poll_seconds: float
     full_24h_mode: bool
     full_24h_min_gap_minutes: float
     full_24h_auto_restart: bool
@@ -268,6 +270,15 @@ def load_config(path: str | Path) -> BotConfig:
             settings.get("swap_delay_seconds", 2.0),
             "settings.swap_delay_seconds",
         ),
+        max_network_fee_cc_per_execution=(
+            _to_decimal(
+                settings.get("max_network_fee_cc_per_execution"),
+                "settings.max_network_fee_cc_per_execution",
+            )
+            if settings.get("max_network_fee_cc_per_execution") not in {None, ""}
+            else None
+        ),
+        network_fee_poll_seconds=float(settings.get("network_fee_poll_seconds", 30.0)),
         full_24h_mode=bool(settings.get("full_24h_mode", False)),
         full_24h_min_gap_minutes=float(settings.get("full_24h_min_gap_minutes", 5.0)),
         full_24h_auto_restart=bool(settings.get("full_24h_auto_restart", False)),
@@ -317,6 +328,13 @@ def load_config(path: str | Path) -> BotConfig:
         raise ValueError("settings.max_concurrency minimal 1")
     if runtime.activity_items_limit < 1:
         raise ValueError("settings.activity_items_limit minimal 1")
+    if (
+        runtime.max_network_fee_cc_per_execution is not None
+        and runtime.max_network_fee_cc_per_execution <= 0
+    ):
+        raise ValueError("settings.max_network_fee_cc_per_execution harus > 0")
+    if runtime.network_fee_poll_seconds <= 0:
+        raise ValueError("settings.network_fee_poll_seconds harus > 0")
     if runtime.full_24h_min_gap_minutes < 0:
         raise ValueError("settings.full_24h_min_gap_minutes tidak boleh negatif")
     if runtime.full_24h_schedule_log_limit < 1:
