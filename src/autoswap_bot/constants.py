@@ -6,6 +6,7 @@ from decimal import Decimal
 CC_SYMBOL = "CC"
 TRACKED_SYMBOLS = ("CC", "USDCx", "CBTC")
 DEFAULT_MIN_CC_RESERVE = Decimal("5")
+MIN_TICKET_SIZE_CC = Decimal("10")
 DUST_BY_SYMBOL = {
     "CC": Decimal("0.000001"),
     "USDCx": Decimal("0.000001"),

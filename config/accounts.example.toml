@@ -13,7 +13,7 @@ full_24h_schedule_log_limit = 12
 random_seed = ""
 telegram_enabled = true
 telegram_bot_token = "env:TELEGRAM_BOT_TOKEN"
-telegram_chat_id = ""
+telegram_chat_id = "env:TELEGRAM_CHAT_ID"
 telegram_update_min_interval_seconds = 5
 telegram_latest_logs_limit = 6
 activity_enabled = false
@@ -36,6 +36,7 @@ enabled = true
 operator_key = "env:CANTEX_OPERATOR_KEY_1"
 trading_key = "env:CANTEX_TRADING_KEY_1"
 proxy_label = "No proxy"
+allow_continue_on_low_balance = true
 auto_create_intent_account = true
 
 [[accounts]]
@@ -44,7 +45,7 @@ enabled = true
 operator_key = "env:CANTEX_OPERATOR_KEY_2"
 trading_key = "env:CANTEX_TRADING_KEY_2"
 proxy_label = "No proxy"
-allow_continue_on_low_balance = false
+allow_continue_on_low_balance = true
 auto_create_intent_account = true
 
 [[accounts]]

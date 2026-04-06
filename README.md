@@ -36,9 +36,10 @@ Alur umum:
 
 1. Buat virtual environment
 2. Install dependency
-3. Copy config contoh
-4. Isi credential dan pengaturan
-5. Jalankan bot
+3. Copy `.env.example` menjadi `.env`
+4. Copy config contoh
+5. Isi credential dan pengaturan
+6. Jalankan bot
 
 ## Menjalankan di Windows
 
@@ -49,26 +50,25 @@ py -m venv venv
 .\venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 Copy-Item config\accounts.example.toml config\accounts.toml
 ```
 
-Isi config di `config\accounts.toml`, lalu jalankan:
+Isi secret di `.env`, isi pengaturan di `config\accounts.toml`, lalu jalankan:
 
 ```powershell
 py run_bot.py --config config\accounts.toml
 ```
 
-Jika memakai environment variable untuk key:
+Contoh isi `.env`:
 
 ```powershell
-$env:CANTEX_OPERATOR_KEY_1="isi_operator_key"
-$env:CANTEX_TRADING_KEY_1="isi_trading_key"
-```
-
-Jika ingin Telegram:
-
-```powershell
-$env:TELEGRAM_BOT_TOKEN="isi_token_bot"
+TELEGRAM_BOT_TOKEN="isi_token_bot"
+TELEGRAM_CHAT_ID="isi_chat_id"
+CANTEX_OPERATOR_KEY_1="isi_operator_key_1"
+CANTEX_TRADING_KEY_1="isi_trading_key_1"
+CANTEX_OPERATOR_KEY_2="isi_operator_key_2"
+CANTEX_TRADING_KEY_2="isi_trading_key_2"
 ```
 
 ## Menjalankan di VPS Ubuntu
@@ -80,10 +80,11 @@ python3 -m venv venv
 source venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+cp .env.example .env
 cp config/accounts.example.toml config/accounts.toml
 ```
 
-Isi config di `config/accounts.toml`, lalu jalankan:
+Isi secret di `.env`, isi pengaturan di `config/accounts.toml`, lalu jalankan:
 
 ```bash
 python run_bot.py --config config/accounts.toml
@@ -95,13 +96,18 @@ Penting:
 - Command ini salah di Linux: `python run_bot.py --config config\accounts.toml`
 - Command yang benar di Linux: `python run_bot.py --config config/accounts.toml`
 
-Jika memakai environment variable:
+Contoh isi `.env`:
 
 ```bash
-export CANTEX_OPERATOR_KEY_1="isi_operator_key"
-export CANTEX_TRADING_KEY_1="isi_trading_key"
-export TELEGRAM_BOT_TOKEN="isi_token_bot"
+TELEGRAM_BOT_TOKEN="isi_token_bot"
+TELEGRAM_CHAT_ID="isi_chat_id"
+CANTEX_OPERATOR_KEY_1="isi_operator_key_1"
+CANTEX_TRADING_KEY_1="isi_trading_key_1"
+CANTEX_OPERATOR_KEY_2="isi_operator_key_2"
+CANTEX_TRADING_KEY_2="isi_trading_key_2"
 ```
+
+Bot akan otomatis membaca file `.env` dari root project saat start.
 
 ## Format Config
 
@@ -177,6 +183,9 @@ auto_create_intent_account = true
 
 - `telegram_enabled`
   - Jika `true`, bot akan mengirim 1 kartu Telegram per account
+
+- `telegram_chat_id`
+  - Disarankan diisi lewat `.env` dengan `env:TELEGRAM_CHAT_ID`
 
 - `default_continue_on_low_balance`
   - Default perilaku untuk semua account jika balance kurang
@@ -325,6 +334,8 @@ Catatan penting:
 
 - Saat mode 24 jam aktif, account dijalankan paralel di level account
 - Di dalam 1 account, transaksi tetap serial
+- Saat mode 24 jam aktif, bot selalu memaksa perilaku recovery / continue semampunya
+- Jadi `allow_continue_on_low_balance = false` tidak dipakai sebagai stop keras selama mode 24 jam aktif
 
 ## Retry dan Skip Round
 
@@ -336,6 +347,15 @@ Jika swap hop gagal:
 4. Bot lanjut ke round berikutnya
 
 Jadi bot tidak langsung berhenti untuk account hanya karena 1 hop swap gagal.
+
+## Recovery dan Minimum Ticket
+
+- Jika balance aset jual kurang dan mode account mengizinkan recovery, bot akan mencoba recovery aset sisa ke aset target
+- Setelah recovery tx terkirim, bot akan menunggu settlement balance terlebih dahulu sebelum memutuskan langkah berikutnya
+- Jika setelah recovery balance masih belum cukup, round akan di-skip dan account tetap lanjut ke round berikutnya
+- Jika nominal swap berada di bawah minimum ticket size website, bot akan:
+- menaikkan nominal ke minimum jika balance masih memungkinkan
+- atau skip round jika memang tidak cukup untuk memenuhi minimum ticket
 
 ## Telegram Monitor
 
@@ -359,7 +379,7 @@ Contoh config:
 [settings]
 telegram_enabled = true
 telegram_bot_token = "env:TELEGRAM_BOT_TOKEN"
-telegram_chat_id = "-1001234567890"
+telegram_chat_id = "env:TELEGRAM_CHAT_ID"
 telegram_update_min_interval_seconds = 5
 telegram_latest_logs_limit = 6
 ```
@@ -412,6 +432,21 @@ Jika `telegram_enabled = true`, pastikan:
 - `telegram_bot_token` valid
 - `telegram_chat_id` valid
 - environment variable sudah di-set jika memakai format `env:...`
+
+### Menghentikan bot secara manual
+
+Saat bot sedang berjalan, tekan `Ctrl + C`.
+
+Bot akan menampilkan:
+
+```text
+berhenti? (y/n)
+```
+
+Arti pilihan:
+
+- `y`: bot berhenti dengan rapi
+- `n`: bot lanjut jalan
 
 ### Account nonaktif tetap minta private key
 

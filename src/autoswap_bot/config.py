@@ -300,8 +300,13 @@ def load_config(path: str | Path) -> BotConfig:
             else None
         ),
         telegram_chat_id=(
-            str(settings.get("telegram_chat_id")).strip()
-            if telegram_enabled and settings.get("telegram_chat_id") not in {None, ""}
+            _read_optional_secret(
+                settings.get("telegram_chat_id"),
+                settings.get("telegram_chat_id_file"),
+                config_path.parent,
+                "settings.telegram_chat_id",
+            )
+            if telegram_enabled
             else None
         ),
         telegram_update_min_interval_seconds=float(

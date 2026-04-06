@@ -24,7 +24,7 @@ from cantex_sdk import (
 )
 
 from .config import AccountConfig, BotConfig, PreparedAccountRun
-from .constants import CC_SYMBOL, TRACKED_SYMBOLS, dust_for_symbol
+from .constants import CC_SYMBOL, MIN_TICKET_SIZE_CC, TRACKED_SYMBOLS, dust_for_symbol
 from .models import ActivitySummary, AccountPlan, AccountResult, PlanIssue, PlanStep, RouteHop, RoutePlan
 from .routing import RouteOptimizer
 from .sdk_ext import ExtendedCantexSDK
@@ -34,6 +34,10 @@ from .telegram_monitor import TelegramCardState, TelegramMonitor
 class AccountLoggerAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
         return f"[{self.extra['account']}] {msg}", kwargs
+
+
+class StopRequested(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,13 @@ class AutoswapBot:
         self._prompt_lock = asyncio.Lock()
         self._rng = random.Random(self.config.runtime.random_seed)
         self.monitor = TelegramMonitor(self.config.runtime)
+        self._stop_requested = asyncio.Event()
+
+    async def request_stop(self) -> None:
+        self._stop_requested.set()
+
+    def stop_requested(self) -> bool:
+        return self._stop_requested.is_set()
 
     async def run(self) -> list[AccountResult]:
         await self.monitor.start()
@@ -92,6 +103,7 @@ class AutoswapBot:
         last_result: AccountResult | None = None
 
         while True:
+            self._raise_if_stop_requested()
             session_number += 1
             last_result = await self._run_account_session(
                 account=account,
@@ -200,9 +212,15 @@ class AutoswapBot:
                 )
 
                 low_balance_mode: LowBalanceMode = (
-                    "recover" if account.allow_continue_on_low_balance else "stop"
+                    "recover"
+                    if self.config.runtime.full_24h_mode or account.allow_continue_on_low_balance
+                    else "stop"
                 )
-                if not plan.can_fully_execute:
+                if self.config.runtime.full_24h_mode and not plan.can_fully_execute:
+                    logger.warning(
+                        "Mode 24 jam aktif, auto-continue dipaksa walau plan tidak penuh"
+                    )
+                elif not plan.can_fully_execute:
                     prompt_result = await self._handle_short_balance_prompt(logger, plan)
                     if prompt_result == "abort":
                         result.aborted = True
@@ -323,6 +341,17 @@ class AutoswapBot:
                         force=True,
                     )
                     await self.monitor.finalize(monitor_card, phase="FINISHED")
+        except StopRequested:
+            result.aborted = True
+            result.stop_reason = "MANUAL_STOP"
+            result.error = "Dihentikan user"
+            logger.info("Eksekusi dihentikan user")
+            await self.monitor.log_event(
+                monitor_card,
+                "⛔ Stopped by user",
+                force=True,
+            )
+            await self.monitor.finalize(monitor_card, phase="STOPPED_MANUAL")
         except (CantexAuthError, CantexAPIError, CantexTimeoutError) as exc:
             result.error = str(exc)
             logger.error("Eksekusi gagal: %s", exc)
@@ -493,23 +522,34 @@ class AutoswapBot:
                     monitor_card,
                     f"⚠️ Low balance {sell_symbol}, try recovery",
                 )
-                recovered_tx = await self._recover_to_symbol(
+                recovered_tx, balances, recovery_satisfied = await self._recover_until_target_available(
                     sdk=sdk,
                     router=router,
                     target_symbol=sell_symbol,
+                    required_amount=target_amount,
                     logger=logger,
                     monitor_card=monitor_card,
                     used_network_fee=used_network_fee,
                     used_swap_fee=used_swap_fee,
                 )
                 tx_count += recovered_tx
-                info = await sdk.get_account_info()
-                balances = self._balances_by_symbol(info)
                 available_amount = self._spendable_amount(
                     sell_symbol,
                     balances.get(sell_symbol, Decimal("0")),
                     self.config.runtime.min_cc_reserve,
                 )
+                if not recovery_satisfied and available_amount < target_amount:
+                    await self.monitor.log_event(
+                        monitor_card,
+                        f"⏭️ Round {round_index + 1} skipped, recovery not enough for {sell_symbol}",
+                        force=True,
+                    )
+                    return RoundExecutionResult(
+                        completed=False,
+                        tx_count=tx_count,
+                        stop_reason="RECOVERY_NOT_ENOUGH",
+                        skipped=True,
+                    )
             else:
                 logger.warning(
                     "Putaran %s dihentikan karena balance %s (%s) kurang dari target %s",
@@ -547,6 +587,30 @@ class AutoswapBot:
             )
 
         actual_amount = min(target_amount, available_amount)
+        actual_amount, min_ticket_reason = await self._normalize_amount_for_min_ticket(
+            router=router,
+            sell_symbol=sell_symbol,
+            buy_symbol=buy_symbol,
+            desired_amount=actual_amount,
+            max_available_amount=available_amount,
+        )
+        if actual_amount is None:
+            logger.warning(
+                "Putaran %s di-skip karena nominal %s terlalu kecil terhadap minimum ticket",
+                round_index + 1,
+                sell_symbol,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"⏭️ Round {round_index + 1} skipped: {min_ticket_reason}",
+                force=True,
+            )
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason="MIN_TICKET_SIZE",
+                skipped=True,
+            )
         route, issue = await self._prepare_affordable_route(
             router=router,
             balances=balances,
@@ -657,7 +721,7 @@ class AutoswapBot:
         )
 
         for hop_index, hop in enumerate(route.hops, start=1):
-            tx_result = await self._swap_hop_with_retry(
+            tx_result, failure_reason = await self._swap_hop_with_retry(
                 sdk=sdk,
                 hop=hop,
                 hop_index=hop_index,
@@ -669,13 +733,13 @@ class AutoswapBot:
             if tx_result is None:
                 await self.monitor.log_event(
                     monitor_card,
-                    f"⏭️ Round {round_index + 1} skipped after retry limit",
+                    f"⏭️ Round {round_index + 1} skipped: {failure_reason or 'retry limit reached'}",
                     force=True,
                 )
                 return RoundExecutionResult(
                     completed=False,
                     tx_count=tx_count,
-                    stop_reason="SWAP_HOP_FAILED_SKIPPED",
+                    stop_reason=failure_reason or "SWAP_HOP_FAILED_SKIPPED",
                     skipped=True,
                 )
 
@@ -749,6 +813,149 @@ class AutoswapBot:
             tx_count=tx_count,
         )
 
+    async def _recover_until_target_available(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        router: RouteOptimizer,
+        target_symbol: str,
+        required_amount: Decimal,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        used_network_fee: defaultdict[str, Decimal],
+        used_swap_fee: defaultdict[str, Decimal],
+    ) -> tuple[int, dict[str, Decimal], bool]:
+        total_tx = 0
+        last_balances = self._balances_by_symbol(await sdk.get_account_info())
+
+        while True:
+            spendable = self._spendable_amount(
+                target_symbol,
+                last_balances.get(target_symbol, Decimal("0")),
+                self.config.runtime.min_cc_reserve,
+            )
+            if spendable >= required_amount:
+                return total_tx, last_balances, True
+
+            recovered_tx = await self._recover_to_symbol(
+                sdk=sdk,
+                router=router,
+                target_symbol=target_symbol,
+                logger=logger,
+                monitor_card=monitor_card,
+                used_network_fee=used_network_fee,
+                used_swap_fee=used_swap_fee,
+            )
+            total_tx += recovered_tx
+            if recovered_tx <= 0:
+                return total_tx, last_balances, False
+
+            updated_balances = await self._wait_for_balance_settlement(
+                sdk=sdk,
+                target_symbol=target_symbol,
+                previous_balances=last_balances,
+                required_amount=required_amount,
+                logger=logger,
+                monitor_card=monitor_card,
+            )
+            if updated_balances == last_balances:
+                return total_tx, updated_balances, False
+            last_balances = updated_balances
+
+    async def _wait_for_balance_settlement(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        target_symbol: str,
+        previous_balances: dict[str, Decimal],
+        required_amount: Decimal,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+    ) -> dict[str, Decimal]:
+        wait_seconds = max(self.config.runtime.retry_base_delay, 2.0)
+        max_polls = max(3, self.config.runtime.max_retries * 2)
+
+        for poll_index in range(max_polls):
+            self._raise_if_stop_requested()
+            info = await sdk.get_account_info()
+            balances = self._balances_by_symbol(info)
+            previous_amount = previous_balances.get(target_symbol, Decimal("0"))
+            current_amount = balances.get(target_symbol, Decimal("0"))
+            spendable = self._spendable_amount(
+                target_symbol,
+                current_amount,
+                self.config.runtime.min_cc_reserve,
+            )
+            if current_amount > previous_amount or spendable >= required_amount:
+                return balances
+
+            if poll_index < max_polls - 1:
+                logger.info(
+                    "Menunggu settlement recovery %s | poll %s/%s | balance=%s",
+                    target_symbol,
+                    poll_index + 1,
+                    max_polls,
+                    current_amount,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏳ Waiting recovery settlement {target_symbol} ({poll_index + 1}/{max_polls})",
+                )
+                await self._sleep_or_stop(wait_seconds)
+
+        return previous_balances
+
+    async def _normalize_amount_for_min_ticket(
+        self,
+        *,
+        router: RouteOptimizer,
+        sell_symbol: str,
+        buy_symbol: str,
+        desired_amount: Decimal,
+        max_available_amount: Decimal,
+    ) -> tuple[Decimal | None, str | None]:
+        if sell_symbol == CC_SYMBOL:
+            if desired_amount >= MIN_TICKET_SIZE_CC:
+                return desired_amount, None
+            if max_available_amount >= MIN_TICKET_SIZE_CC:
+                return MIN_TICKET_SIZE_CC, "amount adjusted to minimum 10 CC"
+            return None, "amount below minimum ticket size (10 CC equivalent)"
+
+        desired_cc_equivalent = await self._estimate_cc_equivalent(
+            router=router,
+            sell_symbol=sell_symbol,
+            amount=desired_amount,
+        )
+        if desired_cc_equivalent >= MIN_TICKET_SIZE_CC:
+            return desired_amount, None
+
+        available_cc_equivalent = await self._estimate_cc_equivalent(
+            router=router,
+            sell_symbol=sell_symbol,
+            amount=max_available_amount,
+        )
+        if available_cc_equivalent >= MIN_TICKET_SIZE_CC:
+            return max_available_amount, "amount raised to available balance to satisfy minimum ticket"
+
+        return None, "amount below minimum ticket size (10 CC equivalent)"
+
+    async def _estimate_cc_equivalent(
+        self,
+        *,
+        router: RouteOptimizer,
+        sell_symbol: str,
+        amount: Decimal,
+    ) -> Decimal:
+        if sell_symbol == CC_SYMBOL:
+            return amount
+        if amount <= 0:
+            return Decimal("0")
+        try:
+            route = await router.choose_best_route(sell_symbol, CC_SYMBOL, amount)
+        except Exception:
+            return Decimal("0")
+        return route.final_amount
+
     async def _swap_hop_with_retry(
         self,
         *,
@@ -759,16 +966,34 @@ class AutoswapBot:
         round_number: int,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, str | None]:
         max_attempts = max(1, self.config.runtime.max_retries)
         for attempt in range(1, max_attempts + 1):
+            self._raise_if_stop_requested()
             try:
-                return await sdk.swap(
+                return (
+                    await sdk.swap(
                     sell_amount=hop.sell_amount,
                     sell_instrument=hop.raw_quote.sell_instrument,
                     buy_instrument=hop.raw_quote.buy_instrument,
+                    ),
+                    None,
                 )
             except Exception as exc:
+                if self._is_min_ticket_error(exc):
+                    logger.warning(
+                        "Swap hop %s/%s round %s gagal karena minimum ticket size: %s",
+                        hop_index,
+                        hop_total,
+                        round_number,
+                        exc,
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        f"⏭️ Hop {hop_index}/{hop_total} skipped: minimum ticket size",
+                        force=True,
+                    )
+                    return None, "MIN_TICKET_SIZE"
                 logger.warning(
                     "Swap gagal pada hop %s/%s round %s percobaan %s/%s: %s",
                     hop_index,
@@ -784,15 +1009,15 @@ class AutoswapBot:
                         f"❌ Hop {hop_index}/{hop_total} failed after {max_attempts} attempts: {exc}",
                         force=True,
                     )
-                    return None
+                    return None, "SWAP_RETRY_EXHAUSTED"
 
                 wait_seconds = max(self.config.runtime.retry_base_delay, 1.0) * attempt
                 await self.monitor.log_event(
                     monitor_card,
                     f"🔁 Retry hop {hop_index}/{hop_total} attempt {attempt + 1}/{max_attempts} in {int(wait_seconds)}s",
                 )
-                await asyncio.sleep(wait_seconds)
-        return None
+                await self._sleep_or_stop(wait_seconds)
+        return None, "SWAP_RETRY_EXHAUSTED"
 
     async def _wait_for_network_fee_below_cap(
         self,
@@ -813,6 +1038,7 @@ class AutoswapBot:
 
         route = current_route
         while route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0")) > fee_cap:
+            self._raise_if_stop_requested()
             current_fee = route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0"))
             logger.warning(
                 "Round %s menunggu network fee turun | fee=%s CC | batas=%s CC",
@@ -830,7 +1056,7 @@ class AutoswapBot:
                 phase="WAITING_FEE",
                 next_wait_seconds=self.config.runtime.network_fee_poll_seconds,
             )
-            await asyncio.sleep(self.config.runtime.network_fee_poll_seconds)
+            await self._sleep_or_stop(self.config.runtime.network_fee_poll_seconds)
             route, issue = await self._prepare_affordable_route(
                 router=router,
                 balances=balances,
@@ -917,7 +1143,7 @@ class AutoswapBot:
             )
             recovery_failed = False
             for hop_index, hop in enumerate(route.hops, start=1):
-                tx_result = await self._swap_hop_with_retry(
+                tx_result, failure_reason = await self._swap_hop_with_retry(
                     sdk=sdk,
                     hop=hop,
                     hop_index=hop_index,
@@ -930,7 +1156,7 @@ class AutoswapBot:
                     recovery_failed = True
                     await self.monitor.log_event(
                         monitor_card,
-                        f"⏭️ Recovery {source_symbol}->{target_symbol} skipped after retry limit",
+                        f"⏭️ Recovery {source_symbol}->{target_symbol} skipped: {failure_reason or 'retry limit reached'}",
                         force=True,
                     )
                     break
@@ -976,6 +1202,7 @@ class AutoswapBot:
         schedule: tuple[ScheduledRound, ...],
     ) -> None:
         for scheduled_round in schedule:
+            self._raise_if_stop_requested()
             now_utc = datetime.now(timezone.utc)
             if now_utc >= session_end_utc:
                 logger.info(
@@ -1006,7 +1233,7 @@ class AutoswapBot:
                     monitor_card,
                     f"⏳ Next swap in {int(wait_seconds)}s",
                 )
-                await asyncio.sleep(wait_seconds)
+                await self._sleep_or_stop(wait_seconds)
             else:
                 logger.info(
                     "Round %s sudah melewati jadwal %.0f detik, dieksekusi sekarang",
@@ -1056,7 +1283,7 @@ class AutoswapBot:
                 self._format_utc(session_end_utc),
                 remaining_seconds,
             )
-            await asyncio.sleep(remaining_seconds)
+            await self._sleep_or_stop(remaining_seconds)
         logger.info("Sesi 24 jam selesai pada %s UTC", self._format_utc(session_end_utc))
 
     def _build_24h_schedule(
@@ -1159,7 +1386,21 @@ class AutoswapBot:
     async def _sleep_between_swaps(self) -> None:
         if self.config.runtime.full_24h_mode:
             return
-        await asyncio.sleep(self.config.runtime.swap_delay_seconds_range.sample(self._rng))
+        await self._sleep_or_stop(self.config.runtime.swap_delay_seconds_range.sample(self._rng))
+
+    async def _sleep_or_stop(self, seconds: float) -> None:
+        if seconds <= 0:
+            self._raise_if_stop_requested()
+            return
+        try:
+            await asyncio.wait_for(self._stop_requested.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return
+        raise StopRequested()
+
+    def _raise_if_stop_requested(self) -> None:
+        if self.stop_requested():
+            raise StopRequested()
 
     def _format_utc(self, dt: datetime) -> str:
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1464,11 +1705,15 @@ class AutoswapBot:
     def _message_for_stop_reason(self, stop_reason: str) -> str:
         mapping = {
             "USER_ABORT_LOW_BALANCE_PROMPT": "Dihentikan user karena balance tidak cukup",
+            "MANUAL_STOP": "Dihentikan user secara manual",
             "LOW_BALANCE_MODE_I": "Eksekusi berhenti karena balance kurang dan mode 'i' aktif",
             "INSUFFICIENT_BALANCE": "Eksekusi berhenti karena balance tidak cukup",
+            "RECOVERY_NOT_ENOUGH": "Round di-skip karena recovery belum menghasilkan balance yang cukup",
             "ROUND_AFFORDABILITY_CHECK_FAILED": "Eksekusi berhenti karena route tidak lagi affordable",
             "SWAP_HOP_FAILED": "Eksekusi berhenti karena transaksi swap gagal",
             "SWAP_HOP_FAILED_SKIPPED": "Round di-skip karena swap gagal setelah retry limit",
+            "SWAP_RETRY_EXHAUSTED": "Round di-skip karena swap gagal setelah retry limit",
+            "MIN_TICKET_SIZE": "Round di-skip karena nominal di bawah minimum ticket size",
             "ROUND_STOPPED": "Eksekusi berhenti di tengah sesi",
         }
         return mapping.get(stop_reason, f"Eksekusi berhenti: {stop_reason}")
