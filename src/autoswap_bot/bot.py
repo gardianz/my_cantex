@@ -939,6 +939,25 @@ class AutoswapBot:
 
         return None, "amount below minimum ticket size (10 CC equivalent)"
 
+    def _is_min_ticket_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "minimum ticket size" in message
+            or "too small amount" in message
+            or "10 cc" in message
+        )
+
+    def _recovery_source_order(self, target_symbol: str) -> tuple[str, ...]:
+        if target_symbol == CC_SYMBOL:
+            return tuple(symbol for symbol in TRACKED_SYMBOLS if symbol != target_symbol)
+        ordered = [CC_SYMBOL]
+        ordered.extend(
+            symbol
+            for symbol in TRACKED_SYMBOLS
+            if symbol not in {target_symbol, CC_SYMBOL}
+        )
+        return tuple(ordered)
+
     async def _estimate_cc_equivalent(
         self,
         *,
@@ -1109,9 +1128,7 @@ class AutoswapBot:
         total_tx = 0
         info = await sdk.get_account_info()
         balances = self._balances_by_symbol(info)
-        for source_symbol in TRACKED_SYMBOLS:
-            if source_symbol == target_symbol:
-                continue
+        for source_symbol in self._recovery_source_order(target_symbol):
             available_amount = self._spendable_amount(
                 source_symbol,
                 balances.get(source_symbol, Decimal("0")),
@@ -1120,26 +1137,59 @@ class AutoswapBot:
             if available_amount <= dust_for_symbol(source_symbol):
                 continue
 
-            route = await router.choose_best_route(source_symbol, target_symbol, available_amount)
-            issue = self._check_route_affordability(
+            recovery_amount, min_ticket_reason = await self._normalize_amount_for_min_ticket(
+                router=router,
+                sell_symbol=source_symbol,
+                buy_symbol=target_symbol,
+                desired_amount=available_amount,
+                max_available_amount=available_amount,
+            )
+            if recovery_amount is None:
+                logger.info(
+                    "Recovery source %s -> %s dilewati: %s | available=%s",
+                    source_symbol,
+                    target_symbol,
+                    min_ticket_reason,
+                    available_amount,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏭️ Recovery {source_symbol}->{target_symbol} skipped: {min_ticket_reason}",
+                )
+                continue
+
+            route, issue = await self._prepare_affordable_route(
+                router=router,
                 balances=balances,
-                route=route,
-                min_cc_reserve=self.config.runtime.min_cc_reserve,
+                sell_symbol=source_symbol,
+                buy_symbol=target_symbol,
+                proposed_amount=recovery_amount,
                 round_number=0,
             )
             if issue is not None:
+                logger.info(
+                    "Recovery source %s -> %s belum affordable: %s",
+                    source_symbol,
+                    target_symbol,
+                    issue.reason,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏭️ Recovery {source_symbol}->{target_symbol} skipped: {issue.reason}",
+                )
                 continue
 
+            route_amount = route.hops[0].sell_amount if route.hops else recovery_amount
             logger.info(
                 "Recovery aset sisa | %s -> %s | nominal=%s | route=%s",
                 source_symbol,
                 target_symbol,
-                available_amount,
+                route_amount,
                 route.label,
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"🛟 Recovery {source_symbol}->{target_symbol} ({available_amount})",
+                f"🛟 Recovery {source_symbol}->{target_symbol} ({route_amount})",
             )
             recovery_failed = False
             for hop_index, hop in enumerate(route.hops, start=1):
