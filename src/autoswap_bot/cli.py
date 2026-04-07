@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import signal
+import threading
 from pathlib import Path
 
 from .bot import AutoswapBot, configure_logging, summarize_results
@@ -13,7 +14,8 @@ class InterruptController:
     def __init__(self) -> None:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.bot: AutoswapBot | None = None
-        self._prompt_task: asyncio.Task[None] | None = None
+        self._prompt_active = False
+        self._prompt_lock = threading.Lock()
 
     def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
@@ -24,14 +26,30 @@ class InterruptController:
     def handle_sigint(self) -> None:
         if self.loop is None or self.loop.is_closed():
             return
-        if self._prompt_task is not None and not self._prompt_task.done():
-            return
-        self._prompt_task = self.loop.create_task(self._confirm_stop())
+        with self._prompt_lock:
+            if self._prompt_active:
+                return
+            self._prompt_active = True
+        prompt_thread = threading.Thread(
+            target=self._confirm_stop_blocking,
+            name="interrupt-confirmation",
+            daemon=True,
+        )
+        prompt_thread.start()
 
-    async def _confirm_stop(self) -> None:
-        answer = await asyncio.to_thread(input, "\nberhenti? (y/n) ")
-        if answer.strip().lower() == "y" and self.bot is not None:
-            await self.bot.request_stop()
+    def _confirm_stop_blocking(self) -> None:
+        try:
+            print("\nberhenti? (y/n) ", end="", flush=True)
+            answer = input().strip().lower()
+            if answer == "y" and self.bot is not None and self.loop is not None and not self.loop.is_closed():
+                self.loop.call_soon_threadsafe(self.loop.create_task, self.bot.request_stop())
+            elif answer == "n":
+                print("lanjut.\n", end="", flush=True)
+        except (EOFError, KeyboardInterrupt):
+            return
+        finally:
+            with self._prompt_lock:
+                self._prompt_active = False
 
 
 def build_parser() -> argparse.ArgumentParser:
