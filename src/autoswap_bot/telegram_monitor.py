@@ -74,8 +74,10 @@ class TelegramMonitor:
         strategy_label: str,
     ) -> TelegramCardState:
         pair_targets: dict[str, int] = {}
-        for request in prepared_run.round_requests:
-            pair_key = f"{request.sell_symbol}->{request.buy_symbol}"
+        strategy = account.strategy()
+        for round_index in range(prepared_run.rounds):
+            sell_symbol, buy_symbol = strategy.step_for_round(round_index)
+            pair_key = f"{sell_symbol}->{buy_symbol}"
             pair_targets[pair_key] = pair_targets.get(pair_key, 0) + 1
 
         return TelegramCardState(

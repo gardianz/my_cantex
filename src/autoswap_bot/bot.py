@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from cantex_sdk import (
     AccountInfo,
@@ -25,7 +25,7 @@ from cantex_sdk import (
 
 from .config import AccountConfig, BotConfig, PreparedAccountRun
 from .constants import CC_SYMBOL, MIN_TICKET_SIZE_CC, TRACKED_SYMBOLS, dust_for_symbol
-from .models import ActivitySummary, AccountPlan, AccountResult, PlanIssue, PlanStep, RouteHop, RoutePlan
+from .models import ActivitySummary, AccountResult, PlanIssue, RouteHop, RoutePlan
 from .routing import RouteOptimizer
 from .sdk_ext import ExtendedCantexSDK
 from .telegram_monitor import TelegramCardState, TelegramMonitor
@@ -52,10 +52,6 @@ class RoundExecutionResult:
     tx_count: int
     stop_reason: str | None = None
     skipped: bool = False
-
-
-LowBalanceMode = Literal["recover", "stop"]
-ShortBalancePromptResult = Literal["recover", "stop", "abort"]
 
 
 class AutoswapBot:
@@ -194,48 +190,10 @@ class AutoswapBot:
                     baseline_activity,
                     force=True,
                 )
-
-                plan = await self._build_plan(prepared_run, info, router)
-                result.estimated_network_fee_by_symbol = plan.estimated_network_fee_by_symbol
-                self._log_plan(logger, plan)
                 await self.monitor.log_event(
                     monitor_card,
-                    f"📋 Plan ready: {prepared_run.rounds} rounds / {plan.estimated_swap_count} tx",
+                    f"🗓️ Ready for {prepared_run.rounds} swap rounds",
                 )
-                await self.monitor.log_event(
-                    monitor_card,
-                    self._format_fee_log_line(
-                        prefix="Fee est all rounds",
-                        network_fee=plan.estimated_network_fee_by_symbol,
-                        swap_fee=plan.estimated_admin_and_liquidity_by_symbol,
-                    ),
-                )
-
-                low_balance_mode: LowBalanceMode = (
-                    "recover"
-                    if self.config.runtime.full_24h_mode or account.allow_continue_on_low_balance
-                    else "stop"
-                )
-                if self.config.runtime.full_24h_mode and not plan.can_fully_execute:
-                    logger.warning(
-                        "Mode 24 jam aktif, auto-continue dipaksa walau plan tidak penuh"
-                    )
-                elif not plan.can_fully_execute:
-                    prompt_result = await self._handle_short_balance_prompt(logger, plan)
-                    if prompt_result == "abort":
-                        result.aborted = True
-                        result.error = "Dihentikan user karena balance tidak cukup"
-                        result.stop_reason = "USER_ABORT_LOW_BALANCE_PROMPT"
-                        result.final_balances = self._balances_by_symbol(info)
-                        result.activity_summary = await self._fetch_activity_summary(sdk, logger)
-                        await self.monitor.log_event(
-                            monitor_card,
-                            "⛔ Stopped by user due to low balance",
-                            force=True,
-                        )
-                        await self.monitor.finalize(monitor_card, phase="STOPPED_USER")
-                        return result
-                    low_balance_mode = "recover" if prompt_result == "recover" else "stop"
 
                 if self.config.runtime.dry_run:
                     logger.info("Dry-run aktif, tidak ada swap yang dieksekusi")
@@ -252,44 +210,59 @@ class AutoswapBot:
                 used_network_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 used_swap_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 if self.config.runtime.full_24h_mode:
-                    session_start_utc = datetime.now(timezone.utc)
-                    session_end_utc = self._next_utc_midnight(session_start_utc)
-                    execution_buffer_seconds = self._estimate_24h_execution_buffer_seconds(plan)
-                    schedule = self._build_24h_schedule(
-                        rounds=prepared_run.rounds,
-                        start_utc=session_start_utc,
-                        end_utc=session_end_utc,
-                        execution_buffer_seconds=execution_buffer_seconds,
-                    )
-                    self._log_24h_schedule(
-                        logger,
-                        prepared_run,
-                        session_start_utc,
-                        session_end_utc,
-                        schedule,
-                        execution_buffer_seconds,
-                    )
-                    await self._run_24h_session(
-                        sdk=sdk,
-                        router=router,
-                        prepared_run=prepared_run,
-                        low_balance_mode=low_balance_mode,
-                        logger=logger,
-                        monitor_card=monitor_card,
-                        used_network_fee=used_network_fee,
-                        used_swap_fee=used_swap_fee,
-                        result=result,
-                        session_end_utc=session_end_utc,
-                        schedule=schedule,
-                    )
+                    while result.completed_rounds < prepared_run.rounds:
+                        session_start_utc = datetime.now(timezone.utc)
+                        session_end_utc = self._next_utc_midnight(session_start_utc)
+                        remaining_rounds = prepared_run.rounds - result.completed_rounds
+                        execution_buffer_seconds = self._estimate_24h_execution_buffer_seconds(remaining_rounds)
+                        schedule = self._build_24h_schedule(
+                            rounds=remaining_rounds,
+                            start_utc=session_start_utc,
+                            end_utc=session_end_utc,
+                            execution_buffer_seconds=execution_buffer_seconds,
+                        )
+                        self._log_24h_schedule(
+                            logger,
+                            remaining_rounds,
+                            session_start_utc,
+                            session_end_utc,
+                            schedule,
+                            execution_buffer_seconds,
+                            start_round_number=result.completed_rounds + 1,
+                        )
+                        await self._run_24h_session(
+                            sdk=sdk,
+                            router=router,
+                            account=account,
+                            prepared_run=prepared_run,
+                            logger=logger,
+                            monitor_card=monitor_card,
+                            used_network_fee=used_network_fee,
+                            used_swap_fee=used_swap_fee,
+                            result=result,
+                            session_end_utc=session_end_utc,
+                            schedule=schedule,
+                        )
+                        if result.completed_rounds < prepared_run.rounds:
+                            logger.info(
+                                "Rounds tersisa %s, lanjut ke sesi UTC berikutnya",
+                                prepared_run.rounds - result.completed_rounds,
+                            )
+                            await self.monitor.log_event(
+                                monitor_card,
+                                f"⏭️ {prepared_run.rounds - result.completed_rounds} rounds remaining, continue next UTC session",
+                                force=True,
+                            )
                 else:
-                    for round_index in range(prepared_run.rounds):
+                    while result.completed_rounds < prepared_run.rounds:
+                        current_round_number = result.completed_rounds + 1
                         round_result = await self._execute_round(
                             sdk=sdk,
                             router=router,
+                            account=account,
                             prepared_run=prepared_run,
-                            round_index=round_index,
-                            low_balance_mode=low_balance_mode,
+                            round_number=current_round_number,
+                            fee_retry_deadline_utc=None,
                             logger=logger,
                             monitor_card=monitor_card,
                             used_network_fee=used_network_fee,
@@ -299,24 +272,7 @@ class AutoswapBot:
                         if round_result.completed:
                             result.completed_rounds += 1
                             continue
-                        if round_result.skipped:
-                            result.skipped_rounds += 1
-                            continue
-                        if not round_result.completed:
-                            if result.error is None:
-                                result.aborted = True
-                                result.stop_reason = round_result.stop_reason or "ROUND_STOPPED"
-                                result.error = self._message_for_stop_reason(result.stop_reason)
-                                await self.monitor.log_event(
-                                    monitor_card,
-                                    f"⛔ Stop reason: {result.stop_reason}",
-                                    force=True,
-                                )
-                                await self.monitor.finalize(
-                                    monitor_card,
-                                    phase=f"STOPPED_{result.stop_reason}",
-                                )
-                            break
+                        await self._sleep_between_swaps()
 
                 final_info = await sdk.get_account_info()
                 result.final_balances = self._balances_by_symbol(final_info)
@@ -399,108 +355,22 @@ class AutoswapBot:
             raise RuntimeError(f"Instrument tidak ditemukan untuk simbol: {', '.join(missing)}")
         return resolved
 
-    async def _build_plan(
-        self,
-        prepared_run: PreparedAccountRun,
-        info: AccountInfo,
-        router: RouteOptimizer,
-    ) -> AccountPlan:
-        estimated_network_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
-        estimated_admin_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
-        simulated_balances = self._balances_by_symbol(info)
-        steps: list[PlanStep] = []
-        issues: list[PlanIssue] = []
-        estimated_swap_count = 0
-
-        for request in prepared_run.round_requests:
-            sell_symbol = request.sell_symbol
-            buy_symbol = request.buy_symbol
-            requested_amount = request.requested_amount
-            route = await router.choose_best_route(sell_symbol, buy_symbol, requested_amount)
-            issue = self._check_route_affordability(
-                balances=simulated_balances,
-                route=route,
-                min_cc_reserve=self.config.runtime.min_cc_reserve,
-                round_number=request.round_number,
-            )
-
-            steps.append(
-                PlanStep(
-                    round_number=request.round_number,
-                    sell_symbol=sell_symbol,
-                    buy_symbol=buy_symbol,
-                    requested_amount=requested_amount,
-                    route=route,
-                )
-            )
-            estimated_swap_count += route.tx_count
-            for symbol, amount in route.total_network_fee_by_symbol.items():
-                estimated_network_fee[symbol] += amount
-            for symbol, amount in route.total_admin_and_liquidity_by_symbol.items():
-                estimated_admin_fee[symbol] += amount
-
-            if issue is not None:
-                issues.append(issue)
-                continue
-
-            self._apply_route_to_balances(simulated_balances, route)
-
-        return AccountPlan(
-            steps=tuple(steps),
-            issues=tuple(issues),
-            estimated_network_fee_by_symbol=dict(estimated_network_fee),
-            estimated_admin_and_liquidity_by_symbol=dict(estimated_admin_fee),
-            estimated_swap_count=estimated_swap_count,
-        )
-
-    async def _handle_short_balance_prompt(
-        self,
-        logger: AccountLoggerAdapter,
-        plan: AccountPlan,
-    ) -> ShortBalancePromptResult:
-        for issue in plan.issues:
-            logger.warning(
-                "Putaran %s tidak cukup untuk %s: butuh %s, tersedia %s (%s)",
-                issue.round_number,
-                issue.sell_symbol,
-                issue.requested_amount,
-                issue.available_amount,
-                issue.reason,
-            )
-
-        async with self._prompt_lock:
-            while True:
-                answer = await asyncio.to_thread(
-                    input,
-                    "balance kurang apakah anda akan tetap melanjutkan?(y/n/i) ",
-                )
-                normalized = answer.strip().lower()
-                if normalized == "y":
-                    return "recover"
-                if normalized == "i":
-                    return "stop"
-                if normalized == "n":
-                    return "abort"
-                print("Masukkan 'y', 'n', atau 'i'.")
-
     async def _execute_round(
         self,
         *,
         sdk: ExtendedCantexSDK,
         router: RouteOptimizer,
+        account: AccountConfig,
         prepared_run: PreparedAccountRun,
-        round_index: int,
-        low_balance_mode: LowBalanceMode,
+        round_number: int,
+        fee_retry_deadline_utc: datetime | None,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         used_network_fee: defaultdict[str, Decimal],
         used_swap_fee: defaultdict[str, Decimal],
     ) -> RoundExecutionResult:
         tx_count = 0
-        round_request = prepared_run.round_requests[round_index]
-        sell_symbol = round_request.sell_symbol
-        buy_symbol = round_request.buy_symbol
-        target_amount = round_request.requested_amount
+        sell_symbol, buy_symbol = account.strategy().step_for_round(round_number - 1)
         pair_key = f"{sell_symbol}->{buy_symbol}"
         info = await sdk.get_account_info()
         balances = self._balances_by_symbol(info)
@@ -510,99 +380,57 @@ class AutoswapBot:
             balances.get(sell_symbol, Decimal("0")),
             self.config.runtime.min_cc_reserve,
         )
-
-        if available_amount < target_amount:
-            if low_balance_mode == "recover":
-                logger.warning(
-                    "Balance %s kurang pada putaran %s, mencoba recovery aset sisa",
-                    sell_symbol,
-                    round_index + 1,
-                )
-                await self.monitor.log_event(
-                    monitor_card,
-                    f"⚠️ Low balance {sell_symbol}, try recovery",
-                )
-                recovered_tx, balances, recovery_satisfied = await self._recover_until_target_available(
-                    sdk=sdk,
-                    router=router,
-                    target_symbol=sell_symbol,
-                    required_amount=target_amount,
-                    logger=logger,
-                    monitor_card=monitor_card,
-                    used_network_fee=used_network_fee,
-                    used_swap_fee=used_swap_fee,
-                )
-                tx_count += recovered_tx
-                available_amount = self._spendable_amount(
-                    sell_symbol,
-                    balances.get(sell_symbol, Decimal("0")),
-                    self.config.runtime.min_cc_reserve,
-                )
-                if not recovery_satisfied and available_amount < target_amount:
-                    await self.monitor.log_event(
-                        monitor_card,
-                        f"⏭️ Round {round_index + 1} skipped, recovery not enough for {sell_symbol}",
-                        force=True,
-                    )
-                    return RoundExecutionResult(
-                        completed=False,
-                        tx_count=tx_count,
-                        stop_reason="RECOVERY_NOT_ENOUGH",
-                        skipped=True,
-                    )
-            else:
-                logger.warning(
-                    "Putaran %s dihentikan karena balance %s (%s) kurang dari target %s",
-                    round_index + 1,
-                    sell_symbol,
-                    available_amount,
-                    target_amount,
-                )
-                await self.monitor.log_event(
-                    monitor_card,
-                    f"⛔ Round {round_index + 1} stopped, insufficient {sell_symbol}",
-                    force=True,
-                )
-                return RoundExecutionResult(
-                    completed=False,
-                    tx_count=tx_count,
-                    stop_reason="LOW_BALANCE_MODE_I",
-                )
-
-        if available_amount <= dust_for_symbol(sell_symbol):
-            logger.warning(
-                "Putaran %s dihentikan karena balance %s sudah tidak cukup",
-                round_index + 1,
+        amount_range = account.amount_range_for_symbol(sell_symbol)
+        max_allowed_amount = min(available_amount, amount_range.max_value)
+        if max_allowed_amount < amount_range.min_value or max_allowed_amount <= dust_for_symbol(sell_symbol):
+            reason = (
+                f"CC reserve reached ({balances.get('CC', Decimal('0'))} <= {self.config.runtime.min_cc_reserve})"
+                if sell_symbol == CC_SYMBOL
+                else f"{sell_symbol} balance below user config min ({available_amount} < {amount_range.min_value})"
+            )
+            logger.info(
+                "Putaran %s belum bisa dieksekusi | %s -> %s | %s",
+                round_number,
                 sell_symbol,
+                buy_symbol,
+                reason,
+            )
+            await self.monitor.update_status(
+                monitor_card,
+                pair_key=self._monitor_pair_key(pair_key),
+                round_number=round_number,
+                phase="PROCESSING",
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"⛔ Round {round_index + 1} skipped, insufficient {sell_symbol}",
-                force=True,
+                f"⏭️ Round {round_number} pending: {reason}",
             )
             return RoundExecutionResult(
                 completed=False,
                 tx_count=tx_count,
-                stop_reason="INSUFFICIENT_BALANCE",
+                stop_reason="WAIT_SOURCE_BALANCE",
+                skipped=True,
             )
 
-        actual_amount = min(target_amount, available_amount)
+        target_amount = self._sample_execution_amount(amount_range, max_allowed_amount)
         actual_amount, min_ticket_reason = await self._normalize_amount_for_min_ticket(
             router=router,
             sell_symbol=sell_symbol,
             buy_symbol=buy_symbol,
-            desired_amount=actual_amount,
-            max_available_amount=available_amount,
+            desired_amount=target_amount,
+            max_available_amount=max_allowed_amount,
         )
         if actual_amount is None:
-            logger.warning(
-                "Putaran %s di-skip karena nominal %s terlalu kecil terhadap minimum ticket",
-                round_index + 1,
+            logger.info(
+                "Putaran %s belum valid di protocol | %s -> %s | %s",
+                round_number,
                 sell_symbol,
+                buy_symbol,
+                min_ticket_reason,
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"⏭️ Round {round_index + 1} skipped: {min_ticket_reason}",
+                f"⏭️ Round {round_number} pending: {min_ticket_reason}",
                 force=True,
             )
             return RoundExecutionResult(
@@ -617,69 +445,27 @@ class AutoswapBot:
             sell_symbol=sell_symbol,
             buy_symbol=buy_symbol,
             proposed_amount=actual_amount,
-            round_number=round_index + 1,
+            round_number=round_number,
         )
         if issue is not None:
-            if low_balance_mode != "recover":
-                logger.warning("Putaran %s dibatalkan: %s", round_index + 1, issue.reason)
-                await self.monitor.log_event(
-                    monitor_card,
-                    f"⛔ Round {round_index + 1} canceled: {issue.reason}",
-                    force=True,
-                )
-                return RoundExecutionResult(
-                    completed=False,
-                    tx_count=tx_count,
-                    stop_reason="ROUND_AFFORDABILITY_CHECK_FAILED",
-                )
-
-            if issue.sell_symbol != sell_symbol:
-                logger.warning(
-                    "Aset untuk fee kurang pada putaran %s, mencoba recovery ke %s",
-                    round_index + 1,
-                    issue.sell_symbol,
-                )
-                recovered_tx = await self._recover_to_symbol(
-                    sdk=sdk,
-                    router=router,
-                    target_symbol=issue.sell_symbol,
-                    logger=logger,
-                    monitor_card=monitor_card,
-                    used_network_fee=used_network_fee,
-                    used_swap_fee=used_swap_fee,
-                )
-                tx_count += recovered_tx
-                info = await sdk.get_account_info()
-                balances = self._balances_by_symbol(info)
-
-            actual_amount = min(
-                available_amount,
-                self._spendable_amount(
-                    sell_symbol,
-                    balances.get(sell_symbol, Decimal("0")),
-                    self.config.runtime.min_cc_reserve,
-                ),
+            logger.info(
+                "Putaran %s belum affordable | %s -> %s | %s",
+                round_number,
+                sell_symbol,
+                buy_symbol,
+                issue.reason,
             )
-            route, issue = await self._prepare_affordable_route(
-                router=router,
-                balances=balances,
-                sell_symbol=sell_symbol,
-                buy_symbol=buy_symbol,
-                proposed_amount=actual_amount,
-                round_number=round_index + 1,
+            await self.monitor.log_event(
+                monitor_card,
+                f"⏭️ Round {round_number} pending: {issue.reason}",
+                force=True,
             )
-            if issue is not None:
-                logger.warning("Putaran %s tetap gagal: %s", round_index + 1, issue.reason)
-                await self.monitor.log_event(
-                    monitor_card,
-                    f"❌ Round {round_index + 1} failed: {issue.reason}",
-                    force=True,
-                )
-                return RoundExecutionResult(
-                    completed=False,
-                    tx_count=tx_count,
-                    stop_reason="ROUND_AFFORDABILITY_CHECK_FAILED",
-                )
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason="ROUND_AFFORDABILITY_CHECK_FAILED",
+                skipped=True,
+            )
 
         route, issue = await self._wait_for_network_fee_below_cap(
             router=router,
@@ -687,27 +473,59 @@ class AutoswapBot:
             sell_symbol=sell_symbol,
             buy_symbol=buy_symbol,
             actual_amount=actual_amount,
-            round_number=round_index + 1,
+            round_number=round_number,
+            fee_retry_deadline_utc=fee_retry_deadline_utc,
             logger=logger,
             monitor_card=monitor_card,
             current_route=route,
         )
         if issue is not None:
+            message = (
+                f"⏭️ Round {round_number} slot skipped: {issue.reason}"
+                if "30 detik sebelum jadwal berikutnya" in issue.reason
+                else f"⏭️ Round {round_number} pending: {issue.reason}"
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                message,
+                force=True,
+            )
             return RoundExecutionResult(
                 completed=False,
                 tx_count=tx_count,
                 stop_reason="ROUND_AFFORDABILITY_CHECK_FAILED",
+                skipped=True,
+            )
+        if route.hops and route.hops[0].sell_amount < amount_range.min_value:
+            reason = f"route adjusted amount below user config min ({route.hops[0].sell_amount} < {amount_range.min_value})"
+            logger.info(
+                "Putaran %s belum bisa dieksekusi | %s -> %s | %s",
+                round_number,
+                sell_symbol,
+                buy_symbol,
+                reason,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"⏭️ Round {round_number} pending: {reason}",
+                force=True,
+            )
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason="USER_CONFIG_MIN_NOT_MET",
+                skipped=True,
             )
 
         await self.monitor.update_status(
             monitor_card,
             pair_key=self._monitor_pair_key(pair_key),
-            round_number=round_index + 1,
+            round_number=round_number,
             phase="PROCESSING",
         )
         logger.info(
             "Putaran %s | %s -> %s | nominal=%s | route=%s | fee est=%s | network fee est=%s",
-            round_index + 1,
+            round_number,
             sell_symbol,
             buy_symbol,
             actual_amount,
@@ -717,7 +535,7 @@ class AutoswapBot:
         )
         await self.monitor.log_event(
             monitor_card,
-            f"🔄 Round {round_index + 1}/{prepared_run.rounds} {self._monitor_pair_key(pair_key)} ({actual_amount})",
+            f"🔄 Round {round_number}/{prepared_run.rounds} {self._monitor_pair_key(pair_key)} ({actual_amount})",
         )
 
         for hop_index, hop in enumerate(route.hops, start=1):
@@ -726,14 +544,14 @@ class AutoswapBot:
                 hop=hop,
                 hop_index=hop_index,
                 hop_total=len(route.hops),
-                round_number=round_index + 1,
+                round_number=round_number,
                 logger=logger,
                 monitor_card=monitor_card,
             )
             if tx_result is None:
                 await self.monitor.log_event(
                     monitor_card,
-                    f"⏭️ Round {round_index + 1} skipped: {failure_reason or 'retry limit reached'}",
+                    f"⏭️ Round {round_number} pending: {failure_reason or 'retry limit reached'}",
                     force=True,
                 )
                 return RoundExecutionResult(
@@ -905,6 +723,16 @@ class AutoswapBot:
 
         return previous_balances
 
+    def _sample_execution_amount(
+        self,
+        amount_range,
+        max_allowed_amount: Decimal,
+    ) -> Decimal:
+        if max_allowed_amount <= amount_range.min_value:
+            return max_allowed_amount
+        fraction = Decimal(str(self._rng.random()))
+        return amount_range.min_value + ((max_allowed_amount - amount_range.min_value) * fraction)
+
     async def _normalize_amount_for_min_ticket(
         self,
         *,
@@ -1047,6 +875,7 @@ class AutoswapBot:
         buy_symbol: str,
         actual_amount: Decimal,
         round_number: int,
+        fee_retry_deadline_utc: datetime | None,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         current_route: RoutePlan,
@@ -1059,6 +888,29 @@ class AutoswapBot:
         while route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0")) > fee_cap:
             self._raise_if_stop_requested()
             current_fee = route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0"))
+            now_utc = datetime.now(timezone.utc)
+            if fee_retry_deadline_utc is not None and now_utc >= fee_retry_deadline_utc:
+                return route, PlanIssue(
+                    round_number=round_number,
+                    sell_symbol=sell_symbol,
+                    requested_amount=actual_amount,
+                    available_amount=balances.get(sell_symbol, Decimal("0")),
+                    reason="network fee tetap di atas batas sampai 30 detik sebelum jadwal berikutnya",
+                )
+
+            wait_seconds = self.config.runtime.network_fee_poll_seconds
+            if fee_retry_deadline_utc is not None:
+                seconds_left = (fee_retry_deadline_utc - now_utc).total_seconds()
+                if seconds_left <= 0:
+                    return route, PlanIssue(
+                        round_number=round_number,
+                        sell_symbol=sell_symbol,
+                        requested_amount=actual_amount,
+                        available_amount=balances.get(sell_symbol, Decimal("0")),
+                        reason="network fee tetap di atas batas sampai 30 detik sebelum jadwal berikutnya",
+                    )
+                wait_seconds = min(wait_seconds, max(1.0, seconds_left))
+
             logger.warning(
                 "Round %s menunggu network fee turun | fee=%s CC | batas=%s CC",
                 round_number,
@@ -1067,15 +919,15 @@ class AutoswapBot:
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"⏳ Network fee {current_fee} CC > limit {fee_cap} CC, waiting {int(self.config.runtime.network_fee_poll_seconds)}s",
+                f"⏳ Network fee {current_fee} CC > limit {fee_cap} CC, waiting {int(wait_seconds)}s",
             )
             await self.monitor.update_status(
                 monitor_card,
                 round_number=round_number,
                 phase="WAITING_FEE",
-                next_wait_seconds=self.config.runtime.network_fee_poll_seconds,
+                next_wait_seconds=wait_seconds,
             )
-            await self._sleep_or_stop(self.config.runtime.network_fee_poll_seconds)
+            await self._sleep_or_stop(wait_seconds)
             route, issue = await self._prepare_affordable_route(
                 router=router,
                 balances=balances,
@@ -1241,8 +1093,8 @@ class AutoswapBot:
         *,
         sdk: ExtendedCantexSDK,
         router: RouteOptimizer,
+        account: AccountConfig,
         prepared_run: PreparedAccountRun,
-        low_balance_mode: LowBalanceMode,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         used_network_fee: defaultdict[str, Decimal],
@@ -1253,6 +1105,8 @@ class AutoswapBot:
     ) -> None:
         for scheduled_round in schedule:
             self._raise_if_stop_requested()
+            if result.completed_rounds >= prepared_run.rounds:
+                return
             now_utc = datetime.now(timezone.utc)
             if now_utc >= session_end_utc:
                 logger.info(
@@ -1262,19 +1116,27 @@ class AutoswapBot:
                 return
 
             wait_seconds = (scheduled_round.execute_at_utc - now_utc).total_seconds()
+            current_round_number = result.completed_rounds + 1
+            sell_symbol, buy_symbol = account.strategy().step_for_round(result.completed_rounds)
+            next_slot_utc = (
+                schedule[scheduled_round.round_index + 1].execute_at_utc
+                if scheduled_round.round_index + 1 < len(schedule)
+                else session_end_utc
+            )
+            fee_retry_deadline_utc = next_slot_utc - timedelta(seconds=30)
             if wait_seconds > 0:
                 logger.info(
                     "Menunggu round %s sampai %s UTC (%.0f detik lagi)",
-                    scheduled_round.round_index + 1,
+                    current_round_number,
                     self._format_utc(scheduled_round.execute_at_utc),
                     wait_seconds,
                 )
                 await self.monitor.update_status(
                     monitor_card,
                     pair_key=self._monitor_pair_key(
-                        f"{prepared_run.round_requests[scheduled_round.round_index].sell_symbol}->{prepared_run.round_requests[scheduled_round.round_index].buy_symbol}"
+                        f"{sell_symbol}->{buy_symbol}"
                     ),
-                    round_number=scheduled_round.round_index + 1,
+                    round_number=current_round_number,
                     phase="WAITING",
                     next_scheduled_utc=scheduled_round.execute_at_utc,
                     next_wait_seconds=wait_seconds,
@@ -1287,16 +1149,17 @@ class AutoswapBot:
             else:
                 logger.info(
                     "Round %s sudah melewati jadwal %.0f detik, dieksekusi sekarang",
-                    scheduled_round.round_index + 1,
+                    current_round_number,
                     abs(wait_seconds),
                 )
 
             round_result = await self._execute_round(
                 sdk=sdk,
                 router=router,
+                account=account,
                 prepared_run=prepared_run,
-                round_index=scheduled_round.round_index,
-                low_balance_mode=low_balance_mode,
+                round_number=current_round_number,
+                fee_retry_deadline_utc=fee_retry_deadline_utc,
                 logger=logger,
                 monitor_card=monitor_card,
                 used_network_fee=used_network_fee,
@@ -1305,35 +1168,8 @@ class AutoswapBot:
             result.swap_transactions += round_result.tx_count
             if round_result.completed:
                 result.completed_rounds += 1
-                continue
-            if round_result.skipped:
+            elif round_result.skipped:
                 result.skipped_rounds += 1
-                continue
-            if not round_result.completed:
-                if result.error is None:
-                    result.aborted = True
-                    result.stop_reason = round_result.stop_reason or "ROUND_STOPPED"
-                    result.error = self._message_for_stop_reason(result.stop_reason)
-                    await self.monitor.log_event(
-                        monitor_card,
-                        f"⛔ Stop reason: {result.stop_reason}",
-                        force=True,
-                    )
-                    await self.monitor.finalize(
-                        monitor_card,
-                        phase=f"STOPPED_{result.stop_reason}",
-                    )
-                return
-
-        now_utc = datetime.now(timezone.utc)
-        remaining_seconds = (session_end_utc - now_utc).total_seconds()
-        if remaining_seconds > 0:
-            logger.info(
-                "Menunggu akhir sesi 24 jam sampai %s UTC (%.0f detik lagi)",
-                self._format_utc(session_end_utc),
-                remaining_seconds,
-            )
-            await self._sleep_or_stop(remaining_seconds)
         logger.info("Sesi 24 jam selesai pada %s UTC", self._format_utc(session_end_utc))
 
     def _build_24h_schedule(
@@ -1348,11 +1184,8 @@ class AutoswapBot:
             return ()
 
         total_seconds = max(1.0, (end_utc - start_utc).total_seconds())
-        schedulable_seconds = total_seconds - max(0.0, execution_buffer_seconds)
-        if schedulable_seconds <= 0:
-            raise ValueError(
-                "Window 24 jam tidak cukup setelah memperhitungkan buffer eksekusi swap"
-            )
+        reserved_seconds = min(max(0.0, execution_buffer_seconds), max(0.0, total_seconds - 1.0))
+        schedulable_seconds = max(1.0, total_seconds - reserved_seconds)
 
         min_gap_seconds = max(0.0, self.config.runtime.full_24h_min_gap_minutes * 60.0)
         if rounds > 1:
@@ -1382,17 +1215,18 @@ class AutoswapBot:
     def _log_24h_schedule(
         self,
         logger: AccountLoggerAdapter,
-        prepared_run: PreparedAccountRun,
+        remaining_rounds: int,
         session_start_utc: datetime,
         session_end_utc: datetime,
         schedule: tuple[ScheduledRound, ...],
         execution_buffer_seconds: float,
+        start_round_number: int,
     ) -> None:
         logger.info(
             "Mode 24 jam aktif | mulai=%s UTC | selesai=%s UTC | rounds=%s | buffer-eksekusi=%.0f detik",
             self._format_utc(session_start_utc),
             self._format_utc(session_end_utc),
-            prepared_run.rounds,
+            remaining_rounds,
             execution_buffer_seconds,
         )
         displayed_schedule = self._compress_schedule_for_logging(schedule)
@@ -1400,13 +1234,9 @@ class AutoswapBot:
             if scheduled_round is None:
                 logger.info("Jadwal random | ... disingkat ...")
                 continue
-            request = prepared_run.round_requests[scheduled_round.round_index]
             logger.info(
-                "Jadwal random round %s | %s -> %s | nominal=%s | waktu=%s UTC",
-                request.round_number,
-                request.sell_symbol,
-                request.buy_symbol,
-                request.requested_amount,
+                "Jadwal random round %s | waktu=%s UTC",
+                start_round_number + scheduled_round.round_index,
                 self._format_utc(scheduled_round.execute_at_utc),
             )
 
@@ -1425,13 +1255,8 @@ class AutoswapBot:
         compressed.extend(schedule[-tail_count:])
         return tuple(compressed)
 
-    def _estimate_24h_execution_buffer_seconds(self, plan: AccountPlan) -> float:
-        quote_based_seconds = 0.0
-        for step in plan.steps:
-            for hop in step.route.hops:
-                quote_based_seconds += max(float(hop.estimated_time_seconds), 45.0)
-        safety_padding_seconds = max(300.0, plan.estimated_swap_count * 20.0)
-        return quote_based_seconds + safety_padding_seconds
+    def _estimate_24h_execution_buffer_seconds(self, remaining_rounds: int) -> float:
+        return max(300.0, remaining_rounds * 90.0)
 
     async def _sleep_between_swaps(self) -> None:
         if self.config.runtime.full_24h_mode:
@@ -1671,26 +1496,6 @@ class AutoswapBot:
                 if nested is not None:
                     return nested
         return None
-
-    def _log_plan(self, logger: AccountLoggerAdapter, plan: AccountPlan) -> None:
-        logger.info(
-            "Estimasi swap tx=%s | estimasi network fee=%s | estimasi fee swap=%s",
-            plan.estimated_swap_count,
-            self._format_amount_map(plan.estimated_network_fee_by_symbol),
-            self._format_amount_map(plan.estimated_admin_and_liquidity_by_symbol),
-        )
-        for step in plan.steps:
-            logger.info(
-                "Plan putaran %s | %s -> %s | nominal=%s | route=%s | tx=%s | output est=%s %s",
-                step.round_number,
-                step.sell_symbol,
-                step.buy_symbol,
-                step.requested_amount,
-                step.route.label,
-                step.route.tx_count,
-                step.route.final_amount,
-                step.buy_symbol,
-            )
 
     def _log_activity_summary(
         self,

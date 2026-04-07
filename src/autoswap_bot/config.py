@@ -93,18 +93,9 @@ class DecimalRange:
 
 
 @dataclass(frozen=True)
-class PreparedRound:
-    round_number: int
-    sell_symbol: str
-    buy_symbol: str
-    requested_amount: Decimal
-
-
-@dataclass(frozen=True)
 class PreparedAccountRun:
     strategy_name: str
     rounds: int
-    round_requests: tuple[PreparedRound, ...]
 
 
 def _parse_int_range(value: Any, field_name: str) -> IntRange:
@@ -217,24 +208,10 @@ class AccountConfig:
         return amount_range
 
     def prepare_run(self, rng: random.Random) -> PreparedAccountRun:
-        strategy = self.strategy()
         rounds = self.rounds_range.sample(rng)
-        round_requests: list[PreparedRound] = []
-        for round_index in range(rounds):
-            sell_symbol, buy_symbol = strategy.step_for_round(round_index)
-            amount = self.amount_range_for_symbol(sell_symbol).sample(rng)
-            round_requests.append(
-                PreparedRound(
-                    round_number=round_index + 1,
-                    sell_symbol=sell_symbol,
-                    buy_symbol=buy_symbol,
-                    requested_amount=amount,
-                )
-            )
         return PreparedAccountRun(
             strategy_name=self.strategy_name,
             rounds=rounds,
-            round_requests=tuple(round_requests),
         )
 
     def describe_amount_ranges(self) -> dict[str, str]:

@@ -8,10 +8,10 @@ Fitur utama:
 
 - Multi-account
 - 9 strategi swap
-- Validasi balance sebelum eksekusi
+- Validasi balance, minimum protocol, dan fee sebelum submit swap
 - Reserve minimal `5 CC` per account
 - Optimasi route `direct` vs `1-hop`
-- Retry swap hop dan skip round jika tetap gagal
+- `1 swap sukses = 1 round selesai`
 - Mode 24 jam berbasis UTC
 - Monitor Telegram berbentuk kartu
 - Best-effort fetch activity user dari endpoint web Cantex
@@ -163,11 +163,19 @@ auto_create_intent_account = true
   - Bisa angka tetap atau range `{ min, max }`
 
 - `max_network_fee_cc_per_execution`
-  - Batas network fee per round dalam satuan `CC`
-  - Jika fee saat itu lebih tinggi dari batas, bot akan menunggu dan cek ulang quote
+  - Batas maksimum network fee untuk 1 percobaan swap dalam satuan `CC`
+  - Bot akan cek quote terlebih dahulu sebelum submit transaksi
+  - Jika network fee quote saat itu lebih tinggi dari batas ini, transaksi tidak dikirim
+  - Bot akan menunggu sesuai `network_fee_poll_seconds`, lalu quote ulang sampai fee turun
+  - Setting ini hanya membatasi network fee, bukan swap fee admin/liquidity
+  - Contoh:
+    - jika nilai setting `0.12`
+    - lalu quote menunjukkan network fee `0.15 CC`
+    - maka bot tidak swap, tetapi menunggu dan cek ulang
 
 - `network_fee_poll_seconds`
-  - Interval tunggu saat fee masih di atas batas
+  - Interval tunggu antar pengecekan ulang fee saat fee masih di atas batas
+  - Contoh: `30` berarti bot akan cek ulang setiap 30 detik
 
 - `full_24h_mode`
   - Jika `true`, bot memakai scheduler harian berbasis UTC sampai `00:00 UTC` berikutnya
@@ -271,8 +279,12 @@ Artinya account `wallet-2` tetap memakai `false`, walaupun default global `true`
 
 Catatan:
 
-- Untuk strategi `1-6`, `rounds` berarti jumlah pengulangan swap yang sama
-- Untuk strategi `7-9`, `rounds` berarti jumlah langkah swap total, bukan jumlah siklus penuh
+- `rounds` adalah jumlah swap sukses yang ingin dicapai
+- `1 swap sukses = 1 round selesai`
+- Untuk strategi `1-6`, bot akan terus mencoba swap yang sama sampai round sukses terkumpul sesuai target
+- Untuk strategi `7-9`, bot mengikuti urutan langkah strategi secara maju
+- Langkah strategi hanya maju jika swap pada langkah saat ini benar-benar sukses
+- Constraint sementara seperti fee tinggi, minimum ticket protocol, atau source token belum cukup tidak mengurangi `rounds`
 
 Contoh:
 
@@ -298,37 +310,40 @@ rounds = { min = 5, max = 8 }
 
 Artinya:
 
-- nominal swap diacak pada setiap langkah
+- nominal swap diacak saat langkah itu benar-benar akan dieksekusi
+- token source aktif menentukan range amount yang dipakai
 - `rounds` diacak sekali di awal run account
 
-## Perilaku Saat Balance Kurang
+## Perilaku Saat Balance dan Reserve
 
-Saat balance tidak cukup, bot bisa menampilkan prompt:
-
-```text
-balance kurang apakah anda akan tetap melanjutkan?(y/n/i)
-```
-
-Arti pilihan:
-
-- `y`: lanjut semampunya dan boleh recovery aset sisa bila perlu
-- `i`: tetap mulai jalan, tetapi jika nanti balance kurang di tengah proses bot langsung stop
-- `n`: hentikan proses
+- `min_cc_reserve` hanya membatasi saat source token adalah `CC`
+- Jika step aktif adalah `CC -> token lain`, bot hanya boleh swap selama balance `CC` masih di atas reserve
+- Jika balance `CC <= min_cc_reserve`, bot tidak akan lagi memakai `CC` sebagai source token untuk swap keluar
+- Kondisi ini bukan berarti strategi selesai
+- Step lain seperti `USDCx -> CBTC`, `CBTC -> CC`, atau `USDCx -> CC` tetap boleh berjalan walaupun `CC <= min_cc_reserve`
 
 Catatan:
 
-- `allow_continue_on_low_balance = true` artinya mode default account adalah lanjut semampunya
-- `allow_continue_on_low_balance = false` artinya account tidak recovery otomatis
+- Bot tidak menganggap balance kurang sebagai kondisi selesai
+- Jika source token aktif belum memenuhi syarat config user atau protocol, bot hanya menunda attempt dan mencoba lagi pada evaluasi berikutnya
+- `allow_continue_on_low_balance` saat ini sebaiknya dianggap sebagai setting kompatibilitas lama, bukan penentu selesai strategi
 
 ## Mode 24 Jam
 
 Jika `full_24h_mode = true`:
 
 - `swap_delay_seconds` diabaikan
+- saat startup bot hanya membuat plan waktu eksekusi swap
+- bot tidak membuat plan swap lengkap di awal
 - bot membuat jadwal random per account
 - semua jadwal memakai acuan UTC
 - target sesi adalah selesai sebelum `00:00 UTC`
 - jika `full_24h_auto_restart = true`, sesi berikutnya dimulai lagi untuk hari UTC berikutnya
+- `max_network_fee_cc_per_execution` tetap berlaku
+- jika fee terlalu tinggi, bot akan retry quote pada slot round itu
+- retry fee dilakukan sampai tersisa `30 detik` menuju jadwal round berikutnya
+- jika sampai batas itu fee tidak turun, slot round saat itu dilewati dan bot lanjut ke slot berikutnya
+- account tidak dianggap gagal hanya karena fee sedang tinggi
 
 Catatan penting:
 
@@ -336,26 +351,39 @@ Catatan penting:
 - Di dalam 1 account, transaksi tetap serial
 - Saat mode 24 jam aktif, bot selalu memaksa perilaku recovery / continue semampunya
 - Jadi `allow_continue_on_low_balance = false` tidak dipakai sebagai stop keras selama mode 24 jam aktif
+- Di mode normal, bot akan terus menunggu fee turun karena tidak ada jadwal round berikutnya yang menjadi batas deadline
 
-## Retry dan Skip Round
+Contoh flow fee cap di mode 24 jam:
+
+1. Round saat ini dijadwalkan pukul `10:00:00 UTC`
+2. Round berikutnya dijadwalkan pukul `10:05:00 UTC`
+3. Deadline retry fee untuk round saat ini adalah `10:04:30 UTC`
+4. Jika sampai `10:04:30 UTC` fee masih di atas `max_network_fee_cc_per_execution`, slot round saat ini dilewati
+5. Bot lanjut ke round berikutnya dan tetap hidup
+
+## Retry dan Attempt
 
 Jika swap hop gagal:
 
 1. Bot retry sampai batas `max_retries`
 2. Bot menunggu sesuai `retry_base_delay`
-3. Jika tetap gagal, round di-skip
-4. Bot lanjut ke round berikutnya
+3. Jika tetap gagal, attempt saat itu dianggap gagal
+4. Bot tetap hidup dan akan mencoba lagi pada evaluasi berikutnya
+5. Round baru dianggap selesai jika ada 1 swap sukses
 
-Jadi bot tidak langsung berhenti untuk account hanya karena 1 hop swap gagal.
+Jadi bot tidak langsung berhenti untuk account hanya karena 1 hop swap gagal, dan `rounds` tidak berkurang hanya karena retry habis.
 
 ## Recovery dan Minimum Ticket
 
-- Jika balance aset jual kurang dan mode account mengizinkan recovery, bot akan mencoba recovery aset sisa ke aset target
-- Setelah recovery tx terkirim, bot akan menunggu settlement balance terlebih dahulu sebelum memutuskan langkah berikutnya
-- Jika setelah recovery balance masih belum cukup, round akan di-skip dan account tetap lanjut ke round berikutnya
-- Jika nominal swap berada di bawah minimum ticket size website, bot akan:
-- menaikkan nominal ke minimum jika balance masih memungkinkan
-- atau skip round jika memang tidak cukup untuk memenuhi minimum ticket
+- Bot membedakan:
+  - minimum amount dari config user
+  - minimum ticket size dari protocol / web
+- Jika nominal saat itu berada di bawah minimum protocol, bot tidak menganggap strategi selesai
+- Bot akan mencoba menyesuaikan amount jika masih memungkinkan
+- Jika tetap tidak memenuhi minimum protocol, attempt saat itu dilewati dengan log yang jelas
+- Bot tetap hidup dan mencoba lagi sampai round sukses terkumpul sesuai target
+- Dust balance kecil tidak dipaksa swap jika akan menghasilkan transaksi invalid
+- Jika route optimizer menurunkan amount sampai di bawah minimum config user, bot tidak submit transaksi itu
 
 ## Telegram Monitor
 
@@ -389,7 +417,7 @@ telegram_latest_logs_limit = 6
 Di akhir run, bot menampilkan ringkasan per account, termasuk:
 
 - status
-- putaran selesai
+- putaran selesai (`swap sukses`)
 - `skipped_rounds`
 - jumlah tx swap
 - estimasi network fee
@@ -397,6 +425,11 @@ Di akhir run, bot menampilkan ringkasan per account, termasuk:
 - swap fee terpakai
 - balance akhir
 - `stop_reason` jika ada
+
+Catatan:
+
+- `completed_rounds` adalah jumlah swap sukses
+- `skipped_rounds` terutama menunjukkan jumlah attempt / slot yang dilewati, bukan jumlah round yang dianggap selesai
 
 ## Sumber Activity
 
