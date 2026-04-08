@@ -159,7 +159,7 @@ class RuntimeConfig:
     min_cc_reserve: Decimal
     swap_delay_seconds_range: FloatRange
     max_network_fee_cc_per_execution: Decimal | None
-    network_fee_poll_seconds: float
+    network_fee_poll_seconds_range: FloatRange
     full_24h_mode: bool
     full_24h_min_gap_minutes: float
     full_24h_auto_restart: bool
@@ -255,7 +255,10 @@ def load_config(path: str | Path) -> BotConfig:
             if settings.get("max_network_fee_cc_per_execution") not in {None, ""}
             else None
         ),
-        network_fee_poll_seconds=float(settings.get("network_fee_poll_seconds", 30.0)),
+        network_fee_poll_seconds_range=_parse_float_range(
+            settings.get("network_fee_poll_seconds", 30.0),
+            "settings.network_fee_poll_seconds",
+        ),
         full_24h_mode=bool(settings.get("full_24h_mode", False)),
         full_24h_min_gap_minutes=float(settings.get("full_24h_min_gap_minutes", 5.0)),
         full_24h_auto_restart=bool(settings.get("full_24h_auto_restart", False)),
@@ -315,8 +318,14 @@ def load_config(path: str | Path) -> BotConfig:
         and runtime.max_network_fee_cc_per_execution <= 0
     ):
         raise ValueError("settings.max_network_fee_cc_per_execution harus > 0")
-    if runtime.network_fee_poll_seconds <= 0:
-        raise ValueError("settings.network_fee_poll_seconds harus > 0")
+    if runtime.network_fee_poll_seconds_range.min_value <= 0:
+        raise ValueError("settings.network_fee_poll_seconds.min harus > 0")
+    if runtime.network_fee_poll_seconds_range.max_value <= 0:
+        raise ValueError("settings.network_fee_poll_seconds.max harus > 0")
+    if runtime.network_fee_poll_seconds_range.min_value > runtime.network_fee_poll_seconds_range.max_value:
+        raise ValueError(
+            "settings.network_fee_poll_seconds.min tidak boleh lebih besar dari .max"
+        )
     if runtime.full_24h_min_gap_minutes < 0:
         raise ValueError("settings.full_24h_min_gap_minutes tidak boleh negatif")
     if runtime.full_24h_schedule_log_limit < 1:

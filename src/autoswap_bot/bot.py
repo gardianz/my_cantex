@@ -560,6 +560,27 @@ class AutoswapBot:
                 stop_reason="TRANSIENT_API_ERROR",
                 skipped=True,
             )
+        except RuntimeError as exc:
+            if not self._is_retryable_route_error(exc):
+                raise
+            logger.warning(
+                "Putaran %s gagal sementara saat siapkan route | %s -> %s | %s",
+                round_number,
+                sell_symbol,
+                buy_symbol,
+                exc,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"⏭️ Round {round_number} pending: transient quote error ({exc})",
+                force=True,
+            )
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason="TRANSIENT_ROUTE_ERROR",
+                skipped=True,
+            )
 
         try:
             route, issue = await self._wait_for_network_fee_below_cap(
@@ -591,6 +612,27 @@ class AutoswapBot:
                 completed=False,
                 tx_count=tx_count,
                 stop_reason="TRANSIENT_API_ERROR",
+                skipped=True,
+            )
+        except RuntimeError as exc:
+            if not self._is_retryable_route_error(exc):
+                raise
+            logger.warning(
+                "Putaran %s gagal sementara saat tunggu fee | %s -> %s | %s",
+                round_number,
+                sell_symbol,
+                buy_symbol,
+                exc,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"⏭️ Round {round_number} pending: transient quote error ({exc})",
+                force=True,
+            )
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason="TRANSIENT_ROUTE_ERROR",
                 skipped=True,
             )
         if issue is not None:
@@ -940,6 +982,17 @@ class AutoswapBot:
             or "10 cc" in message
         )
 
+    def _is_retryable_route_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "quote gagal" in message
+            or "tidak ada route valid" in message
+            or "http 500" in message
+            or "http 502" in message
+            or "http 503" in message
+            or "http 504" in message
+        )
+
     def _recovery_source_order(self, target_symbol: str) -> tuple[str, ...]:
         if target_symbol == CC_SYMBOL:
             return tuple(symbol for symbol in TRACKED_SYMBOLS if symbol != target_symbol)
@@ -1063,7 +1116,7 @@ class AutoswapBot:
                     reason="network fee tetap di atas batas sampai 30 detik sebelum jadwal berikutnya",
                 )
 
-            wait_seconds = self.config.runtime.network_fee_poll_seconds
+            wait_seconds = self._sample_network_fee_poll_seconds()
             if fee_retry_deadline_utc is not None:
                 seconds_left = (fee_retry_deadline_utc - now_utc).total_seconds()
                 if seconds_left <= 0:
@@ -1093,14 +1146,31 @@ class AutoswapBot:
                 next_wait_seconds=wait_seconds,
             )
             await self._sleep_or_stop(wait_seconds)
-            route, issue = await self._prepare_affordable_route(
-                router=router,
-                balances=balances,
-                sell_symbol=sell_symbol,
-                buy_symbol=buy_symbol,
-                proposed_amount=actual_amount,
-                round_number=round_number,
-            )
+            try:
+                route, issue = await self._prepare_affordable_route(
+                    router=router,
+                    balances=balances,
+                    sell_symbol=sell_symbol,
+                    buy_symbol=buy_symbol,
+                    proposed_amount=actual_amount,
+                    round_number=round_number,
+                )
+            except RuntimeError as exc:
+                if not self._is_retryable_route_error(exc):
+                    raise
+                logger.warning(
+                    "Round %s quote gagal sementara saat tunggu fee turun | %s -> %s | %s",
+                    round_number,
+                    sell_symbol,
+                    buy_symbol,
+                    exc,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏭️ Round {round_number} pending: transient quote error ({exc})",
+                    force=True,
+                )
+                continue
             if issue is not None:
                 return route, issue
         return route, None
@@ -1121,7 +1191,6 @@ class AutoswapBot:
     ) -> tuple[RoutePlan, PlanIssue | None]:
         route = initial_route
         issue = initial_issue
-        poll_seconds = max(1.0, self.config.runtime.network_fee_poll_seconds)
         waiting_logged = False
 
         while True:
@@ -1162,6 +1231,7 @@ class AutoswapBot:
                 )
                 waiting_logged = True
 
+            poll_seconds = self._sample_network_fee_poll_seconds()
             if (
                 self.config.runtime.max_network_fee_cc_per_execution is not None
                 and current_fee > self.config.runtime.max_network_fee_cc_per_execution
@@ -1188,14 +1258,29 @@ class AutoswapBot:
                     reason=f"{source_symbol} balance tidak cukup untuk recovery",
                 )
             recovery_amount = min(recovery_amount, available_amount)
-            route, issue = await self._prepare_affordable_route(
-                router=router,
-                balances=balances,
-                sell_symbol=source_symbol,
-                buy_symbol=target_symbol,
-                proposed_amount=recovery_amount,
-                round_number=0,
-            )
+            try:
+                route, issue = await self._prepare_affordable_route(
+                    router=router,
+                    balances=balances,
+                    sell_symbol=source_symbol,
+                    buy_symbol=target_symbol,
+                    proposed_amount=recovery_amount,
+                    round_number=0,
+                )
+            except RuntimeError as exc:
+                if not self._is_retryable_route_error(exc):
+                    raise
+                logger.warning(
+                    "Recovery %s -> %s quote gagal sementara: %s",
+                    source_symbol,
+                    target_symbol,
+                    exc,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏭️ Recovery {source_symbol}->{target_symbol} : transient quote error ({exc})",
+                )
+                continue
 
     def _format_fee_log_line(
         self,
@@ -1267,14 +1352,64 @@ class AutoswapBot:
                 )
                 continue
 
-            route, issue = await self._prepare_affordable_route(
-                router=router,
-                balances=balances,
-                sell_symbol=source_symbol,
-                buy_symbol=target_symbol,
-                proposed_amount=recovery_amount,
-                round_number=0,
-            )
+            while True:
+                try:
+                    route, issue = await self._prepare_affordable_route(
+                        router=router,
+                        balances=balances,
+                        sell_symbol=source_symbol,
+                        buy_symbol=target_symbol,
+                        proposed_amount=recovery_amount,
+                        round_number=0,
+                    )
+                    break
+                except RuntimeError as exc:
+                    if not self._is_retryable_route_error(exc):
+                        raise
+                    wait_seconds = self._sample_network_fee_poll_seconds()
+                    logger.warning(
+                        "Recovery %s -> %s quote gagal sementara: %s",
+                        source_symbol,
+                        target_symbol,
+                        exc,
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        f"⏭️ Recovery {source_symbol}->{target_symbol} : transient quote error ({exc}), retry {int(wait_seconds)}s",
+                    )
+                    await self._sleep_or_stop(wait_seconds)
+                    info = await sdk.get_account_info()
+                    balances = self._balances_by_symbol(info)
+                    available_amount = self._spendable_amount(
+                        source_symbol,
+                        balances.get(source_symbol, Decimal("0")),
+                        self.config.runtime.min_cc_reserve,
+                    )
+                    if available_amount <= dust_for_symbol(source_symbol):
+                        route = None
+                        issue = PlanIssue(
+                            round_number=0,
+                            sell_symbol=source_symbol,
+                            requested_amount=recovery_amount,
+                            available_amount=available_amount,
+                            reason=f"{source_symbol} balance tidak cukup untuk recovery",
+                        )
+                        break
+                    recovery_amount = min(recovery_amount, available_amount)
+            if route is None:
+                if issue is not None:
+                    logger.info(
+                        "Recovery source %s -> %s dilewati: %s | available=%s",
+                        source_symbol,
+                        target_symbol,
+                        issue.reason,
+                        available_amount,
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        f"⏭️ Recovery {source_symbol}->{target_symbol} skipped: {issue.reason}",
+                    )
+                continue
             route, issue = await self._wait_for_recovery_route_ready(
                 sdk=sdk,
                 router=router,
@@ -1541,6 +1676,9 @@ class AutoswapBot:
         if self.config.runtime.full_24h_mode:
             return
         await self._sleep_or_stop(self.config.runtime.swap_delay_seconds_range.sample(self._rng))
+
+    def _sample_network_fee_poll_seconds(self) -> float:
+        return max(1.0, self.config.runtime.network_fee_poll_seconds_range.sample(self._rng))
 
     async def _sleep_or_stop(self, seconds: float) -> None:
         if seconds <= 0:

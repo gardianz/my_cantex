@@ -121,7 +121,7 @@ execution_mode = "sequential"
 min_cc_reserve = "5"
 swap_delay_seconds = { min = 20.0, max = 100.0 }
 max_network_fee_cc_per_execution = "0.12"
-network_fee_poll_seconds = 30
+network_fee_poll_seconds = { min = 20.0, max = 40.0 }
 full_24h_mode = true
 full_24h_auto_restart = true
 telegram_enabled = false
@@ -167,6 +167,7 @@ auto_create_intent_account = true
   - Bot akan cek quote terlebih dahulu sebelum submit transaksi
   - Jika network fee quote saat itu lebih tinggi dari batas ini, transaksi tidak dikirim
   - Bot akan menunggu sesuai `network_fee_poll_seconds`, lalu quote ulang sampai fee turun
+  - Jika saat menunggu muncul quote error sementara seperti `HTTP 502`, bot tidak dianggap gagal; bot tetap hidup dan akan quote ulang lagi
   - Setting ini hanya membatasi network fee, bukan swap fee admin/liquidity
   - Contoh:
     - jika nilai setting `0.12`
@@ -175,7 +176,11 @@ auto_create_intent_account = true
 
 - `network_fee_poll_seconds`
   - Interval tunggu antar pengecekan ulang fee saat fee masih di atas batas
-  - Contoh: `30` berarti bot akan cek ulang setiap 30 detik
+  - Bisa angka tetap atau range `{ min, max }`
+  - Jika memakai range, bot akan memilih jeda random baru pada setiap percobaan
+  - Contoh:
+    - `30` berarti bot akan cek ulang setiap 30 detik
+    - `{ min = 20.0, max = 40.0 }` berarti bot akan cek ulang dengan jeda acak antara 20 sampai 40 detik
 
 - `full_24h_mode`
   - Jika `true`, bot memakai scheduler harian berbasis UTC sampai `00:00 UTC` berikutnya
@@ -341,6 +346,7 @@ Jika `full_24h_mode = true`:
 - jika `full_24h_auto_restart = true`, sesi berikutnya dimulai lagi untuk hari UTC berikutnya
 - `max_network_fee_cc_per_execution` tetap berlaku
 - jika fee terlalu tinggi, bot akan retry quote pada slot round itu
+- jika saat menunggu fee turun muncul quote error sementara seperti `HTTP 502`, bot tetap hidup dan akan mencoba quote ulang lagi
 - retry fee dilakukan sampai tersisa `30 detik` menuju jadwal round berikutnya
 - jika sampai batas itu fee tidak turun, slot round saat itu dilewati dan bot lanjut ke slot berikutnya
 - account tidak dianggap gagal hanya karena fee sedang tinggi

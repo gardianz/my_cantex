@@ -5,7 +5,7 @@ max_concurrency = 1
 min_cc_reserve = "5"
 swap_delay_seconds = { min = 20.0, max = 100.0 }
 max_network_fee_cc_per_execution = "0.12"
-network_fee_poll_seconds = 30
+network_fee_poll_seconds = { min = 20.0, max = 40.0 }
 full_24h_mode = true
 full_24h_min_gap_minutes = 5
 full_24h_auto_restart = true
