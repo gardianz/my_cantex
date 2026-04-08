@@ -123,6 +123,7 @@ swap_delay_seconds = { min = 20.0, max = 100.0 }
 max_network_fee_cc_per_execution = "0.12"
 network_fee_poll_seconds = { min = 20.0, max = 40.0 }
 full_24h_mode = true
+full_24h_startup_mode = "planned"
 full_24h_auto_restart = true
 telegram_enabled = false
 default_continue_on_low_balance = true
@@ -184,6 +185,17 @@ auto_create_intent_account = true
 
 - `full_24h_mode`
   - Jika `true`, bot memakai scheduler harian berbasis UTC sampai `00:00 UTC` berikutnya
+
+- `full_24h_startup_mode`
+  - Menentukan perilaku saat sesi 24 jam dimulai
+  - Setting ini berlaku pada awal setiap sesi harian, termasuk setelah auto restart
+  - `planned`
+    - Bot memakai plan jadwal random seperti logic yang sudah dipakai sebelumnya
+  - `direct`
+    - Bot tidak membuat plan swap di awal sesi
+    - Bot langsung mencoba swap terus-menerus sampai `rounds` sukses terpenuhi
+    - Delay setelah swap yang berhasil mengikuti `swap_delay_seconds`
+    - Jika quota `rounds` sudah tercapai lebih cepat dan `full_24h_auto_restart = true`, bot akan idle sampai `00:00 UTC` berikutnya
 
 - `full_24h_auto_restart`
   - Jika `true`, setelah sesi harian selesai bot akan lanjut ke hari UTC berikutnya
@@ -337,12 +349,14 @@ Catatan:
 
 Jika `full_24h_mode = true`:
 
-- `swap_delay_seconds` diabaikan
-- saat startup bot hanya membuat plan waktu eksekusi swap
+- jika `full_24h_startup_mode = "planned"`, `swap_delay_seconds` diabaikan
+- jika `full_24h_startup_mode = "planned"`, saat startup bot hanya membuat plan waktu eksekusi swap
 - bot tidak membuat plan swap lengkap di awal
-- bot membuat jadwal random per account
+- jika `full_24h_startup_mode = "planned"`, bot membuat jadwal random per account
+- jika `full_24h_startup_mode = "direct"`, bot tidak membuat jadwal random di awal dan langsung mencoba swap
 - semua jadwal memakai acuan UTC
-- target sesi adalah selesai sebelum `00:00 UTC`
+- pada mode `planned`, target sesi adalah selesai sebelum `00:00 UTC`
+- pada mode `direct`, bot terus mencoba sampai quota `rounds` sukses terpenuhi; jika quota selesai lebih cepat dan `full_24h_auto_restart = true`, bot akan idle sampai `00:00 UTC` berikutnya
 - jika `full_24h_auto_restart = true`, sesi berikutnya dimulai lagi untuk hari UTC berikutnya
 - `max_network_fee_cc_per_execution` tetap berlaku
 - jika fee terlalu tinggi, bot akan retry quote pada slot round itu
@@ -357,6 +371,7 @@ Catatan penting:
 - Di dalam 1 account, transaksi tetap serial
 - Saat mode 24 jam aktif, bot selalu memaksa perilaku recovery / continue semampunya
 - Jadi `allow_continue_on_low_balance = false` tidak dipakai sebagai stop keras selama mode 24 jam aktif
+- Pada `full_24h_startup_mode = "direct"`, bot memakai `swap_delay_seconds` hanya setelah swap yang berhasil
 - Di mode normal, bot akan terus menunggu fee turun karena tidak ada jadwal round berikutnya yang menjadi batas deadline
 
 Contoh flow fee cap di mode 24 jam:

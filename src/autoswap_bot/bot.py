@@ -170,11 +170,16 @@ class AutoswapBot:
                 )
 
                 logger.info(
-                    "Strategi=%s | putaran=%s | nominal-range=%s | delay-range=%s | seed=%s",
+                    "Strategi=%s | putaran=%s | nominal-range=%s | delay-range=%s | 24h-start=%s | seed=%s",
                     account.strategy().label,
                     prepared_run.rounds,
                     self._format_text_map(account.describe_amount_ranges()),
                     self.config.runtime.swap_delay_seconds_range.describe(),
+                    (
+                        self.config.runtime.full_24h_startup_mode
+                        if self.config.runtime.full_24h_mode
+                        else "-"
+                    ),
                     self.config.runtime.random_seed if self.config.runtime.random_seed is not None else "-",
                 )
                 self._log_balances(logger, info, "Balance awal")
@@ -211,27 +216,17 @@ class AutoswapBot:
                 used_swap_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 strategy_attempt_index = 0
                 if self.config.runtime.full_24h_mode:
-                    while result.completed_rounds < prepared_run.rounds:
-                        session_start_utc = datetime.now(timezone.utc)
-                        session_end_utc = self._next_utc_midnight(session_start_utc)
-                        remaining_rounds = prepared_run.rounds - result.completed_rounds
-                        execution_buffer_seconds = self._estimate_24h_execution_buffer_seconds(remaining_rounds)
-                        schedule = self._build_24h_schedule(
-                            rounds=remaining_rounds,
-                            start_utc=session_start_utc,
-                            end_utc=session_end_utc,
-                            execution_buffer_seconds=execution_buffer_seconds,
-                        )
-                        self._log_24h_schedule(
-                            logger,
-                            remaining_rounds,
-                            session_start_utc,
-                            session_end_utc,
-                            schedule,
-                            execution_buffer_seconds,
-                            start_round_number=result.completed_rounds + 1,
-                        )
-                        strategy_attempt_index = await self._run_24h_session(
+                    await self.monitor.log_event(
+                        monitor_card,
+                        (
+                            "🗓️ 24h startup mode: planned"
+                            if self.config.runtime.full_24h_startup_mode == "planned"
+                            else "⚡ 24h startup mode: direct"
+                        ),
+                        force=True,
+                    )
+                    if self.config.runtime.full_24h_startup_mode == "direct":
+                        strategy_attempt_index = await self._run_24h_direct_session(
                             sdk=sdk,
                             router=router,
                             account=account,
@@ -242,19 +237,52 @@ class AutoswapBot:
                             used_network_fee=used_network_fee,
                             used_swap_fee=used_swap_fee,
                             result=result,
-                            session_end_utc=session_end_utc,
-                            schedule=schedule,
                         )
-                        if result.completed_rounds < prepared_run.rounds:
-                            logger.info(
-                                "Rounds tersisa %s, lanjut ke sesi UTC berikutnya",
-                                prepared_run.rounds - result.completed_rounds,
+                    else:
+                        while result.completed_rounds < prepared_run.rounds:
+                            session_start_utc = datetime.now(timezone.utc)
+                            session_end_utc = self._next_utc_midnight(session_start_utc)
+                            remaining_rounds = prepared_run.rounds - result.completed_rounds
+                            execution_buffer_seconds = self._estimate_24h_execution_buffer_seconds(remaining_rounds)
+                            schedule = self._build_24h_schedule(
+                                rounds=remaining_rounds,
+                                start_utc=session_start_utc,
+                                end_utc=session_end_utc,
+                                execution_buffer_seconds=execution_buffer_seconds,
                             )
-                            await self.monitor.log_event(
-                                monitor_card,
-                                f"⏭️ {prepared_run.rounds - result.completed_rounds} rounds remaining, continue next UTC session",
-                                force=True,
+                            self._log_24h_schedule(
+                                logger,
+                                remaining_rounds,
+                                session_start_utc,
+                                session_end_utc,
+                                schedule,
+                                execution_buffer_seconds,
+                                start_round_number=result.completed_rounds + 1,
                             )
+                            strategy_attempt_index = await self._run_24h_session(
+                                sdk=sdk,
+                                router=router,
+                                account=account,
+                                prepared_run=prepared_run,
+                                strategy_attempt_index=strategy_attempt_index,
+                                logger=logger,
+                                monitor_card=monitor_card,
+                                used_network_fee=used_network_fee,
+                                used_swap_fee=used_swap_fee,
+                                result=result,
+                                session_end_utc=session_end_utc,
+                                schedule=schedule,
+                            )
+                            if result.completed_rounds < prepared_run.rounds:
+                                logger.info(
+                                    "Rounds tersisa %s, lanjut ke sesi UTC berikutnya",
+                                    prepared_run.rounds - result.completed_rounds,
+                                )
+                                await self.monitor.log_event(
+                                    monitor_card,
+                                    f"⏭️ {prepared_run.rounds - result.completed_rounds} rounds remaining, continue next UTC session",
+                                    force=True,
+                                )
                 else:
                     while result.completed_rounds < prepared_run.rounds:
                         current_round_number = result.completed_rounds + 1
@@ -1498,6 +1526,68 @@ class AutoswapBot:
             balances = self._balances_by_symbol(info)
         return total_tx
 
+    async def _run_24h_direct_session(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        router: RouteOptimizer,
+        account: AccountConfig,
+        prepared_run: PreparedAccountRun,
+        strategy_attempt_index: int,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        used_network_fee: defaultdict[str, Decimal],
+        used_swap_fee: defaultdict[str, Decimal],
+        result: AccountResult,
+    ) -> int:
+        while result.completed_rounds < prepared_run.rounds:
+            self._raise_if_stop_requested()
+            current_round_number = result.completed_rounds + 1
+            sell_symbol, buy_symbol = account.strategy().step_for_round(strategy_attempt_index)
+
+            round_result = await self._execute_round(
+                sdk=sdk,
+                router=router,
+                account=account,
+                prepared_run=prepared_run,
+                round_number=current_round_number,
+                strategy_step_index=strategy_attempt_index,
+                fee_retry_deadline_utc=None,
+                logger=logger,
+                monitor_card=monitor_card,
+                used_network_fee=used_network_fee,
+                used_swap_fee=used_swap_fee,
+            )
+            strategy_attempt_index += 1
+            result.swap_transactions += round_result.tx_count
+            next_sell_symbol, next_buy_symbol = account.strategy().step_for_round(strategy_attempt_index)
+            if round_result.completed:
+                result.completed_rounds += 1
+                if result.completed_rounds >= prepared_run.rounds:
+                    if self.config.runtime.full_24h_auto_restart:
+                        await self._wait_until_next_utc_day_after_quota(
+                            logger=logger,
+                            monitor_card=monitor_card,
+                        )
+                    return strategy_attempt_index
+                await self._sleep_after_direct_24h_success(
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    next_round_number=result.completed_rounds + 1,
+                    pair_key=self._monitor_pair_key(f"{next_sell_symbol}->{next_buy_symbol}"),
+                )
+                continue
+
+            if round_result.skipped:
+                result.skipped_rounds += 1
+            await self._sleep_after_direct_24h_pending(
+                logger=logger,
+                monitor_card=monitor_card,
+                next_round_number=current_round_number,
+                pair_key=self._monitor_pair_key(f"{next_sell_symbol}->{next_buy_symbol}"),
+            )
+        return strategy_attempt_index
+
     async def _run_24h_session(
         self,
         *,
@@ -1672,10 +1762,93 @@ class AutoswapBot:
     def _estimate_24h_execution_buffer_seconds(self, remaining_rounds: int) -> float:
         return max(300.0, remaining_rounds * 90.0)
 
+    async def _wait_until_next_utc_day_after_quota(
+        self,
+        *,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+    ) -> None:
+        now_utc = datetime.now(timezone.utc)
+        next_midnight_utc = self._next_utc_midnight(now_utc)
+        wait_seconds = max(0.0, (next_midnight_utc - now_utc).total_seconds())
+        if wait_seconds <= 0:
+            return
+        logger.info(
+            "Quota harian tercapai, menunggu sampai %s UTC untuk sesi berikutnya",
+            self._format_utc(next_midnight_utc),
+        )
+        await self.monitor.update_status(
+            monitor_card,
+            phase="WAITING_NEXT_DAY",
+            next_scheduled_utc=next_midnight_utc,
+            next_wait_seconds=wait_seconds,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            f"🌙 Daily quota reached, waiting until {self._format_utc(next_midnight_utc)} UTC",
+            force=True,
+        )
+        await self._sleep_or_stop(wait_seconds)
+
+    async def _sleep_after_direct_24h_success(
+        self,
+        *,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        next_round_number: int,
+        pair_key: str,
+    ) -> None:
+        wait_seconds = self._sample_swap_delay_seconds()
+        logger.info(
+            "Mode 24 jam direct menunggu %.0f detik sebelum swap berikutnya",
+            wait_seconds,
+        )
+        await self.monitor.update_status(
+            monitor_card,
+            pair_key=pair_key,
+            round_number=next_round_number,
+            phase="WAITING",
+            next_wait_seconds=wait_seconds,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            f"⏳ Next swap in {int(wait_seconds)}s",
+        )
+        await self._sleep_or_stop(wait_seconds)
+
+    async def _sleep_after_direct_24h_pending(
+        self,
+        *,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        next_round_number: int,
+        pair_key: str,
+    ) -> None:
+        wait_seconds = max(1.0, self.config.runtime.retry_base_delay)
+        logger.info(
+            "Mode 24 jam direct retry lagi dalam %.0f detik",
+            wait_seconds,
+        )
+        await self.monitor.update_status(
+            monitor_card,
+            pair_key=pair_key,
+            round_number=next_round_number,
+            phase="WAITING",
+            next_wait_seconds=wait_seconds,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            f"⏳ Retry next attempt in {int(wait_seconds)}s",
+        )
+        await self._sleep_or_stop(wait_seconds)
+
+    def _sample_swap_delay_seconds(self) -> float:
+        return self.config.runtime.swap_delay_seconds_range.sample(self._rng)
+
     async def _sleep_between_swaps(self) -> None:
         if self.config.runtime.full_24h_mode:
             return
-        await self._sleep_or_stop(self.config.runtime.swap_delay_seconds_range.sample(self._rng))
+        await self._sleep_or_stop(self._sample_swap_delay_seconds())
 
     def _sample_network_fee_poll_seconds(self) -> float:
         return max(1.0, self.config.runtime.network_fee_poll_seconds_range.sample(self._rng))

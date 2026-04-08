@@ -137,6 +137,26 @@ def _parse_decimal_range(value: Any, field_name: str) -> DecimalRange:
     return DecimalRange(min_value=min_value, max_value=max_value)
 
 
+def _normalize_full_24h_startup_mode(value: Any) -> str:
+    mode = str(value).strip().lower()
+    aliases = {
+        "planned": "planned",
+        "plan": "planned",
+        "scheduled": "planned",
+        "schedule": "planned",
+        "direct": "direct",
+        "immediate": "direct",
+        "no_plan": "direct",
+        "noplan": "direct",
+    }
+    normalized = aliases.get(mode)
+    if normalized is None:
+        raise ValueError(
+            "settings.full_24h_startup_mode harus salah satu dari: planned, plan, scheduled, direct, immediate, no_plan"
+        )
+    return normalized
+
+
 def _parse_amount_ranges(raw_amounts: Any, field_name: str) -> dict[str, DecimalRange]:
     if not isinstance(raw_amounts, dict):
         raise ValueError(f"{field_name} harus berupa table/map")
@@ -161,6 +181,7 @@ class RuntimeConfig:
     max_network_fee_cc_per_execution: Decimal | None
     network_fee_poll_seconds_range: FloatRange
     full_24h_mode: bool
+    full_24h_startup_mode: str
     full_24h_min_gap_minutes: float
     full_24h_auto_restart: bool
     full_24h_schedule_log_limit: int
@@ -230,7 +251,15 @@ class BotConfig:
 
 def load_config(path: str | Path) -> BotConfig:
     config_path = Path(path).resolve()
-    raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    try:
+        raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(
+            "Format TOML tidak valid di "
+            f"{config_path}: {exc}. "
+            "Biasanya ini terjadi karena ada key yang ditulis dua kali "
+            "(misalnya `network_fee_poll_seconds`, `swap_delay_seconds`, atau field di `[settings]`)."
+        ) from exc
     settings = raw.get("settings", {})
     defaults = raw.get("defaults", {})
     telegram_enabled = bool(settings.get("telegram_enabled", False))
@@ -260,6 +289,9 @@ def load_config(path: str | Path) -> BotConfig:
             "settings.network_fee_poll_seconds",
         ),
         full_24h_mode=bool(settings.get("full_24h_mode", False)),
+        full_24h_startup_mode=_normalize_full_24h_startup_mode(
+            settings.get("full_24h_startup_mode", "planned")
+        ),
         full_24h_min_gap_minutes=float(settings.get("full_24h_min_gap_minutes", 5.0)),
         full_24h_auto_restart=bool(settings.get("full_24h_auto_restart", False)),
         full_24h_schedule_log_limit=int(settings.get("full_24h_schedule_log_limit", 12)),
