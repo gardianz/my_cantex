@@ -726,7 +726,6 @@ class AutoswapBot:
         await self.monitor.record_round_completed(
             monitor_card,
             pair_key=self._monitor_pair_key(pair_key),
-            tx_count_delta=tx_count,
             force=True,
         )
         latest_activity = await self._fetch_activity_summary(sdk, logger)
@@ -1197,6 +1196,31 @@ class AutoswapBot:
                 )
                 continue
 
+            route, issue = await self._wait_for_network_fee_below_cap(
+                router=router,
+                balances=balances,
+                sell_symbol=source_symbol,
+                buy_symbol=target_symbol,
+                actual_amount=route.hops[0].sell_amount if route.hops else recovery_amount,
+                round_number=0,
+                fee_retry_deadline_utc=None,
+                logger=logger,
+                monitor_card=monitor_card,
+                current_route=route,
+            )
+            if issue is not None:
+                logger.info(
+                    "Recovery source %s -> %s tertahan fee cap: %s",
+                    source_symbol,
+                    target_symbol,
+                    issue.reason,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏭️ Recovery {source_symbol}->{target_symbol} skipped: {issue.reason}",
+                )
+                continue
+
             route_amount = route.hops[0].sell_amount if route.hops else recovery_amount
             logger.info(
                 "Recovery aset sisa | %s -> %s | nominal=%s | route=%s",
@@ -1510,7 +1534,12 @@ class AutoswapBot:
         simulated = deepcopy(balances)
         for hop in route.hops:
             current_sell = simulated.get(hop.sell_symbol, Decimal("0"))
-            spendable_sell = self._spendable_amount(hop.sell_symbol, current_sell, min_cc_reserve)
+            spendable_sell = self._source_spendable_amount(
+                sell_symbol=hop.sell_symbol,
+                buy_symbol=hop.buy_symbol,
+                balance=current_sell,
+                min_cc_reserve=min_cc_reserve,
+            )
             combined_spend = hop.sell_amount
             if hop.sell_symbol == hop.network_fee_symbol:
                 combined_spend += hop.network_fee_amount
@@ -1526,10 +1555,9 @@ class AutoswapBot:
 
             if hop.sell_symbol != hop.network_fee_symbol:
                 network_fee_balance = simulated.get(hop.network_fee_symbol, Decimal("0"))
-                spendable_fee = self._spendable_amount(
-                    hop.network_fee_symbol,
-                    network_fee_balance,
-                    min_cc_reserve,
+                spendable_fee = self._fee_spendable_amount(
+                    symbol=hop.network_fee_symbol,
+                    balance=network_fee_balance,
                 )
                 if spendable_fee < hop.network_fee_amount:
                     return PlanIssue(
@@ -1703,6 +1731,26 @@ class AutoswapBot:
     ) -> Decimal:
         if symbol == CC_SYMBOL:
             return max(Decimal("0"), balance - min_cc_reserve)
+        return max(Decimal("0"), balance)
+
+    def _source_spendable_amount(
+        self,
+        *,
+        sell_symbol: str,
+        buy_symbol: str,
+        balance: Decimal,
+        min_cc_reserve: Decimal,
+    ) -> Decimal:
+        if sell_symbol == CC_SYMBOL and buy_symbol != CC_SYMBOL:
+            return self._spendable_amount(sell_symbol, balance, min_cc_reserve)
+        return max(Decimal("0"), balance)
+
+    def _fee_spendable_amount(
+        self,
+        *,
+        symbol: str,
+        balance: Decimal,
+    ) -> Decimal:
         return max(Decimal("0"), balance)
 
     def _format_amount_map(self, values: dict[str, Decimal]) -> str:

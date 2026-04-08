@@ -163,12 +163,11 @@ class TelegramMonitor:
         card: TelegramCardState | None,
         *,
         pair_key: str,
-        tx_count_delta: int,
         force: bool = True,
     ) -> None:
         if card is None:
             return
-        card.swap_transactions += tx_count_delta
+        card.swap_transactions += 1
         card.pair_completed[pair_key] = card.pair_completed.get(pair_key, 0) + 1
         card.phase = "COMPLETED"
         card.next_scheduled_utc = None
@@ -272,7 +271,6 @@ class TelegramMonitor:
             html.escape(self._build_swaps_line(card)),
             f"🌐 Proxy: {html.escape(card.proxy_label)}",
             html.escape(self._build_reward_line(card)),
-            html.escape(self._build_delta_line(card)),
             "",
             "<b>📝 Latest Logs</b>",
             f"<pre>{html.escape(latest_logs)}</pre>",
@@ -326,34 +324,6 @@ class TelegramMonitor:
         rank = self._metric_value(summary.rank if summary else None)
         return f"🏆 Stats: Reward {reward} | Volume {volume} | Tx {tx} | Rank {rank}"
 
-    def _build_delta_line(self, card: TelegramCardState) -> str:
-        tx_delta = self._build_numeric_delta(
-            card.activity_summary.tx_count if card.activity_summary else None,
-            card.baseline_activity.tx_count if card.baseline_activity else None,
-            fallback=Decimal(card.swap_transactions),
-        )
-        reward_delta = self._build_numeric_delta(
-            card.activity_summary.reward_total if card.activity_summary else None,
-            card.baseline_activity.reward_total if card.baseline_activity else None,
-            fallback=None,
-        )
-        return f"📈 Delta: Tx {tx_delta} | Reward {reward_delta}"
-
-    def _build_numeric_delta(
-        self,
-        current_value: str | None,
-        baseline_value: str | None,
-        *,
-        fallback: Decimal | None,
-    ) -> str:
-        current = self._to_decimal_like(current_value)
-        baseline = self._to_decimal_like(baseline_value)
-        if current is not None and baseline is not None:
-            return self._format_delta_value(current - baseline)
-        if fallback is not None:
-            return self._format_delta_value(fallback)
-        return "-"
-
     def _timestamped_log(self, message: str) -> str:
         now = datetime.now(timezone.utc)
         return f"{now.strftime('%H.%M.%S')} {message[:160]}"
@@ -403,13 +373,6 @@ class TelegramMonitor:
             return Decimal(cleaned)
         except InvalidOperation:
             return None
-
-    def _format_delta_value(self, value: Decimal) -> str:
-        normalized = self._fmt_fee(value.copy_abs())
-        if value == 0:
-            normalized = "0"
-        prefix = "+" if value >= 0 else "-"
-        return f"{prefix}{normalized}"
 
     def _metric_value(self, value: str | None) -> str:
         return value if value not in {None, ""} else "-"
