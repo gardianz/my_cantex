@@ -1105,6 +1105,98 @@ class AutoswapBot:
                 return route, issue
         return route, None
 
+    async def _wait_for_recovery_route_ready(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        router: RouteOptimizer,
+        balances: dict[str, Decimal],
+        source_symbol: str,
+        target_symbol: str,
+        recovery_amount: Decimal,
+        initial_route: RoutePlan,
+        initial_issue: PlanIssue | None,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+    ) -> tuple[RoutePlan, PlanIssue | None]:
+        route = initial_route
+        issue = initial_issue
+        poll_seconds = max(1.0, self.config.runtime.network_fee_poll_seconds)
+        waiting_logged = False
+
+        while True:
+            self._raise_if_stop_requested()
+            if issue is None:
+                route, issue = await self._wait_for_network_fee_below_cap(
+                    router=router,
+                    balances=balances,
+                    sell_symbol=source_symbol,
+                    buy_symbol=target_symbol,
+                    actual_amount=route.hops[0].sell_amount if route.hops else recovery_amount,
+                    round_number=0,
+                    fee_retry_deadline_utc=None,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    current_route=route,
+                )
+                if issue is None:
+                    return route, None
+
+            if issue.reason != "balance fee tidak cukup":
+                return route, issue
+
+            current_fee = route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0"))
+            current_cc = balances.get(CC_SYMBOL, Decimal("0"))
+            if not waiting_logged:
+                logger.info(
+                    "Recovery %s -> %s menunggu fee turun | fee=%s CC | balance CC=%s",
+                    source_symbol,
+                    target_symbol,
+                    current_fee,
+                    current_cc,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏭️ Recovery {source_symbol}->{target_symbol} : balance fee tidak cukup, tunggu fee turun",
+                    force=True,
+                )
+                waiting_logged = True
+
+            if (
+                self.config.runtime.max_network_fee_cc_per_execution is not None
+                and current_fee > self.config.runtime.max_network_fee_cc_per_execution
+            ):
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏳ Network fee {current_fee} CC > limit {self.config.runtime.max_network_fee_cc_per_execution} CC, waiting {int(poll_seconds)}s",
+                )
+
+            await self._sleep_or_stop(poll_seconds)
+            info = await sdk.get_account_info()
+            balances = self._balances_by_symbol(info)
+            available_amount = self._spendable_amount(
+                source_symbol,
+                balances.get(source_symbol, Decimal("0")),
+                self.config.runtime.min_cc_reserve,
+            )
+            if available_amount <= dust_for_symbol(source_symbol):
+                return route, PlanIssue(
+                    round_number=0,
+                    sell_symbol=source_symbol,
+                    requested_amount=recovery_amount,
+                    available_amount=available_amount,
+                    reason=f"{source_symbol} balance tidak cukup untuk recovery",
+                )
+            recovery_amount = min(recovery_amount, available_amount)
+            route, issue = await self._prepare_affordable_route(
+                router=router,
+                balances=balances,
+                sell_symbol=source_symbol,
+                buy_symbol=target_symbol,
+                proposed_amount=recovery_amount,
+                round_number=0,
+            )
+
     def _format_fee_log_line(
         self,
         *,
@@ -1183,34 +1275,21 @@ class AutoswapBot:
                 proposed_amount=recovery_amount,
                 round_number=0,
             )
-            if issue is not None:
-                logger.info(
-                    "Recovery source %s -> %s belum affordable: %s",
-                    source_symbol,
-                    target_symbol,
-                    issue.reason,
-                )
-                await self.monitor.log_event(
-                    monitor_card,
-                    f"⏭️ Recovery {source_symbol}->{target_symbol} skipped: {issue.reason}",
-                )
-                continue
-
-            route, issue = await self._wait_for_network_fee_below_cap(
+            route, issue = await self._wait_for_recovery_route_ready(
+                sdk=sdk,
                 router=router,
                 balances=balances,
-                sell_symbol=source_symbol,
-                buy_symbol=target_symbol,
-                actual_amount=route.hops[0].sell_amount if route.hops else recovery_amount,
-                round_number=0,
-                fee_retry_deadline_utc=None,
+                source_symbol=source_symbol,
+                target_symbol=target_symbol,
+                recovery_amount=recovery_amount,
+                initial_route=route,
+                initial_issue=issue,
                 logger=logger,
                 monitor_card=monitor_card,
-                current_route=route,
             )
             if issue is not None:
                 logger.info(
-                    "Recovery source %s -> %s tertahan fee cap: %s",
+                    "Recovery source %s -> %s belum affordable: %s",
                     source_symbol,
                     target_symbol,
                     issue.reason,
@@ -1274,6 +1353,12 @@ class AutoswapBot:
                 await self._sleep_between_swaps()
             if recovery_failed:
                 continue
+            if target_symbol == CC_SYMBOL:
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"✅ Recovery {source_symbol}->{target_symbol} : refill berhasil",
+                    force=True,
+                )
             info = await sdk.get_account_info()
             balances = self._balances_by_symbol(info)
         return total_tx
