@@ -282,31 +282,29 @@ Artinya account `wallet-2` tetap memakai `false`, walaupun default global `true`
 
 ## Strategi
 
-`strategy` menerima nilai `1-9`:
+`strategy` sekarang hanya menerima nilai `1`, `3`, atau `7`:
 
 1. `CC -> USDCx`
-2. `USDCx -> CC`
 3. `CC -> CBTC`
-4. `CBTC -> CC`
-5. `USDCx -> CBTC`
-6. `CBTC -> USDCx`
-7. Siklik `CC -> USDCx -> CBTC -> CC`
-8. Siklik `USDCx -> CBTC -> CC -> USDCx`
-9. Siklik `CBTC -> CC -> USDCx -> CBTC`
+7. `CC -> USDCx -> CBTC`
 
 Catatan:
 
 - `rounds` adalah jumlah swap sukses yang ingin dicapai
 - `1 swap sukses = 1 round selesai`
-- Untuk strategi `1-6`, bot akan terus mencoba swap yang sama sampai round sukses terkumpul sesuai target
-- Untuk strategi `7-9`, bot mengikuti urutan langkah strategi secara maju
+- Strategi `1` akan memprioritaskan refill token luar strategi ke `CC`, lalu `CC -> USDCx`, lalu unwind `USDCx -> CC` saat `CC` tidak cukup
+- Strategi `3` akan memprioritaskan refill token luar strategi ke `CC`, lalu `CC -> CBTC`, lalu unwind `CBTC -> CC` saat `CC` tidak cukup
+- Strategi `7` memakai static round robin dinamis:
+  - selama `CC` masih cukup, bot bergantian `CC -> USDCx` lalu `CC -> CBTC`
+  - saat `CC` tidak cukup untuk swap keluar, bot masuk fase recycle: `USDCx -> CBTC (50%)`, `CBTC -> USDCx (50%)`, `CBTC -> CC (max)`, `USDCx -> CC (max)`
 - Langkah strategi hanya maju jika swap pada langkah saat ini benar-benar sukses
 - Constraint sementara seperti fee tinggi, minimum ticket protocol, atau source token belum cukup tidak mengurangi `rounds`
 
 Contoh:
 
-- `strategy = "7"` dan `rounds = 3` berarti 1 siklus penuh
-- `strategy = "7"` dan `rounds = 5` berarti 5 langkah berurutan sesuai pola siklik
+- `strategy = "1"` akan terus mengulang flow `refill luar strategi -> CC -> USDCx -> USDCx -> CC`
+- `strategy = "3"` akan terus mengulang flow `refill luar strategi -> CC -> CBTC -> CBTC -> CC`
+- `strategy = "7"` akan terus memakai round robin dinamis antara fase spend dan fase recycle sampai target `rounds` sukses terpenuhi
 
 ## Amount dan Rounds
 

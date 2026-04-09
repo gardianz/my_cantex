@@ -30,64 +30,32 @@ STRATEGIES = {
         label="Strategi 1: CC -> USDCx",
         steps=(("CC", "USDCx"),),
     ),
-    "strategy_2": StrategyDefinition(
-        key="strategy_2",
-        label="Strategi 2: USDCx -> CC",
-        steps=(("USDCx", "CC"),),
-    ),
     "strategy_3": StrategyDefinition(
         key="strategy_3",
         label="Strategi 3: CC -> CBTC",
         steps=(("CC", "CBTC"),),
     ),
-    "strategy_4": StrategyDefinition(
-        key="strategy_4",
-        label="Strategi 4: CBTC -> CC",
-        steps=(("CBTC", "CC"),),
-    ),
-    "strategy_5": StrategyDefinition(
-        key="strategy_5",
-        label="Strategi 5: USDCx -> CBTC",
-        steps=(("USDCx", "CBTC"),),
-    ),
-    "strategy_6": StrategyDefinition(
-        key="strategy_6",
-        label="Strategi 6: CBTC -> USDCx",
-        steps=(("CBTC", "USDCx"),),
-    ),
     "strategy_7": StrategyDefinition(
         key="strategy_7",
-        label="Strategi 7: Siklik CC -> USDCx -> CBTC",
-        steps=(("CC", "USDCx"), ("USDCx", "CBTC"), ("CBTC", "CC")),
-    ),
-    "strategy_8": StrategyDefinition(
-        key="strategy_8",
-        label="Strategi 8: Siklik USDCx -> CBTC -> CC",
-        steps=(("USDCx", "CBTC"), ("CBTC", "CC"), ("CC", "USDCx")),
-    ),
-    "strategy_9": StrategyDefinition(
-        key="strategy_9",
-        label="Strategi 9: Siklik CBTC -> CC -> USDCx",
-        steps=(("CBTC", "CC"), ("CC", "USDCx"), ("USDCx", "CBTC")),
+        label="Strategi 7: CC -> USDCx -> CBTC",
+        steps=(
+            ("CC", "USDCx"),
+            ("CC", "CBTC"),
+            ("USDCx", "CBTC"),
+            ("CBTC", "USDCx"),
+            ("CBTC", "CC"),
+            ("USDCx", "CC"),
+        ),
     ),
 }
 
 STRATEGY_ALIASES = {
     "1": "strategy_1",
-    "2": "strategy_2",
     "3": "strategy_3",
-    "4": "strategy_4",
-    "5": "strategy_5",
-    "6": "strategy_6",
     "7": "strategy_7",
-    "8": "strategy_8",
-    "9": "strategy_9",
     "cc_to_usdcx": "strategy_1",
-    "usdcx_to_cc": "strategy_2",
     "cc_to_cbtc": "strategy_3",
-    "cbtc_to_cc": "strategy_4",
-    "usdcx_to_cbtc": "strategy_5",
-    "cbtc_to_usdcx": "strategy_6",
+    "cc_to_usdcx_to_cbtc": "strategy_7",
 }
 
 

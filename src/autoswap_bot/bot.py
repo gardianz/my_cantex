@@ -46,6 +46,22 @@ class ScheduledRound:
     execute_at_utc: datetime
 
 
+@dataclass
+class StrategyRuntimeState:
+    primary_index: int = 0
+    recycle_index: int = 0
+
+
+@dataclass(frozen=True)
+class StrategyAction:
+    sell_symbol: str
+    buy_symbol: str
+    amount_mode: str
+    pointer_group: str | None = None
+    pointer_next_index: int | None = None
+    fraction: Decimal | None = None
+
+
 @dataclass(frozen=True)
 class RoundExecutionResult:
     completed: bool
@@ -214,7 +230,7 @@ class AutoswapBot:
 
                 used_network_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 used_swap_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
-                strategy_attempt_index = 0
+                strategy_state = StrategyRuntimeState()
                 if self.config.runtime.full_24h_mode:
                     await self.monitor.log_event(
                         monitor_card,
@@ -226,12 +242,12 @@ class AutoswapBot:
                         force=True,
                     )
                     if self.config.runtime.full_24h_startup_mode == "direct":
-                        strategy_attempt_index = await self._run_24h_direct_session(
+                        await self._run_24h_direct_session(
                             sdk=sdk,
                             router=router,
                             account=account,
                             prepared_run=prepared_run,
-                            strategy_attempt_index=strategy_attempt_index,
+                            strategy_state=strategy_state,
                             logger=logger,
                             monitor_card=monitor_card,
                             used_network_fee=used_network_fee,
@@ -259,12 +275,12 @@ class AutoswapBot:
                                 execution_buffer_seconds,
                                 start_round_number=result.completed_rounds + 1,
                             )
-                            strategy_attempt_index = await self._run_24h_session(
+                            await self._run_24h_session(
                                 sdk=sdk,
                                 router=router,
                                 account=account,
                                 prepared_run=prepared_run,
-                                strategy_attempt_index=strategy_attempt_index,
+                                strategy_state=strategy_state,
                                 logger=logger,
                                 monitor_card=monitor_card,
                                 used_network_fee=used_network_fee,
@@ -292,17 +308,16 @@ class AutoswapBot:
                             account=account,
                             prepared_run=prepared_run,
                             round_number=current_round_number,
-                            strategy_step_index=strategy_attempt_index,
+                            strategy_state=strategy_state,
                             fee_retry_deadline_utc=None,
                             logger=logger,
                             monitor_card=monitor_card,
                             used_network_fee=used_network_fee,
                             used_swap_fee=used_swap_fee,
                         )
-                        strategy_attempt_index += 1
-                        result.swap_transactions += round_result.tx_count
                         if round_result.completed:
                             result.completed_rounds += 1
+                            result.swap_transactions += 1
                             continue
                         if round_result.skipped:
                             result.skipped_rounds += 1
@@ -389,6 +404,258 @@ class AutoswapBot:
             raise RuntimeError(f"Instrument tidak ditemukan untuk simbol: {', '.join(missing)}")
         return resolved
 
+    def _build_round_robin_candidates(
+        self,
+        actions: tuple[tuple[str, str, str, Decimal | None], ...],
+        *,
+        start_index: int,
+        pointer_group: str,
+    ) -> list[StrategyAction]:
+        candidates: list[StrategyAction] = []
+        action_count = len(actions)
+        for offset in range(action_count):
+            current_index = (start_index + offset) % action_count
+            sell_symbol, buy_symbol, amount_mode, fraction = actions[current_index]
+            candidates.append(
+                StrategyAction(
+                    sell_symbol=sell_symbol,
+                    buy_symbol=buy_symbol,
+                    amount_mode=amount_mode,
+                    pointer_group=pointer_group,
+                    pointer_next_index=(current_index + 1) % action_count,
+                    fraction=fraction,
+                )
+            )
+        return candidates
+
+    def _strategy_action_candidates(
+        self,
+        *,
+        account: AccountConfig,
+        balances: dict[str, Decimal],
+        strategy_state: StrategyRuntimeState,
+    ) -> tuple[list[StrategyAction], str]:
+        strategy_key = account.strategy().key
+        if strategy_key == "strategy_1":
+            return self._strategy_1_action_candidates(account=account, balances=balances)
+        if strategy_key == "strategy_3":
+            return self._strategy_3_action_candidates(account=account, balances=balances)
+        if strategy_key == "strategy_7":
+            return self._strategy_7_action_candidates(
+                account=account,
+                balances=balances,
+                strategy_state=strategy_state,
+            )
+        raise ValueError(f"Strategi {strategy_key} tidak lagi didukung")
+
+    def _strategy_1_action_candidates(
+        self,
+        *,
+        account: AccountConfig,
+        balances: dict[str, Decimal],
+    ) -> tuple[list[StrategyAction], str]:
+        candidates: list[StrategyAction] = []
+        foreign_balance = self._spendable_amount(
+            "CBTC",
+            balances.get("CBTC", Decimal("0")),
+            self.config.runtime.min_cc_reserve,
+        )
+        if foreign_balance > dust_for_symbol("CBTC"):
+            candidates.append(StrategyAction(sell_symbol="CBTC", buy_symbol="CC", amount_mode="max"))
+
+        cc_amount_range = account.amount_range_for_symbol(CC_SYMBOL)
+        spendable_cc = self._spendable_amount(
+            CC_SYMBOL,
+            balances.get(CC_SYMBOL, Decimal("0")),
+            self.config.runtime.min_cc_reserve,
+        )
+        if spendable_cc >= cc_amount_range.min_value:
+            candidates.append(StrategyAction(sell_symbol="CC", buy_symbol="USDCx", amount_mode="config"))
+
+        strategy_balance = self._spendable_amount(
+            "USDCx",
+            balances.get("USDCx", Decimal("0")),
+            self.config.runtime.min_cc_reserve,
+        )
+        if strategy_balance > dust_for_symbol("USDCx"):
+            candidates.append(StrategyAction(sell_symbol="USDCx", buy_symbol="CC", amount_mode="max"))
+
+        if candidates:
+            return candidates, "strategy_1 ready"
+        return [], self._cc_source_block_reason(
+            balance_cc=balances.get(CC_SYMBOL, Decimal("0")),
+            spendable_cc=spendable_cc,
+            required_min_amount=cc_amount_range.min_value,
+        )
+
+    def _strategy_3_action_candidates(
+        self,
+        *,
+        account: AccountConfig,
+        balances: dict[str, Decimal],
+    ) -> tuple[list[StrategyAction], str]:
+        candidates: list[StrategyAction] = []
+        foreign_balance = self._spendable_amount(
+            "USDCx",
+            balances.get("USDCx", Decimal("0")),
+            self.config.runtime.min_cc_reserve,
+        )
+        if foreign_balance > dust_for_symbol("USDCx"):
+            candidates.append(StrategyAction(sell_symbol="USDCx", buy_symbol="CC", amount_mode="max"))
+
+        cc_amount_range = account.amount_range_for_symbol(CC_SYMBOL)
+        spendable_cc = self._spendable_amount(
+            CC_SYMBOL,
+            balances.get(CC_SYMBOL, Decimal("0")),
+            self.config.runtime.min_cc_reserve,
+        )
+        if spendable_cc >= cc_amount_range.min_value:
+            candidates.append(StrategyAction(sell_symbol="CC", buy_symbol="CBTC", amount_mode="config"))
+
+        strategy_balance = self._spendable_amount(
+            "CBTC",
+            balances.get("CBTC", Decimal("0")),
+            self.config.runtime.min_cc_reserve,
+        )
+        if strategy_balance > dust_for_symbol("CBTC"):
+            candidates.append(StrategyAction(sell_symbol="CBTC", buy_symbol="CC", amount_mode="max"))
+
+        if candidates:
+            return candidates, "strategy_3 ready"
+        return [], self._cc_source_block_reason(
+            balance_cc=balances.get(CC_SYMBOL, Decimal("0")),
+            spendable_cc=spendable_cc,
+            required_min_amount=cc_amount_range.min_value,
+        )
+
+    def _strategy_7_action_candidates(
+        self,
+        *,
+        account: AccountConfig,
+        balances: dict[str, Decimal],
+        strategy_state: StrategyRuntimeState,
+    ) -> tuple[list[StrategyAction], str]:
+        cc_amount_range = account.amount_range_for_symbol(CC_SYMBOL)
+        spendable_cc = self._spendable_amount(
+            CC_SYMBOL,
+            balances.get(CC_SYMBOL, Decimal("0")),
+            self.config.runtime.min_cc_reserve,
+        )
+        if spendable_cc >= cc_amount_range.min_value:
+            return self._build_round_robin_candidates(
+                (
+                    ("CC", "USDCx", "config", None),
+                    ("CC", "CBTC", "config", None),
+                ),
+                start_index=strategy_state.primary_index,
+                pointer_group="primary",
+            ), "strategy_7 spend phase"
+
+        recycle_candidates: list[StrategyAction] = []
+        recycle_actions = self._build_round_robin_candidates(
+            (
+                ("USDCx", "CBTC", "fraction", Decimal("0.5")),
+                ("CBTC", "USDCx", "fraction", Decimal("0.5")),
+                ("CBTC", "CC", "max", None),
+                ("USDCx", "CC", "max", None),
+            ),
+            start_index=strategy_state.recycle_index,
+            pointer_group="recycle",
+        )
+        for action in recycle_actions:
+            spendable_source = self._spendable_amount(
+                action.sell_symbol,
+                balances.get(action.sell_symbol, Decimal("0")),
+                self.config.runtime.min_cc_reserve,
+            )
+            if spendable_source <= dust_for_symbol(action.sell_symbol):
+                continue
+            recycle_candidates.append(action)
+        if recycle_candidates:
+            return recycle_candidates, "strategy_7 recycle phase"
+        return [], self._cc_source_block_reason(
+            balance_cc=balances.get(CC_SYMBOL, Decimal("0")),
+            spendable_cc=spendable_cc,
+            required_min_amount=cc_amount_range.min_value,
+        )
+
+    async def _resolve_strategy_action_amount(
+        self,
+        *,
+        account: AccountConfig,
+        action: StrategyAction,
+        balances: dict[str, Decimal],
+        router: RouteOptimizer,
+    ) -> tuple[Decimal | None, Decimal | None, str | None]:
+        available_amount = self._spendable_amount(
+            action.sell_symbol,
+            balances.get(action.sell_symbol, Decimal("0")),
+            self.config.runtime.min_cc_reserve,
+        )
+        if available_amount <= dust_for_symbol(action.sell_symbol):
+            return None, None, f"{action.sell_symbol} balance terlalu kecil"
+
+        if action.amount_mode == "config":
+            amount_range = account.amount_range_for_symbol(action.sell_symbol)
+            max_allowed_amount = min(available_amount, amount_range.max_value)
+            if max_allowed_amount < amount_range.min_value:
+                reason = (
+                    self._cc_source_block_reason(
+                        balance_cc=balances.get(CC_SYMBOL, Decimal("0")),
+                        spendable_cc=available_amount,
+                        required_min_amount=amount_range.min_value,
+                    )
+                    if action.sell_symbol == CC_SYMBOL
+                    else f"{action.sell_symbol} balance below user config min ({available_amount} < {amount_range.min_value})"
+                )
+                return None, amount_range.min_value, reason
+            target_amount = self._sample_execution_amount(amount_range, max_allowed_amount)
+            actual_amount, min_ticket_reason = await self._normalize_amount_for_min_ticket(
+                router=router,
+                sell_symbol=action.sell_symbol,
+                buy_symbol=action.buy_symbol,
+                desired_amount=target_amount,
+                max_available_amount=max_allowed_amount,
+            )
+            return actual_amount, amount_range.min_value, min_ticket_reason
+
+        if action.amount_mode == "max":
+            actual_amount, min_ticket_reason = await self._normalize_amount_for_min_ticket(
+                router=router,
+                sell_symbol=action.sell_symbol,
+                buy_symbol=action.buy_symbol,
+                desired_amount=available_amount,
+                max_available_amount=available_amount,
+            )
+            return actual_amount, None, min_ticket_reason
+
+        if action.amount_mode == "fraction":
+            fraction = action.fraction or Decimal("0")
+            desired_amount = available_amount * fraction
+            if desired_amount <= dust_for_symbol(action.sell_symbol):
+                return None, None, f"{action.sell_symbol} balance terlalu kecil untuk mode {fraction}"
+            actual_amount, min_ticket_reason = await self._normalize_amount_for_min_ticket(
+                router=router,
+                sell_symbol=action.sell_symbol,
+                buy_symbol=action.buy_symbol,
+                desired_amount=desired_amount,
+                max_available_amount=available_amount,
+            )
+            return actual_amount, None, min_ticket_reason
+
+        raise ValueError(f"Mode amount tidak didukung: {action.amount_mode}")
+
+    def _advance_strategy_state_after_success(
+        self,
+        *,
+        strategy_state: StrategyRuntimeState,
+        action: StrategyAction,
+    ) -> None:
+        if action.pointer_group == "primary" and action.pointer_next_index is not None:
+            strategy_state.primary_index = action.pointer_next_index
+        if action.pointer_group == "recycle" and action.pointer_next_index is not None:
+            strategy_state.recycle_index = action.pointer_next_index
+
     async def _execute_round(
         self,
         *,
@@ -397,7 +664,36 @@ class AutoswapBot:
         account: AccountConfig,
         prepared_run: PreparedAccountRun,
         round_number: int,
-        strategy_step_index: int,
+        strategy_state: StrategyRuntimeState,
+        fee_retry_deadline_utc: datetime | None,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        used_network_fee: defaultdict[str, Decimal],
+        used_swap_fee: defaultdict[str, Decimal],
+    ) -> RoundExecutionResult:
+        return await self._execute_round_dynamic(
+            sdk=sdk,
+            router=router,
+            account=account,
+            prepared_run=prepared_run,
+            round_number=round_number,
+            strategy_state=strategy_state,
+            fee_retry_deadline_utc=fee_retry_deadline_utc,
+            logger=logger,
+            monitor_card=monitor_card,
+            used_network_fee=used_network_fee,
+            used_swap_fee=used_swap_fee,
+        )
+
+    async def _execute_round_dynamic(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        router: RouteOptimizer,
+        account: AccountConfig,
+        prepared_run: PreparedAccountRun,
+        round_number: int,
+        strategy_state: StrategyRuntimeState,
         fee_retry_deadline_utc: datetime | None,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
@@ -405,8 +701,23 @@ class AutoswapBot:
         used_swap_fee: defaultdict[str, Decimal],
     ) -> RoundExecutionResult:
         tx_count = 0
-        sell_symbol, buy_symbol = account.strategy().step_for_round(strategy_step_index)
-        pair_key = f"{sell_symbol}->{buy_symbol}"
+        sell_symbol = "-"
+        buy_symbol = "-"
+        pair_key = "-"
+        selected_action: StrategyAction | None = None
+        return await self._execute_round_dynamic_v2(
+            sdk=sdk,
+            router=router,
+            account=account,
+            prepared_run=prepared_run,
+            round_number=round_number,
+            strategy_state=strategy_state,
+            fee_retry_deadline_utc=fee_retry_deadline_utc,
+            logger=logger,
+            monitor_card=monitor_card,
+            used_network_fee=used_network_fee,
+            used_swap_fee=used_swap_fee,
+        )
         try:
             info = await sdk.get_account_info()
             balances = self._balances_by_symbol(info)
@@ -808,6 +1119,352 @@ class AutoswapBot:
             monitor_card,
             "🎉 Swap completed!",
             force=True,
+        )
+        return RoundExecutionResult(
+            completed=True,
+            tx_count=tx_count,
+        )
+
+    async def _execute_round_dynamic_v2(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        router: RouteOptimizer,
+        account: AccountConfig,
+        prepared_run: PreparedAccountRun,
+        round_number: int,
+        strategy_state: StrategyRuntimeState,
+        fee_retry_deadline_utc: datetime | None,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        used_network_fee: defaultdict[str, Decimal],
+        used_swap_fee: defaultdict[str, Decimal],
+    ) -> RoundExecutionResult:
+        tx_count = 0
+        sell_symbol = "-"
+        buy_symbol = "-"
+        pair_key = "-"
+        selected_action: StrategyAction | None = None
+
+        try:
+            info = await sdk.get_account_info()
+            balances = self._balances_by_symbol(info)
+            await self.monitor.update_balances(monitor_card, balances)
+            action_candidates, pending_reason = self._strategy_action_candidates(
+                account=account,
+                balances=balances,
+                strategy_state=strategy_state,
+            )
+            if not action_candidates:
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏭️ Round {round_number} pending: {pending_reason}",
+                    force=True,
+                )
+                return RoundExecutionResult(
+                    completed=False,
+                    tx_count=tx_count,
+                    stop_reason="WAIT_SOURCE_BALANCE",
+                    skipped=True,
+                )
+
+            route: RoutePlan | None = None
+            actual_amount: Decimal | None = None
+            last_invalid_reason = pending_reason
+
+            for action in action_candidates:
+                sell_symbol = action.sell_symbol
+                buy_symbol = action.buy_symbol
+                pair_key = f"{sell_symbol}->{buy_symbol}"
+                actual_amount, user_min_amount, amount_reason = await self._resolve_strategy_action_amount(
+                    account=account,
+                    action=action,
+                    balances=balances,
+                    router=router,
+                )
+                if actual_amount is None:
+                    if amount_reason:
+                        last_invalid_reason = amount_reason
+                        logger.info(
+                            "Putaran %s kandidat belum valid | %s -> %s | %s",
+                            round_number,
+                            sell_symbol,
+                            buy_symbol,
+                            amount_reason,
+                        )
+                    continue
+
+                route, issue = await self._prepare_affordable_route(
+                    router=router,
+                    balances=balances,
+                    sell_symbol=sell_symbol,
+                    buy_symbol=buy_symbol,
+                    proposed_amount=actual_amount,
+                    round_number=round_number,
+                )
+                if issue is not None:
+                    last_invalid_reason = issue.reason
+                    logger.info(
+                        "Putaran %s kandidat belum affordable | %s -> %s | %s",
+                        round_number,
+                        sell_symbol,
+                        buy_symbol,
+                        issue.reason,
+                    )
+                    continue
+
+                if user_min_amount is not None and route.hops and route.hops[0].sell_amount < user_min_amount:
+                    last_invalid_reason = (
+                        f"route adjusted amount below user config min ({route.hops[0].sell_amount} < {user_min_amount})"
+                    )
+                    logger.info(
+                        "Putaran %s kandidat belum bisa dieksekusi | %s -> %s | %s",
+                        round_number,
+                        sell_symbol,
+                        buy_symbol,
+                        last_invalid_reason,
+                    )
+                    continue
+
+                selected_action = action
+                break
+
+            if selected_action is None or actual_amount is None or route is None:
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏭️ Round {round_number} pending: {last_invalid_reason}",
+                    force=True,
+                )
+                return RoundExecutionResult(
+                    completed=False,
+                    tx_count=tx_count,
+                    stop_reason="ROUND_AFFORDABILITY_CHECK_FAILED",
+                    skipped=True,
+                )
+        except (CantexAPIError, CantexTimeoutError) as exc:
+            logger.warning(
+                "Putaran %s gagal sementara | %s -> %s | %s",
+                round_number,
+                sell_symbol,
+                buy_symbol,
+                exc,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"⏭️ Round {round_number} pending: transient API error ({exc})",
+                force=True,
+            )
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason="TRANSIENT_API_ERROR",
+                skipped=True,
+            )
+        except RuntimeError as exc:
+            if not self._is_retryable_route_error(exc):
+                raise
+            logger.warning(
+                "Putaran %s gagal sementara saat siapkan route | %s -> %s | %s",
+                round_number,
+                sell_symbol,
+                buy_symbol,
+                exc,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"⏭️ Round {round_number} pending: transient quote error ({exc})",
+                force=True,
+            )
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason="TRANSIENT_ROUTE_ERROR",
+                skipped=True,
+            )
+
+        try:
+            route, issue = await self._wait_for_network_fee_below_cap(
+                router=router,
+                balances=balances,
+                sell_symbol=sell_symbol,
+                buy_symbol=buy_symbol,
+                actual_amount=actual_amount,
+                round_number=round_number,
+                fee_retry_deadline_utc=fee_retry_deadline_utc,
+                logger=logger,
+                monitor_card=monitor_card,
+                current_route=route,
+            )
+        except (CantexAPIError, CantexTimeoutError) as exc:
+            logger.warning(
+                "Putaran %s gagal sementara saat cek fee | %s -> %s | %s",
+                round_number,
+                sell_symbol,
+                buy_symbol,
+                exc,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"⏭️ Round {round_number} pending: transient API error ({exc})",
+                force=True,
+            )
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason="TRANSIENT_API_ERROR",
+                skipped=True,
+            )
+        except RuntimeError as exc:
+            if not self._is_retryable_route_error(exc):
+                raise
+            logger.warning(
+                "Putaran %s gagal sementara saat tunggu fee | %s -> %s | %s",
+                round_number,
+                sell_symbol,
+                buy_symbol,
+                exc,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"⏭️ Round {round_number} pending: transient quote error ({exc})",
+                force=True,
+            )
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason="TRANSIENT_ROUTE_ERROR",
+                skipped=True,
+            )
+
+        if issue is not None:
+            message = (
+                f"⏭️ Round {round_number} slot skipped: {issue.reason}"
+                if "30 detik sebelum jadwal berikutnya" in issue.reason
+                else f"⏭️ Round {round_number} pending: {issue.reason}"
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                message,
+                force=True,
+            )
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason="ROUND_AFFORDABILITY_CHECK_FAILED",
+                skipped=True,
+            )
+
+        await self.monitor.update_status(
+            monitor_card,
+            pair_key=self._monitor_pair_key(pair_key),
+            round_number=round_number,
+            phase="PROCESSING",
+        )
+        logger.info(
+            "Putaran %s | %s -> %s | nominal=%s | route=%s | fee est=%s | network fee est=%s",
+            round_number,
+            sell_symbol,
+            buy_symbol,
+            actual_amount,
+            route.label,
+            self._format_amount_map(route.total_admin_and_liquidity_by_symbol),
+            self._format_amount_map(route.total_network_fee_by_symbol),
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            f"🔄 Round {round_number}/{prepared_run.rounds} {self._monitor_pair_key(pair_key)} ({actual_amount})",
+        )
+
+        for hop_index, hop in enumerate(route.hops, start=1):
+            tx_result, failure_reason = await self._swap_hop_with_retry(
+                sdk=sdk,
+                hop=hop,
+                hop_index=hop_index,
+                hop_total=len(route.hops),
+                round_number=round_number,
+                logger=logger,
+                monitor_card=monitor_card,
+            )
+            if tx_result is None:
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏭️ Round {round_number} pending: {failure_reason or 'retry limit reached'}",
+                    force=True,
+                )
+                return RoundExecutionResult(
+                    completed=False,
+                    tx_count=tx_count,
+                    stop_reason=failure_reason or "SWAP_HOP_FAILED_SKIPPED",
+                    skipped=True,
+                )
+
+            tx_count += 1
+            used_network_fee[hop.network_fee_symbol] += hop.network_fee_amount
+            used_swap_fee[hop.fee_symbol] += hop.admin_fee_amount + hop.liquidity_fee_amount
+            await self.monitor.update_fee_totals(
+                monitor_card,
+                total_network_fee=dict(used_network_fee),
+                total_swap_fee=dict(used_swap_fee),
+            )
+            tx_identifier = tx_result.get("id") or tx_result.get("transactionId") or tx_result.get("contract_id")
+            logger.info(
+                "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output est=%s %s",
+                hop_index,
+                len(route.hops),
+                hop.sell_symbol,
+                hop.buy_symbol,
+                tx_identifier or "-",
+                hop.returned_amount,
+                hop.buy_symbol,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"✅ Hop {hop_index}/{len(route.hops)} {hop.sell_symbol}->{hop.buy_symbol} tx={tx_identifier or '-'}",
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                self._format_fee_log_line(
+                    prefix="Fee tx",
+                    network_fee={hop.network_fee_symbol: hop.network_fee_amount},
+                    swap_fee={hop.fee_symbol: hop.admin_fee_amount + hop.liquidity_fee_amount},
+                ),
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                self._format_fee_log_line(
+                    prefix="Fee total",
+                    network_fee=dict(used_network_fee),
+                    swap_fee=dict(used_swap_fee),
+                ),
+            )
+            await self._sleep_between_swaps()
+
+        latest_info = await sdk.get_account_info()
+        latest_balances = self._balances_by_symbol(latest_info)
+        await self.monitor.update_balances(
+            monitor_card,
+            latest_balances,
+            force=True,
+        )
+        await self.monitor.record_round_completed(
+            monitor_card,
+            pair_key=self._monitor_pair_key(pair_key),
+            force=True,
+        )
+        latest_activity = await self._fetch_activity_summary(sdk, logger)
+        await self.monitor.update_activity(
+            monitor_card,
+            latest_activity,
+            force=True,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            "🎉 Swap completed!",
+            force=True,
+        )
+        self._advance_strategy_state_after_success(
+            strategy_state=strategy_state,
+            action=selected_action,
         )
         return RoundExecutionResult(
             completed=True,
@@ -1533,17 +2190,16 @@ class AutoswapBot:
         router: RouteOptimizer,
         account: AccountConfig,
         prepared_run: PreparedAccountRun,
-        strategy_attempt_index: int,
+        strategy_state: StrategyRuntimeState,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         used_network_fee: defaultdict[str, Decimal],
         used_swap_fee: defaultdict[str, Decimal],
         result: AccountResult,
-    ) -> int:
+    ) -> None:
         while result.completed_rounds < prepared_run.rounds:
             self._raise_if_stop_requested()
             current_round_number = result.completed_rounds + 1
-            sell_symbol, buy_symbol = account.strategy().step_for_round(strategy_attempt_index)
 
             round_result = await self._execute_round(
                 sdk=sdk,
@@ -1551,30 +2207,28 @@ class AutoswapBot:
                 account=account,
                 prepared_run=prepared_run,
                 round_number=current_round_number,
-                strategy_step_index=strategy_attempt_index,
+                strategy_state=strategy_state,
                 fee_retry_deadline_utc=None,
                 logger=logger,
                 monitor_card=monitor_card,
                 used_network_fee=used_network_fee,
                 used_swap_fee=used_swap_fee,
             )
-            strategy_attempt_index += 1
-            result.swap_transactions += round_result.tx_count
-            next_sell_symbol, next_buy_symbol = account.strategy().step_for_round(strategy_attempt_index)
             if round_result.completed:
                 result.completed_rounds += 1
+                result.swap_transactions += 1
                 if result.completed_rounds >= prepared_run.rounds:
                     if self.config.runtime.full_24h_auto_restart:
                         await self._wait_until_next_utc_day_after_quota(
                             logger=logger,
                             monitor_card=monitor_card,
                         )
-                    return strategy_attempt_index
+                    return
                 await self._sleep_after_direct_24h_success(
                     logger=logger,
                     monitor_card=monitor_card,
                     next_round_number=result.completed_rounds + 1,
-                    pair_key=self._monitor_pair_key(f"{next_sell_symbol}->{next_buy_symbol}"),
+                    pair_key=None,
                 )
                 continue
 
@@ -1584,9 +2238,9 @@ class AutoswapBot:
                 logger=logger,
                 monitor_card=monitor_card,
                 next_round_number=current_round_number,
-                pair_key=self._monitor_pair_key(f"{next_sell_symbol}->{next_buy_symbol}"),
+                pair_key=None,
             )
-        return strategy_attempt_index
+        return
 
     async def _run_24h_session(
         self,
@@ -1595,7 +2249,7 @@ class AutoswapBot:
         router: RouteOptimizer,
         account: AccountConfig,
         prepared_run: PreparedAccountRun,
-        strategy_attempt_index: int,
+        strategy_state: StrategyRuntimeState,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         used_network_fee: defaultdict[str, Decimal],
@@ -1603,22 +2257,21 @@ class AutoswapBot:
         result: AccountResult,
         session_end_utc: datetime,
         schedule: tuple[ScheduledRound, ...],
-    ) -> int:
+    ) -> None:
         for scheduled_round in schedule:
             self._raise_if_stop_requested()
             if result.completed_rounds >= prepared_run.rounds:
-                return strategy_attempt_index
+                return
             now_utc = datetime.now(timezone.utc)
             if now_utc >= session_end_utc:
                 logger.info(
                     "Mode 24 jam selesai pada %s UTC",
                     self._format_utc(session_end_utc),
                 )
-                return strategy_attempt_index
+                return
 
             wait_seconds = (scheduled_round.execute_at_utc - now_utc).total_seconds()
             current_round_number = result.completed_rounds + 1
-            sell_symbol, buy_symbol = account.strategy().step_for_round(strategy_attempt_index)
             next_slot_utc = (
                 schedule[scheduled_round.round_index + 1].execute_at_utc
                 if scheduled_round.round_index + 1 < len(schedule)
@@ -1634,9 +2287,6 @@ class AutoswapBot:
                 )
                 await self.monitor.update_status(
                     monitor_card,
-                    pair_key=self._monitor_pair_key(
-                        f"{sell_symbol}->{buy_symbol}"
-                    ),
                     round_number=current_round_number,
                     phase="WAITING",
                     next_scheduled_utc=scheduled_round.execute_at_utc,
@@ -1660,21 +2310,20 @@ class AutoswapBot:
                 account=account,
                 prepared_run=prepared_run,
                 round_number=current_round_number,
-                strategy_step_index=strategy_attempt_index,
+                strategy_state=strategy_state,
                 fee_retry_deadline_utc=fee_retry_deadline_utc,
                 logger=logger,
                 monitor_card=monitor_card,
                 used_network_fee=used_network_fee,
                 used_swap_fee=used_swap_fee,
             )
-            strategy_attempt_index += 1
-            result.swap_transactions += round_result.tx_count
             if round_result.completed:
                 result.completed_rounds += 1
+                result.swap_transactions += 1
             elif round_result.skipped:
                 result.skipped_rounds += 1
         logger.info("Sesi 24 jam selesai pada %s UTC", self._format_utc(session_end_utc))
-        return strategy_attempt_index
+        return
 
     def _build_24h_schedule(
         self,
@@ -1796,7 +2445,7 @@ class AutoswapBot:
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         next_round_number: int,
-        pair_key: str,
+        pair_key: str | None,
     ) -> None:
         wait_seconds = self._sample_swap_delay_seconds()
         logger.info(
@@ -1822,7 +2471,7 @@ class AutoswapBot:
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         next_round_number: int,
-        pair_key: str,
+        pair_key: str | None,
     ) -> None:
         wait_seconds = max(1.0, self.config.runtime.retry_base_delay)
         logger.info(

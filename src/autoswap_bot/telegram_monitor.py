@@ -31,6 +31,9 @@ class TelegramCardState:
     session_started_utc: datetime
     total_rounds: int
     pair_targets: dict[str, int]
+    day_index: int = 1
+    lifetime_swap_base: int = 0
+    lifetime_network_fee_base: dict[str, Decimal] = field(default_factory=dict)
     current_pair_key: str | None = None
     current_round_number: int = 0
     phase: str = "STARTING"
@@ -50,11 +53,19 @@ class TelegramCardState:
     last_publish_monotonic: float = 0.0
 
 
+@dataclass
+class TelegramAccountTotals:
+    completed_sessions: int = 0
+    lifetime_swaps: int = 0
+    lifetime_network_fee: dict[str, Decimal] = field(default_factory=dict)
+
+
 class TelegramMonitor:
     def __init__(self, runtime: RuntimeConfig) -> None:
         self.runtime = runtime
         self.log = logging.getLogger("autoswap_bot.telegram")
         self._session: aiohttp.ClientSession | None = None
+        self._account_totals: dict[str, TelegramAccountTotals] = {}
 
     async def start(self) -> None:
         if not self.runtime.telegram_enabled:
@@ -73,12 +84,7 @@ class TelegramMonitor:
         prepared_run: PreparedAccountRun,
         strategy_label: str,
     ) -> TelegramCardState:
-        pair_targets: dict[str, int] = {}
-        strategy = account.strategy()
-        for round_index in range(prepared_run.rounds):
-            sell_symbol, buy_symbol = strategy.step_for_round(round_index)
-            pair_key = f"{sell_symbol}->{buy_symbol}"
-            pair_targets[pair_key] = pair_targets.get(pair_key, 0) + 1
+        persisted = self._account_totals.get(account.name, TelegramAccountTotals())
 
         return TelegramCardState(
             account_name=account.name,
@@ -87,7 +93,10 @@ class TelegramMonitor:
             strategy_label=strategy_label,
             session_started_utc=datetime.now(timezone.utc),
             total_rounds=prepared_run.rounds,
-            pair_targets=pair_targets,
+            pair_targets={},
+            day_index=persisted.completed_sessions + 1,
+            lifetime_swap_base=persisted.lifetime_swaps,
+            lifetime_network_fee_base=dict(persisted.lifetime_network_fee),
             balances={symbol: Decimal("0") for symbol in SYMBOL_SHORT},
             latest_logs=deque(maxlen=self.runtime.telegram_latest_logs_limit),
         )
@@ -200,6 +209,11 @@ class TelegramMonitor:
         card.session_finished_utc = datetime.now(timezone.utc)
         card.next_scheduled_utc = None
         card.next_wait_seconds = None
+        self._account_totals[card.account_name] = TelegramAccountTotals(
+            completed_sessions=max(card.day_index, self._account_totals.get(card.account_name, TelegramAccountTotals()).completed_sessions),
+            lifetime_swaps=card.lifetime_swap_base + card.swap_transactions,
+            lifetime_network_fee=self._merge_amount_maps(card.lifetime_network_fee_base, card.total_network_fee),
+        )
         await self._publish(card, force=True)
 
     async def _publish(self, card: TelegramCardState, *, force: bool) -> None:
@@ -265,6 +279,9 @@ class TelegramMonitor:
         sections = [
             f"<b>{html.escape(f'🔵 Acc {card.display_index}')}</b>",
             f"Status: {html.escape(self._build_status_line(card))}",
+            html.escape(self._build_day_line(card)),
+            html.escape(self._build_swap_totals_line(card)),
+            html.escape(self._build_gas_totals_line(card)),
             f"Uptime: {html.escape(self._format_duration(datetime.now(timezone.utc) - card.session_started_utc))}",
             html.escape(self._build_balances_line(card)),
             html.escape(self._build_fee_line(card)),
@@ -299,6 +316,23 @@ class TelegramMonitor:
         cbtc = self._fmt_balance(card.balances.get("CBTC", Decimal("0")), 8)
         return f"💰 Balances: CC {cc} | U {usdcx} | B {cbtc}"
 
+    def _build_day_line(self, card: TelegramCardState) -> str:
+        return f"🗓️ Hari Ke: {card.day_index}"
+
+    def _build_swap_totals_line(self, card: TelegramCardState) -> str:
+        total_lifetime_swaps = card.lifetime_swap_base + card.swap_transactions
+        return (
+            f"🔢 Total Swap Hari Ini: {card.swap_transactions} | "
+            f"Total Swap Sejak Bot Start: {total_lifetime_swaps}"
+        )
+
+    def _build_gas_totals_line(self, card: TelegramCardState) -> str:
+        total_lifetime_fee = self._merge_amount_maps(card.lifetime_network_fee_base, card.total_network_fee)
+        return (
+            f"⛽ Gas Fee Hari Ini: {self._format_amount_map(card.total_network_fee)} | "
+            f"Total Gas Fee Sejak Bot Start: {self._format_amount_map(total_lifetime_fee)}"
+        )
+
     def _build_fee_line(self, card: TelegramCardState) -> str:
         total_fee = self._merge_amount_maps(card.total_network_fee, card.total_swap_fee)
         return (
@@ -309,9 +343,14 @@ class TelegramMonitor:
 
     def _build_swaps_line(self, card: TelegramCardState) -> str:
         parts = [f"🔁 Swaps: {card.swap_transactions}"]
-        for pair_key, target in card.pair_targets.items():
+        pair_keys = list(dict.fromkeys([*card.pair_targets.keys(), *card.pair_completed.keys()]))
+        for pair_key in pair_keys:
             completed = card.pair_completed.get(pair_key, 0)
-            parts.append(f"{self._short_pair(pair_key)}: {completed}/{target}")
+            target = card.pair_targets.get(pair_key)
+            if target:
+                parts.append(f"{self._short_pair(pair_key)}: {completed}/{target}")
+            else:
+                parts.append(f"{self._short_pair(pair_key)}: {completed}")
         return " | ".join(parts)
 
     def _build_reward_line(self, card: TelegramCardState) -> str:
@@ -350,13 +389,11 @@ class TelegramMonitor:
 
     def _strategy_short(self, strategy_label: str) -> str:
         upper = strategy_label.upper()
+        if "CC -> USDCX -> CBTC" in upper:
+            return "CC→U→B"
         for left, right in (
             ("CC", "USDCX"),
-            ("USDCX", "CC"),
             ("CC", "CBTC"),
-            ("CBTC", "CC"),
-            ("USDCX", "CBTC"),
-            ("CBTC", "USDCX"),
         ):
             token = f"{left} -> {right}"
             if token in upper:
