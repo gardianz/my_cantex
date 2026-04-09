@@ -189,6 +189,7 @@ class RuntimeConfig:
     telegram_enabled: bool
     telegram_bot_token: str | None
     telegram_chat_id: str | None
+    telegram_state_file: Path
     telegram_update_min_interval_seconds: float
     telegram_latest_logs_limit: int
     activity_enabled: bool
@@ -321,6 +322,7 @@ def load_config(path: str | Path) -> BotConfig:
             if telegram_enabled
             else None
         ),
+        telegram_state_file=(config_path.parent / ".autoswap_telegram_state.json").resolve(),
         telegram_update_min_interval_seconds=float(
             settings.get("telegram_update_min_interval_seconds", 5.0)
         ),

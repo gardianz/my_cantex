@@ -22,6 +22,7 @@ htmlcov/
 
 # Secrets and local config (use accounts.example.toml + env vars)
 config/accounts.toml
+.autoswap_telegram_state.json
 .env
 .env.*
 !.env.example
