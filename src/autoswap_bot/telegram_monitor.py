@@ -6,7 +6,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 import aiohttp
@@ -279,13 +279,14 @@ class TelegramMonitor:
         sections = [
             f"<b>{html.escape(f'🔵 Acc {card.display_index}')}</b>",
             f"Status: {html.escape(self._build_status_line(card))}",
+            "",
+            html.escape(self._build_strategy_line(card)),
+            html.escape(self._build_balances_line(card)),
+            "",
             html.escape(self._build_day_line(card)),
             html.escape(self._build_swap_totals_line(card)),
             html.escape(self._build_gas_totals_line(card)),
             f"Uptime: {html.escape(self._format_duration(datetime.now(timezone.utc) - card.session_started_utc))}",
-            html.escape(self._build_balances_line(card)),
-            html.escape(self._build_fee_line(card)),
-            html.escape(self._build_swaps_line(card)),
             f"🌐 Proxy: {html.escape(card.proxy_label)}",
             html.escape(self._build_reward_line(card)),
             "",
@@ -316,8 +317,19 @@ class TelegramMonitor:
         cbtc = self._fmt_balance(card.balances.get("CBTC", Decimal("0")), 8)
         return f"💰 Balances: CC {cc} | U {usdcx} | B {cbtc}"
 
+    def _build_strategy_line(self, card: TelegramCardState) -> str:
+        match = re.search(r"Strategi\s+(\d+)", card.strategy_label, re.IGNORECASE)
+        if match:
+            return f"Strategi: {match.group(1)}"
+        return f"Strategi: {card.strategy_label}"
+
     def _build_day_line(self, card: TelegramCardState) -> str:
-        return f"🗓️ Hari Ke: {card.day_index}"
+        now_utc = datetime.now(timezone.utc)
+        next_midnight_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        if next_midnight_utc <= now_utc:
+            next_midnight_utc += timedelta(days=1)
+        remaining = self._format_duration(next_midnight_utc - now_utc)
+        return f"🗓️ Hari Ke: {card.day_index} Berakhir dalam: {remaining}"
 
     def _build_swap_totals_line(self, card: TelegramCardState) -> str:
         total_lifetime_swaps = card.lifetime_swap_base + card.swap_transactions
