@@ -27,6 +27,7 @@ from .config import AccountConfig, BotConfig, PreparedAccountRun
 from .constants import CC_SYMBOL, MIN_TICKET_SIZE_CC, TRACKED_SYMBOLS, dust_for_symbol
 from .models import ActivitySummary, AccountResult, PlanIssue, RouteHop, RoutePlan
 from .routing import RouteOptimizer
+from .runtime_state import BotRuntimeStateStore, DailyFreeFeeStatus
 from .sdk_ext import ExtendedCantexSDK
 from .telegram_monitor import TelegramCardState, TelegramMonitor
 
@@ -78,6 +79,10 @@ class AutoswapBot:
         self._prompt_lock = asyncio.Lock()
         self._rng = random.Random(self.config.runtime.random_seed)
         self.monitor = TelegramMonitor(self.config.runtime)
+        self.runtime_state = BotRuntimeStateStore(
+            self.config.runtime.bot_state_file,
+            logging.getLogger("autoswap_bot.state"),
+        )
         self._stop_requested = asyncio.Event()
 
     async def request_stop(self) -> None:
@@ -154,6 +159,7 @@ class AutoswapBot:
             prepared_run,
             account.strategy().label,
         )
+        self.runtime_state.ensure_account(account.name)
         sdk = self._build_sdk(account)
 
         try:
@@ -705,6 +711,8 @@ class AutoswapBot:
         buy_symbol = "-"
         pair_key = "-"
         selected_action: StrategyAction | None = None
+        daily_free_fee_status: DailyFreeFeeStatus | None = None
+        daily_free_fee_consumed = False
         return await self._execute_round_dynamic_v2(
             sdk=sdk,
             router=router,
@@ -922,6 +930,7 @@ class AutoswapBot:
             )
 
         try:
+            daily_free_fee_status = self._available_daily_free_fee_status(account.name)
             route, issue = await self._wait_for_network_fee_below_cap(
                 router=router,
                 balances=balances,
@@ -933,6 +942,8 @@ class AutoswapBot:
                 logger=logger,
                 monitor_card=monitor_card,
                 current_route=route,
+                account_name=account.name,
+                daily_free_fee_status=daily_free_fee_status,
             )
         except (CantexAPIError, CantexTimeoutError) as exc:
             logger.warning(
@@ -1399,6 +1410,20 @@ class AutoswapBot:
                 )
 
             tx_count += 1
+            if daily_free_fee_status is not None and not daily_free_fee_consumed:
+                updated_free_fee_status = self._consume_daily_free_fee_swap(account.name)
+                daily_free_fee_consumed = True
+                logger.info(
+                    "Free fee swap harian terpakai | %s | %s/3 | tanggal UTC=%s",
+                    account.name,
+                    updated_free_fee_status.used,
+                    updated_free_fee_status.utc_date,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"🎁 Free fee swap used {updated_free_fee_status.used}/3 for {updated_free_fee_status.utc_date} UTC",
+                    force=True,
+                )
             used_network_fee[hop.network_fee_symbol] += hop.network_fee_amount
             used_swap_fee[hop.fee_symbol] += hop.admin_fee_amount + hop.liquidity_fee_amount
             await self.monitor.update_fee_totals(
@@ -1782,9 +1807,34 @@ class AutoswapBot:
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         current_route: RoutePlan,
+        account_name: str | None = None,
+        daily_free_fee_status: DailyFreeFeeStatus | None = None,
     ) -> tuple[RoutePlan, PlanIssue | None]:
         fee_cap = self.config.runtime.max_network_fee_cc_per_execution
         if fee_cap is None:
+            return current_route, None
+
+        if (
+            account_name is not None
+            and daily_free_fee_status is not None
+            and daily_free_fee_status.window_open
+            and daily_free_fee_status.remaining > 0
+        ):
+            current_fee = current_route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0"))
+            if current_fee > fee_cap:
+                free_swap_number = daily_free_fee_status.used + 1
+                logger.info(
+                    "Round %s memakai free fee swap harian %s/3 | fee=%s CC | batas=%s CC",
+                    round_number,
+                    free_swap_number,
+                    current_fee,
+                    fee_cap,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"🎁 Free fee swap {free_swap_number}/3 active, fee cap bypassed ({current_fee} CC)",
+                    force=True,
+                )
             return current_route, None
 
         route = current_route
@@ -2501,6 +2551,18 @@ class AutoswapBot:
 
     def _sample_network_fee_poll_seconds(self) -> float:
         return max(1.0, self.config.runtime.network_fee_poll_seconds_range.sample(self._rng))
+
+    def _daily_free_fee_status(self, account_name: str) -> DailyFreeFeeStatus:
+        return self.runtime_state.get_daily_free_fee_status(account_name)
+
+    def _available_daily_free_fee_status(self, account_name: str) -> DailyFreeFeeStatus | None:
+        status = self._daily_free_fee_status(account_name)
+        if status.window_open and status.remaining > 0:
+            return status
+        return None
+
+    def _consume_daily_free_fee_swap(self, account_name: str) -> DailyFreeFeeStatus:
+        return self.runtime_state.consume_daily_free_fee_swap(account_name)
 
     async def _sleep_or_stop(self, seconds: float) -> None:
         if seconds <= 0:

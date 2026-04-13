@@ -170,6 +170,10 @@ auto_create_intent_account = true
   - Bot akan menunggu sesuai `network_fee_poll_seconds`, lalu quote ulang sampai fee turun
   - Jika saat menunggu muncul quote error sementara seperti `HTTP 502`, bot tidak dianggap gagal; bot tetap hidup dan akan quote ulang lagi
   - Setting ini hanya membatasi network fee, bukan swap fee admin/liquidity
+  - Cantex saat ini memberi `3x free fee swap` per account per hari UTC
+  - Bot otomatis mencoba memakai jatah ini mulai `01:00 UTC`
+  - Untuk 3 swap sukses pertama setelah `01:00 UTC`, bot akan tetap submit swap walaupun quote UI masih menampilkan fee
+  - Pemakaian jatah free swap disimpan di file state lokal, jadi jika bot direstart di hari UTC yang sama, jatahnya tidak diulang dari awal
   - Contoh:
     - jika nilai setting `0.12`
     - lalu quote menunjukkan network fee `0.15 CC`
@@ -356,6 +360,7 @@ Jika `full_24h_mode = true`:
 - pada mode `planned`, target sesi adalah selesai sebelum `00:00 UTC`
 - pada mode `direct`, bot terus mencoba sampai quota `rounds` sukses terpenuhi; jika quota selesai lebih cepat dan `full_24h_auto_restart = true`, bot akan idle sampai `00:00 UTC` berikutnya
 - jika `full_24h_auto_restart = true`, sesi berikutnya dimulai lagi untuk hari UTC berikutnya
+- jatah `3x free fee swap` harian per account akan reset saat hari UTC berganti, tetapi baru dipakai mulai `01:00 UTC`
 - `max_network_fee_cc_per_execution` tetap berlaku
 - jika fee terlalu tinggi, bot akan retry quote pada slot round itu
 - jika saat menunggu fee turun muncul quote error sementara seperti `HTTP 502`, bot tetap hidup dan akan mencoba quote ulang lagi
@@ -458,6 +463,16 @@ Saat inspeksi frontend `https://www.cantex.io/app/activity`, route tanpa login d
 - `https://api.cantex.io/v1/account/reward_activity`
 
 Bot mencoba endpoint tersebut secara best-effort. Jika data activity tidak tersedia atau belum terindeks, bot tetap lanjut dengan log yang aman.
+
+## File State Lokal
+
+Bot menyimpan state lokal di folder `config/`:
+
+- `.autoswap_bot_runtime_state.json`
+  - menyimpan jatah `3x free fee swap` harian per account
+  - dipakai agar restart bot tidak mengulang free swap yang sudah terpakai di hari UTC yang sama
+- `.autoswap_telegram_state.json`
+  - menyimpan statistik kartu Telegram seperti total swap dan gas fee harian / lifetime
 
 ## Troubleshooting
 

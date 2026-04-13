@@ -174,6 +174,7 @@ def _parse_amount_ranges(raw_amounts: Any, field_name: str) -> dict[str, Decimal
 @dataclass(frozen=True)
 class RuntimeConfig:
     base_url: str
+    bot_state_file: Path
     execution_mode: str
     max_concurrency: int
     min_cc_reserve: Decimal
@@ -267,6 +268,7 @@ def load_config(path: str | Path) -> BotConfig:
 
     runtime = RuntimeConfig(
         base_url=str(settings.get("base_url", "https://api.cantex.io")).rstrip("/"),
+        bot_state_file=(config_path.parent / ".autoswap_bot_runtime_state.json").resolve(),
         execution_mode=str(settings.get("execution_mode", "sequential")).lower(),
         max_concurrency=int(settings.get("max_concurrency", 1)),
         min_cc_reserve=_to_decimal(
