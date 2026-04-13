@@ -30,3 +30,19 @@ class ExtendedCantexSDK(CantexSDK):
             except json.JSONDecodeError:
                 continue
         return None, None
+
+    async def get_trading_history_payload(self) -> tuple[str | None, Any | None]:
+        candidates = (
+            "/v1/history/trading",
+            "/v1/account/activity",
+        )
+        for path in candidates:
+            try:
+                return path, await self._request("GET", path)  # type: ignore[attr-defined]
+            except CantexAPIError as exc:
+                if exc.status in {404, 405}:
+                    continue
+                raise
+            except json.JSONDecodeError:
+                continue
+        return None, None

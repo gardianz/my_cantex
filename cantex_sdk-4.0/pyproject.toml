@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cantex-sdk"
+version = "0.4.0"
+description = "Async Python SDK for the Cantex decentralised exchange API"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "cryptography>=41.0.0",
+    "ecdsa>=0.19.1",
+]
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "aioresponses",
+]

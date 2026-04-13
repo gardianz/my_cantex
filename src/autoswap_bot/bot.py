@@ -172,6 +172,13 @@ class AutoswapBot:
                     force=True,
                 )
                 await sdk.authenticate()
+                await self._sync_daily_free_fee_state_from_history(
+                    sdk=sdk,
+                    account_name=account.name,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    force_log=True,
+                )
 
                 if account.auto_create_intent_account:
                     created = await sdk.ensure_intent_trading_account()
@@ -930,8 +937,8 @@ class AutoswapBot:
             )
 
         try:
-            daily_free_fee_status = self._available_daily_free_fee_status(account.name)
             route, issue = await self._wait_for_network_fee_below_cap(
+                sdk=sdk,
                 router=router,
                 balances=balances,
                 sell_symbol=sell_symbol,
@@ -943,7 +950,6 @@ class AutoswapBot:
                 monitor_card=monitor_card,
                 current_route=route,
                 account_name=account.name,
-                daily_free_fee_status=daily_free_fee_status,
             )
         except (CantexAPIError, CantexTimeoutError) as exc:
             logger.warning(
@@ -1156,6 +1162,8 @@ class AutoswapBot:
         buy_symbol = "-"
         pair_key = "-"
         selected_action: StrategyAction | None = None
+        daily_free_fee_status: DailyFreeFeeStatus | None = None
+        daily_free_fee_consumed = False
 
         try:
             info = await sdk.get_account_info()
@@ -1743,15 +1751,24 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         max_attempts = max(1, self.config.runtime.max_retries)
+        confirm_timeout = max(float(hop.estimated_time_seconds) * 3.0, 30.0)
         for attempt in range(1, max_attempts + 1):
             self._raise_if_stop_requested()
             try:
-                return (
-                    await sdk.swap(
+                event = await sdk.swap_and_confirm(
                     sell_amount=hop.sell_amount,
                     sell_instrument=hop.raw_quote.sell_instrument,
                     buy_instrument=hop.raw_quote.buy_instrument,
-                    ),
+                    timeout=confirm_timeout,
+                )
+                return (
+                    {
+                        "id": getattr(event, "event_id", ""),
+                        "ledger_created_at": getattr(event, "ledger_created_at", ""),
+                        "output_amount": getattr(event, "output_amount", None),
+                        "output_instrument": getattr(getattr(event, "output_instrument", None), "id", ""),
+                        "raw": getattr(event, "raw", {}),
+                    },
                     None,
                 )
             except Exception as exc:
@@ -1797,6 +1814,7 @@ class AutoswapBot:
     async def _wait_for_network_fee_below_cap(
         self,
         *,
+        sdk: ExtendedCantexSDK,
         router: RouteOptimizer,
         balances: dict[str, Decimal],
         sell_symbol: str,
@@ -1808,39 +1826,37 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
         current_route: RoutePlan,
         account_name: str | None = None,
-        daily_free_fee_status: DailyFreeFeeStatus | None = None,
     ) -> tuple[RoutePlan, PlanIssue | None]:
         fee_cap = self.config.runtime.max_network_fee_cc_per_execution
         if fee_cap is None:
-            return current_route, None
-
-        if (
-            account_name is not None
-            and daily_free_fee_status is not None
-            and daily_free_fee_status.window_open
-            and daily_free_fee_status.remaining > 0
-        ):
-            current_fee = current_route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0"))
-            if current_fee > fee_cap:
-                free_swap_number = daily_free_fee_status.used + 1
-                logger.info(
-                    "Round %s memakai free fee swap harian %s/3 | fee=%s CC | batas=%s CC",
-                    round_number,
-                    free_swap_number,
-                    current_fee,
-                    fee_cap,
-                )
-                await self.monitor.log_event(
-                    monitor_card,
-                    f"🎁 Free fee swap {free_swap_number}/3 active, fee cap bypassed ({current_fee} CC)",
-                    force=True,
-                )
             return current_route, None
 
         route = current_route
         while route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0")) > fee_cap:
             self._raise_if_stop_requested()
             current_fee = route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0"))
+            if account_name is not None:
+                daily_free_fee_status = await self._sync_daily_free_fee_state_from_history(
+                    sdk=sdk,
+                    account_name=account_name,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                )
+                if daily_free_fee_status.window_open and daily_free_fee_status.remaining > 0:
+                    free_swap_number = daily_free_fee_status.used + 1
+                    logger.info(
+                        "Round %s memakai free fee swap harian %s/3 | fee=%s CC | batas=%s CC",
+                        round_number,
+                        free_swap_number,
+                        current_fee,
+                        fee_cap,
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        f"🎁 Free fee swap {free_swap_number}/3 active, fee cap bypassed ({current_fee} CC)",
+                        force=True,
+                    )
+                    return route, None
             now_utc = datetime.now(timezone.utc)
             if fee_retry_deadline_utc is not None and now_utc >= fee_retry_deadline_utc:
                 return route, PlanIssue(
@@ -1932,6 +1948,7 @@ class AutoswapBot:
             self._raise_if_stop_requested()
             if issue is None:
                 route, issue = await self._wait_for_network_fee_below_cap(
+                    sdk=sdk,
                     router=router,
                     balances=balances,
                     sell_symbol=source_symbol,
@@ -2564,6 +2581,63 @@ class AutoswapBot:
     def _consume_daily_free_fee_swap(self, account_name: str) -> DailyFreeFeeStatus:
         return self.runtime_state.consume_daily_free_fee_swap(account_name)
 
+    async def _sync_daily_free_fee_state_from_history(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        account_name: str,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        force_log: bool = False,
+    ) -> DailyFreeFeeStatus:
+        local_status = self._daily_free_fee_status(account_name)
+        try:
+            source_path, payload = await sdk.get_trading_history_payload()
+        except Exception as exc:
+            logger.warning("Gagal mengambil trading history untuk free fee sync: %s", exc)
+            if force_log:
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"ℹ️ Free fee sync fallback to local state ({local_status.used}/3)",
+                )
+            return local_status
+
+        if payload is None:
+            if force_log:
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"ℹ️ Free fee sync fallback to local state ({local_status.used}/3)",
+                )
+            return local_status
+
+        history_today_count = self._count_today_trading_history_swaps(payload)
+        if history_today_count is None:
+            if force_log:
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"ℹ️ Free fee history unavailable, using local state ({local_status.used}/3)",
+                )
+            return local_status
+
+        synced_status = self.runtime_state.sync_daily_free_fee_swaps(
+            account_name,
+            min(history_today_count, 3),
+        )
+        if force_log or synced_status.used != local_status.used:
+            logger.info(
+                "Free fee sync | source=%s | swap_hari_ini=%s | used=%s/3 | remaining=%s",
+                source_path or "-",
+                history_today_count,
+                synced_status.used,
+                synced_status.remaining,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"🎁 Free fee sync from history: {synced_status.used}/3 used today",
+                force=force_log,
+            )
+        return synced_status
+
     async def _sleep_or_stop(self, seconds: float) -> None:
         if seconds <= 0:
             self._raise_if_stop_requested()
@@ -2588,6 +2662,99 @@ class AutoswapBot:
         normalized = dt.astimezone(timezone.utc)
         next_day = normalized.date() + timedelta(days=1)
         return datetime.combine(next_day, datetime.min.time(), tzinfo=timezone.utc)
+
+    def _count_today_trading_history_swaps(self, payload: Any) -> int | None:
+        items = self._extract_trading_history_items(payload)
+        if not items:
+            return None
+        today_utc = datetime.now(timezone.utc).date()
+        count = 0
+        for item in items:
+            timestamp = self._extract_item_timestamp(item)
+            if timestamp is None or timestamp.date() != today_utc:
+                continue
+            if self._is_failed_history_item(item):
+                continue
+            count += 1
+        return count
+
+    def _extract_trading_history_items(self, payload: Any) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+
+        def visit(node: Any) -> None:
+            if isinstance(node, list):
+                if node and all(isinstance(entry, dict) for entry in node):
+                    timestamped = [
+                        entry
+                        for entry in node
+                        if self._extract_item_timestamp(entry) is not None
+                    ]
+                    if timestamped:
+                        items.extend(timestamped)
+                        return
+                for child in node:
+                    visit(child)
+                return
+
+            if isinstance(node, dict):
+                for value in node.values():
+                    visit(value)
+
+        visit(payload)
+        return items
+
+    def _extract_item_timestamp(self, item: dict[str, Any]) -> datetime | None:
+        for key in (
+            "createdAt",
+            "created_at",
+            "timestamp",
+            "time",
+            "updatedAt",
+            "updated_at",
+            "executedAt",
+            "executed_at",
+        ):
+            raw_value = item.get(key)
+            parsed = self._parse_datetime_like(raw_value)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _parse_datetime_like(self, value: Any) -> datetime | None:
+        if value in {None, ""}:
+            return None
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000.0
+            try:
+                return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            except (ValueError, OSError):
+                return None
+
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _is_failed_history_item(self, item: dict[str, Any]) -> bool:
+        status_parts = [
+            str(item.get(key, "")).strip().lower()
+            for key in ("status", "state", "result")
+            if item.get(key) not in {None, ""}
+        ]
+        if not status_parts:
+            return False
+        failed_tokens = {"failed", "error", "rejected", "cancelled", "canceled"}
+        return any(token in failed_tokens for token in status_parts)
 
     async def _prepare_affordable_route(
         self,

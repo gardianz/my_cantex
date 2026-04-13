@@ -1,6 +1,6 @@
 # Cantex Autoswap Bot
 
-Bot autoswap multi-account untuk Cantex yang dibangun di atas SDK lokal pada `cantex_sdk-0.3.0`.
+Bot autoswap multi-account untuk Cantex yang dibangun di atas SDK lokal pada `cantex_sdk-4.0`.
 
 ## Ringkasan
 
@@ -15,6 +15,7 @@ Fitur utama:
 - Mode 24 jam berbasis UTC
 - Monitor Telegram berbentuk kartu
 - Best-effort fetch activity user dari endpoint web Cantex
+- Konfirmasi swap via WebSocket (`swap_and_confirm`) dari SDK 4.0
 
 ## Struktur File Penting
 
@@ -173,7 +174,9 @@ auto_create_intent_account = true
   - Cantex saat ini memberi `3x free fee swap` per account per hari UTC
   - Bot otomatis mencoba memakai jatah ini mulai `01:00 UTC`
   - Untuk 3 swap sukses pertama setelah `01:00 UTC`, bot akan tetap submit swap walaupun quote UI masih menampilkan fee
-  - Pemakaian jatah free swap disimpan di file state lokal, jadi jika bot direstart di hari UTC yang sama, jatahnya tidak diulang dari awal
+  - Bot akan mencoba menyinkronkan pemakaian jatah ini dari endpoint history trading lebih dulu
+  - Jika history hari ini sudah menunjukkan `3` swap, bot akan menganggap jatah free swap hari itu sudah habis
+  - State lokal tetap disimpan sebagai fallback agar restart bot tidak mengulang jatah yang sudah terpakai walaupun endpoint history sedang tidak tersedia
   - Contoh:
     - jika nilai setting `0.12`
     - lalu quote menunjukkan network fee `0.15 CC`
@@ -470,7 +473,8 @@ Bot menyimpan state lokal di folder `config/`:
 
 - `.autoswap_bot_runtime_state.json`
   - menyimpan jatah `3x free fee swap` harian per account
-  - dipakai agar restart bot tidak mengulang free swap yang sudah terpakai di hari UTC yang sama
+  - dipakai sebagai fallback lokal dan cache sinkronisasi
+  - saat tersedia, bot akan mencocokkan pemakaian free swap dengan endpoint history trading hari ini
 - `.autoswap_telegram_state.json`
   - menyimpan statistik kartu Telegram seperti total swap dan gas fee harian / lifetime
 

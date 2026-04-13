@@ -5,7 +5,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
-for candidate in (ROOT / "src", ROOT / "cantex_sdk-0.3.0" / "src"):
+for candidate in (
+    ROOT / "src",
+    ROOT / "cantex_sdk-4.0" / "src",
+    ROOT / "cantex_sdk-0.3.0" / "src",
+):
     candidate_str = str(candidate)
     if candidate.exists() and candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
