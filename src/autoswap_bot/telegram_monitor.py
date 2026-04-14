@@ -96,6 +96,9 @@ class TelegramMonitor:
         self._state_loaded = False
         self._telegram_backoff_until_monotonic: float = 0.0
         self._telegram_backoff_last_logged_second: int = 0
+        self._telegram_message_id: int | None = None
+        self._telegram_last_render_text: str | None = None
+        self._telegram_last_publish_monotonic: float = 0.0
 
     async def start(self) -> None:
         self._load_state()
@@ -118,7 +121,7 @@ class TelegramMonitor:
         self._cards[card.account_name] = card
         self._render_terminal_dashboard(force=force)
         if self.runtime.telegram_enabled:
-            await self._publish(card, force=force)
+            await self._publish(force=force)
 
     def create_card(
         self,
@@ -286,29 +289,34 @@ class TelegramMonitor:
         self._persist_card_state(card)
         await self._refresh_outputs(card, force=True)
 
-    async def _publish(self, card: TelegramCardState, *, force: bool) -> None:
-        self._rollover_card_if_needed(card)
+    async def _publish(self, *, force: bool) -> None:
         if not self.runtime.telegram_enabled:
             return
         if self._session is None:
             raise RuntimeError("TelegramMonitor belum di-start")
+
+        cards = sorted(self._cards.values(), key=lambda item: item.display_index)
+        if not cards:
+            return
+        for card in cards:
+            self._rollover_card_if_needed(card)
 
         now = time.monotonic()
         if now < self._telegram_backoff_until_monotonic:
             return
         if (
             not force
-            and card.message_id is not None
-            and now - card.last_publish_monotonic < self.runtime.telegram_update_min_interval_seconds
+            and self._telegram_message_id is not None
+            and now - self._telegram_last_publish_monotonic < self.runtime.telegram_update_min_interval_seconds
         ):
             return
 
-        text = self._trim_message(self._render_card(card))
-        if card.message_id is not None and text == card.last_render_text:
+        text = self._trim_message(self._render_combined_card(cards))
+        if self._telegram_message_id is not None and text == self._telegram_last_render_text:
             return
 
         try:
-            if card.message_id is None:
+            if self._telegram_message_id is None:
                 response = await self._request(
                     "sendMessage",
                     {
@@ -318,20 +326,20 @@ class TelegramMonitor:
                         "disable_web_page_preview": True,
                     },
                 )
-                card.message_id = response.get("result", {}).get("message_id")
+                self._telegram_message_id = response.get("result", {}).get("message_id")
             else:
                 await self._request(
                     "editMessageText",
                     {
                         "chat_id": self.runtime.telegram_chat_id,
-                        "message_id": card.message_id,
+                        "message_id": self._telegram_message_id,
                         "text": text,
                         "parse_mode": "HTML",
                         "disable_web_page_preview": True,
                     },
                 )
-            card.last_render_text = text
-            card.last_publish_monotonic = now
+            self._telegram_last_render_text = text
+            self._telegram_last_publish_monotonic = now
         except TelegramRateLimitError as exc:
             self._telegram_backoff_until_monotonic = max(
                 self._telegram_backoff_until_monotonic,
@@ -346,7 +354,7 @@ class TelegramMonitor:
                     exc.description,
                 )
         except Exception as exc:  # pragma: no cover - network/runtime guard
-            self.log.warning("Gagal update Telegram card %s: %s", card.account_name, exc)
+            self.log.warning("Gagal update Telegram combined card: %s", exc)
 
     def _append_terminal_log(self, card: TelegramCardState, message: str) -> None:
         timestamp = datetime.now().astimezone().strftime("%H:%M:%S")
@@ -657,6 +665,64 @@ class TelegramMonitor:
             f"<i>Edited {html.escape(edited_at)} UTC</i>",
         ]
         return "\n".join(sections)
+
+    def _render_combined_card(self, cards: list[TelegramCardState]) -> str:
+        sections: list[str] = []
+        for card in cards:
+            sections.extend(self._render_combined_account_section(card))
+            sections.append("")
+
+        sections.append("<b>📜 Latest Logs</b>")
+        sections.append(f"<pre>{html.escape(self._render_combined_logs())}</pre>")
+        sections.append(f"<i>Edited {html.escape(datetime.now(timezone.utc).strftime('%H.%M.%S'))} UTC</i>")
+        return "\n".join(sections)
+
+    def _render_combined_account_section(self, card: TelegramCardState) -> list[str]:
+        title = f"🔹 {card.account_name} [{self._combined_status(card)}]"
+        balances = (
+            f"CC {self._fmt_balance(card.balances.get('CC', Decimal('0')), 6)}"
+            f" | U {self._fmt_balance(card.balances.get('USDCx', Decimal('0')), 4)}"
+            f" | B {self._fmt_balance(card.balances.get('CBTC', Decimal('0')), 8)}"
+        )
+        tx_total = card.swap_transactions
+        tx_ok = card.swap_transactions
+        tx_fail = self._combined_fail_count(card)
+        progress = f"TX {tx_total} (ok:{tx_ok}|fail:{tx_fail})"
+        plan = self._dashboard_plan(card)
+        activity = self._build_activity_line(card).replace("🏆 Activity 24h: ", "")
+        rebates = self._build_rebates_line(card).replace("💸 CC Rebates: ", "")
+        gas_fee = self._build_gas_totals_line(card).replace("⛽ Gas Fee Hari Ini: ", "")
+        free_swap = f"Free swap {card.daily_free_fee_used}/{card.daily_free_fee_limit}"
+        return [
+            f"<b>{html.escape(title)}</b>",
+            html.escape(f"{balances} | {progress}"),
+            html.escape(plan),
+            html.escape(f"{activity} | {free_swap}"),
+            html.escape(f"Yesterday {self._rebate_amount(card.activity_summary.rebates.get('yesterday')) if card.activity_summary else '-'} | This Week {self._rebate_amount(card.activity_summary.rebates.get('this_week')) if card.activity_summary else '-'} | Gas {gas_fee}"),
+        ]
+
+    def _render_combined_logs(self) -> str:
+        if not self._terminal_logs:
+            return "-"
+        return "\n".join(list(self._terminal_logs))
+
+    def _combined_status(self, card: TelegramCardState) -> str:
+        mapping = {
+            "WAITING": "IDLE",
+            "WAITING_FEE": "WAIT-FEE",
+            "WAITING_NEXT_DAY": "NEXT-DAY",
+            "PROCESSING": "PROCESS",
+            "COMPLETED": "OK",
+            "FINISHED": "DONE",
+        }
+        if card.phase.startswith("FAILED"):
+            return "FAILED"
+        if card.phase.startswith("STOPPED"):
+            return "STOPPED"
+        return mapping.get(card.phase, card.phase)
+
+    def _combined_fail_count(self, card: TelegramCardState) -> int:
+        return sum(1 for entry in card.latest_logs if "failed" in entry.lower() or "error" in entry.lower())
 
     def _build_status_line(self, card: TelegramCardState) -> str:
         pair = (
