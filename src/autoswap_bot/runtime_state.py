@@ -77,14 +77,21 @@ class BotRuntimeStateStore:
         account_name: str,
         used_swaps: int,
         *,
+        exact: bool = False,
         now_utc: datetime | None = None,
     ) -> DailyFreeFeeStatus:
         self._load()
         normalized_now = self._normalize_now(now_utc)
         state = self._normalized_state(account_name, normalized_now, persist=False)
         capped_used = min(max(used_swaps, 0), DAILY_FREE_FEE_SWAP_LIMIT)
-        if capped_used > state.free_fee_swaps_used:
+        if exact:
+            should_save = capped_used != state.free_fee_swaps_used
             state.free_fee_swaps_used = capped_used
+        else:
+            should_save = capped_used > state.free_fee_swaps_used
+            if should_save:
+                state.free_fee_swaps_used = capped_used
+        if should_save:
             self._accounts[account_name] = state
             self._save()
         return self.get_daily_free_fee_status(account_name, now_utc=normalized_now)

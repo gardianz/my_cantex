@@ -2757,6 +2757,7 @@ class AutoswapBot:
         synced_status = self.runtime_state.sync_daily_free_fee_swaps(
             account_name,
             min(history_today_count, 3),
+            exact=force_log,
         )
         await self.monitor.update_free_fee_status(
             monitor_card,
@@ -2771,6 +2772,11 @@ class AutoswapBot:
                 history_today_count,
                 synced_status.used,
                 synced_status.remaining,
+            )
+            logger.info(
+                "Free fee startup sync: history=%s -> effective=%s/3",
+                history_today_count,
+                synced_status.used,
             )
             await self.monitor.log_event(
                 monitor_card,
