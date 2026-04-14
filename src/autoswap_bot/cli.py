@@ -3,12 +3,51 @@ from __future__ import annotations
 import argparse
 import asyncio
 import signal
+import sys
 import threading
 from pathlib import Path
 
 from .bot import AutoswapBot, configure_logging, summarize_results
 from .config import load_config
 from .env_loader import load_dotenv_file
+
+
+STARTUP_MODE_CHOICES = {
+    "1": "free_only",
+    "2": "free_then_swap",
+    "3": "swap_only",
+    "4": "planned_fee",
+}
+
+
+def _default_startup_mode() -> str:
+    return "free_then_swap"
+
+
+def _prompt_startup_mode() -> str:
+    if not sys.stdin.isatty():
+        return _default_startup_mode()
+
+    print("Pilih mode bot:", flush=True)
+    print("1. Mode hanya ambil free swap", flush=True)
+    print(
+        "2. Mode ambil free swap lalu lanjut swap sesuai batas swap dan fee swap yang ditentukan",
+        flush=True,
+    )
+    print("3. Mode swap sesuai batas swap dan fee swap yang ditentukan", flush=True)
+    print("4. Mode swap sesuai jam plan dan batas fee yang ditentukan", flush=True)
+
+    while True:
+        print("Masukkan pilihan (1/2/3/4): ", end="", flush=True)
+        try:
+            answer = input().strip()
+        except EOFError:
+            print("", flush=True)
+            return _default_startup_mode()
+        startup_mode = STARTUP_MODE_CHOICES.get(answer)
+        if startup_mode is not None:
+            return startup_mode
+        print("Pilihan tidak valid.", flush=True)
 
 class InterruptController:
     def __init__(self) -> None:
@@ -70,12 +109,13 @@ async def _run(config_path: str, interrupt_controller: InterruptController) -> i
     repo_root = Path(__file__).resolve().parents[2]
     load_dotenv_file(repo_root / ".env")
     config = load_config(config_path)
+    startup_mode = _prompt_startup_mode()
     configure_logging(
         config.runtime.log_level,
-        use_utc=config.runtime.full_24h_mode,
+        use_utc=True,
         terminal_dashboard_enabled=config.runtime.terminal_dashboard_enabled,
     )
-    bot = AutoswapBot(config, repo_root=repo_root)
+    bot = AutoswapBot(config, repo_root=repo_root, startup_mode=startup_mode)
     interrupt_controller.attach_bot(bot)
     results = await bot.run()
     print(summarize_results(results))

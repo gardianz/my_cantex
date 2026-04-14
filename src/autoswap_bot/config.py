@@ -294,7 +294,7 @@ def load_config(path: str | Path) -> BotConfig:
             settings.get("network_fee_poll_seconds", 30.0),
             "settings.network_fee_poll_seconds",
         ),
-        full_24h_mode=bool(settings.get("full_24h_mode", False)),
+        full_24h_mode=True,
         full_24h_startup_mode=_normalize_full_24h_startup_mode(
             settings.get("full_24h_startup_mode", "planned")
         ),

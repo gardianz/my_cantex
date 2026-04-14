@@ -7,13 +7,14 @@ Bot autoswap multi-account untuk Cantex yang dibangun di atas SDK lokal pada `ca
 Fitur utama:
 
 - Multi-account
-- 9 strategi swap
+- Strategi swap `1`, `3`, dan `7`
 - Validasi balance, minimum protocol, dan fee sebelum submit swap
 - Reserve minimal `5 CC` per account
 - Optimasi route `direct` vs `1-hop`
 - `1 swap sukses = 1 round selesai`
-- Mode 24 jam berbasis UTC
-- Monitor Telegram berbentuk kartu
+- Bot selalu berjalan dalam mode 24 jam berbasis UTC
+- Saat start bot selalu meminta pilihan mode startup `1-4`
+- Monitor Telegram gabungan dalam 1 pesan
 - Dashboard terminal live berbentuk tabel per account
 - Best-effort fetch activity user dari endpoint web Cantex
 - Konfirmasi swap via WebSocket (`swap_and_confirm`) dari SDK 4.0
@@ -119,13 +120,10 @@ Struktur dasarnya:
 
 ```toml
 [settings]
-execution_mode = "sequential"
 min_cc_reserve = "5"
 swap_delay_seconds = { min = 20.0, max = 100.0 }
 max_network_fee_cc_per_execution = "0.12"
 network_fee_poll_seconds = { min = 20.0, max = 40.0 }
-full_24h_mode = true
-full_24h_startup_mode = "planned"
 full_24h_auto_restart = true
 telegram_enabled = false
 terminal_dashboard_enabled = true
@@ -152,13 +150,6 @@ auto_create_intent_account = true
 ## Penjelasan Setting Penting
 
 ### `[settings]`
-
-- `execution_mode`
-  - `sequential`: account diproses satu per satu
-  - `concurrent`: beberapa account diproses bersamaan sesuai `max_concurrency`
-
-- `max_concurrency`
-  - Batas account paralel saat `execution_mode = "concurrent"`
 
 - `min_cc_reserve`
   - Reserve minimum `CC` yang selalu disisakan untuk fee
@@ -195,18 +186,12 @@ auto_create_intent_account = true
     - `{ min = 20.0, max = 40.0 }` berarti bot akan cek ulang dengan jeda acak antara 20 sampai 40 detik
 
 - `full_24h_mode`
-  - Jika `true`, bot memakai scheduler harian berbasis UTC sampai `00:00 UTC` berikutnya
+  - Secara praktik bot sekarang selalu memakai mode 24 jam berbasis UTC
+  - Setting ini dipertahankan untuk kompatibilitas config lama
 
 - `full_24h_startup_mode`
-  - Menentukan perilaku saat sesi 24 jam dimulai
-  - Setting ini berlaku pada awal setiap sesi harian, termasuk setelah auto restart
-  - `planned`
-    - Bot memakai plan jadwal random seperti logic yang sudah dipakai sebelumnya
-  - `direct`
-    - Bot tidak membuat plan swap di awal sesi
-    - Bot langsung mencoba swap terus-menerus sampai `rounds` sukses terpenuhi
-    - Delay setelah swap yang berhasil mengikuti `swap_delay_seconds`
-    - Jika quota `rounds` sudah tercapai lebih cepat dan `full_24h_auto_restart = true`, bot akan idle sampai `00:00 UTC` berikutnya
+  - Dipertahankan untuk kompatibilitas config lama
+  - Sumber utama perilaku startup sekarang adalah prompt pilihan mode saat bot dijalankan
 
 - `full_24h_auto_restart`
   - Jika `true`, setelah sesi harian selesai bot akan lanjut ke hari UTC berikutnya
@@ -218,7 +203,7 @@ auto_create_intent_account = true
   - Isi angka jika ingin pola random bisa direproduksi saat debugging
 
 - `telegram_enabled`
-  - Jika `true`, bot akan mengirim 1 kartu Telegram per account
+  - Jika `true`, bot akan mengirim 1 pesan Telegram gabungan untuk semua account
 
 - `telegram_chat_id`
   - Disarankan diisi lewat `.env` dengan `env:TELEGRAM_CHAT_ID`
@@ -366,18 +351,38 @@ Catatan:
 
 ## Mode 24 Jam
 
-Jika `full_24h_mode = true`:
+Bot sekarang selalu berjalan dalam mode 24 jam.
 
-- jika `full_24h_startup_mode = "planned"`, `swap_delay_seconds` diabaikan
-- jika `full_24h_startup_mode = "planned"`, saat startup bot hanya membuat plan waktu eksekusi swap
-- bot tidak membuat plan swap lengkap di awal
-- jika `full_24h_startup_mode = "planned"`, bot membuat jadwal random per account
-- jika `full_24h_startup_mode = "direct"`, bot tidak membuat jadwal random di awal dan langsung mencoba swap
+Saat bot dijalankan, akan muncul 4 pilihan mode startup:
+
+1. `Mode hanya ambil free swap`
+2. `Mode ambil free swap lalu lanjut swap sesuai batas swap dan fee swap yang ditentukan`
+3. `Mode swap sesuai batas swap dan fee swap yang ditentukan`
+4. `Mode swap sesuai jam plan dan batas fee yang ditentukan`
+
+Arti mode:
+
+- Mode `1`
+  - Bot hanya memakai jatah free swap harian
+  - Setelah jatah free swap hari itu habis, bot menunggu hari UTC berikutnya jika `full_24h_auto_restart = true`
+- Mode `2`
+  - Bot memprioritaskan free swap harian lebih dulu
+  - Setelah jatah free swap habis, bot lanjut swap normal dengan fee cap
+- Mode `3`
+  - Bot langsung swap normal
+  - Free swap harian tidak dipakai sebagai bypass fee cap
+- Mode `4`
+  - Bot memakai plan jadwal random dalam window harian UTC
+  - Fee cap tetap berlaku
+
+Perilaku umum mode 24 jam:
+
 - semua jadwal memakai acuan UTC
 - pada mode `planned`, target sesi adalah selesai sebelum `00:00 UTC`
-- pada mode `direct`, bot terus mencoba sampai quota `rounds` sukses terpenuhi; jika quota selesai lebih cepat dan `full_24h_auto_restart = true`, bot akan idle sampai `00:00 UTC` berikutnya
+- pada mode non-plan, bot terus mencoba sampai quota `rounds` sukses terpenuhi; jika quota selesai lebih cepat dan `full_24h_auto_restart = true`, bot akan idle sampai `00:00 UTC` berikutnya
 - jika `full_24h_auto_restart = true`, sesi berikutnya dimulai lagi untuk hari UTC berikutnya
-- jatah `3x free fee swap` harian per account akan reset saat hari UTC berganti, tetapi baru dipakai mulai `01:00 UTC`
+- jatah `3x free fee swap` harian per account akan reset saat hari UTC berganti, tetapi baru boleh dipakai mulai `01:00 UTC`
+- jadi bot tidak akan memakai free swap tepat setelah `00:00 UTC`, melainkan menunggu `+1 jam`
 - `max_network_fee_cc_per_execution` tetap berlaku
 - jika fee terlalu tinggi, bot akan retry quote pada slot round itu
 - jika saat menunggu fee turun muncul quote error sementara seperti `HTTP 502`, bot tetap hidup dan akan mencoba quote ulang lagi
@@ -428,19 +433,26 @@ Jadi bot tidak langsung berhenti untuk account hanya karena 1 hop swap gagal, da
 
 ## Telegram Monitor
 
-Jika `telegram_enabled = true`, bot membuat 1 kartu Telegram per account dan terus mengedit pesan itu.
+Jika `telegram_enabled = true`, bot membuat 1 pesan Telegram gabungan untuk semua account dan terus mengedit pesan yang sama.
 
-Isi kartu meliputi:
+Isi pesan gabungan per account meliputi:
 
-- status
-- uptime
-- balance
-- total fee
-- progres swap
-- proxy label
-- reward / volume / tx / rank
-- delta tx dan reward
-- latest logs
+- status account
+- balance `CC`, `USDCX`, `CBTC`
+- statistik 24h
+  - `Tx [ok|fail]`
+  - `Free swap`
+  - `Swap`
+  - `Volume`
+  - `Fee Spent`
+- rewards
+  - `Kemarin`
+  - `Minggu ini`
+- statistik sejak bot start
+  - `Tx [ok|fail]`
+  - `Swap`
+  - `Volume`
+  - `Fee Spent`
 
 Contoh config:
 
@@ -452,6 +464,11 @@ telegram_chat_id = "env:TELEGRAM_CHAT_ID"
 telegram_update_min_interval_seconds = 5
 telegram_latest_logs_limit = 6
 ```
+
+Catatan:
+
+- Saat startup, monitor Telegram tidak lagi mengirim 1 pesan per akun
+- Bot akan mempertahankan 1 pesan gabungan dan mengeditnya secara berkala
 
 ## Output dan Ringkasan
 
@@ -474,12 +491,19 @@ Catatan:
 
 ## Sumber Activity
 
-Saat inspeksi frontend `https://www.cantex.io/app/activity`, route tanpa login diarahkan ke `/signup`, tetapi bundle frontend memuat referensi endpoint:
+Saat inspeksi frontend Cantex secara langsung, data activity akun dan history trading yang dipakai bot mengikuti endpoint berikut:
 
-- `https://api.cantex.io/v1/account/activity`
 - `https://api.cantex.io/v1/account/reward_activity`
+- `https://api.cantex.io/v1/history/trading`
 
-Bot mencoba endpoint tersebut secara best-effort. Jika data activity tidak tersedia atau belum terindeks, bot tetap lanjut dengan log yang aman.
+Bot memakai endpoint ini untuk:
+
+- `24h swaps`
+- `24h volume`
+- `CC rebates` seperti `Yesterday` dan `This Week`
+- sinkronisasi history trading harian untuk jatah `3x free fee swap`
+
+Jika data activity belum tersedia atau belum terindeks, bot tetap lanjut dengan log yang aman.
 
 ## File State Lokal
 
@@ -489,8 +513,10 @@ Bot menyimpan state lokal di folder `config/`:
   - menyimpan jatah `3x free fee swap` harian per account
   - dipakai sebagai fallback lokal dan cache sinkronisasi
   - saat tersedia, bot akan mencocokkan pemakaian free swap dengan endpoint history trading hari ini
+  - reset harian mengikuti UTC
+  - window pemakaian free swap tetap baru terbuka pada `01:00 UTC`
 - `.autoswap_telegram_state.json`
-  - menyimpan statistik kartu Telegram seperti total swap dan gas fee harian / lifetime
+  - menyimpan statistik pesan Telegram seperti tx ok/fail, swap, dan gas fee harian / lifetime
 
 ## Troubleshooting
 

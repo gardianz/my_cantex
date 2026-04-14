@@ -73,9 +73,10 @@ class RoundExecutionResult:
 
 
 class AutoswapBot:
-    def __init__(self, config: BotConfig, *, repo_root: Path) -> None:
+    def __init__(self, config: BotConfig, *, repo_root: Path, startup_mode: str) -> None:
         self.config = config
         self.repo_root = repo_root
+        self.startup_mode = startup_mode
         self.log = logging.getLogger("autoswap_bot")
         self._prompt_lock = asyncio.Lock()
         self._free_fee_swap_lock = asyncio.Lock()
@@ -96,23 +97,9 @@ class AutoswapBot:
     async def run(self) -> list[AccountResult]:
         await self.monitor.start()
         try:
-            accounts = self.config.accounts
-            if self.config.runtime.full_24h_mode:
-                return await asyncio.gather(*(self._run_account(account) for account in accounts))
-
-            if self.config.runtime.execution_mode == "concurrent" and len(accounts) > 1:
-                semaphore = asyncio.Semaphore(self.config.runtime.max_concurrency)
-
-                async def guarded(account: AccountConfig) -> AccountResult:
-                    async with semaphore:
-                        return await self._run_account(account)
-
-                return await asyncio.gather(*(guarded(account) for account in accounts))
-
-            results: list[AccountResult] = []
-            for account in accounts:
-                results.append(await self._run_account(account))
-            return results
+            return await asyncio.gather(
+                *(self._run_account(account) for account in self.config.accounts)
+            )
         finally:
             await self.monitor.close()
 
@@ -206,16 +193,12 @@ class AutoswapBot:
                 )
 
                 logger.info(
-                    "Strategi=%s | putaran=%s | nominal-range=%s | delay-range=%s | 24h-start=%s | seed=%s",
+                    "Strategi=%s | putaran=%s | nominal-range=%s | delay-range=%s | startup-mode=%s | seed=%s",
                     account.strategy().label,
                     prepared_run.rounds,
                     self._format_text_map(account.describe_amount_ranges()),
                     self.config.runtime.swap_delay_seconds_range.describe(),
-                    (
-                        self.config.runtime.full_24h_startup_mode
-                        if self.config.runtime.full_24h_mode
-                        else "-"
-                    ),
+                    self._startup_mode_label(),
                     self.config.runtime.random_seed if self.config.runtime.random_seed is not None else "-",
                 )
                 self._log_balances(logger, info, "Balance awal")
@@ -235,6 +218,10 @@ class AutoswapBot:
                     monitor_card,
                     f"🗓️ Ready for {prepared_run.rounds} swap rounds",
                 )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"🧭 Startup mode: {self._startup_mode_label()}",
+                )
 
                 if self.config.runtime.dry_run:
                     logger.info("Dry-run aktif, tidak ada swap yang dieksekusi")
@@ -251,18 +238,37 @@ class AutoswapBot:
                 used_network_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 used_swap_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 strategy_state = StrategyRuntimeState()
-                if self.config.runtime.full_24h_mode:
-                    await self.monitor.log_event(
-                        monitor_card,
-                        (
-                            "🗓️ 24h startup mode: planned"
-                            if self.config.runtime.full_24h_startup_mode == "planned"
-                            else "⚡ 24h startup mode: direct"
-                        ),
-                        force=True,
-                    )
-                    if self.config.runtime.full_24h_startup_mode == "direct":
-                        await self._run_24h_direct_session(
+                await self.monitor.log_event(
+                    monitor_card,
+                    (
+                        "🗓️ 24h startup mode: planned"
+                        if self._startup_mode_is_planned()
+                        else "⚡ 24h startup mode: direct"
+                    ),
+                    force=True,
+                )
+                if self._startup_mode_is_planned():
+                    while result.completed_rounds < prepared_run.rounds:
+                        session_start_utc = datetime.now(timezone.utc)
+                        session_end_utc = self._next_utc_midnight(session_start_utc)
+                        remaining_rounds = prepared_run.rounds - result.completed_rounds
+                        execution_buffer_seconds = self._estimate_24h_execution_buffer_seconds(remaining_rounds)
+                        schedule = self._build_24h_schedule(
+                            rounds=remaining_rounds,
+                            start_utc=session_start_utc,
+                            end_utc=session_end_utc,
+                            execution_buffer_seconds=execution_buffer_seconds,
+                        )
+                        self._log_24h_schedule(
+                            logger,
+                            remaining_rounds,
+                            session_start_utc,
+                            session_end_utc,
+                            schedule,
+                            execution_buffer_seconds,
+                            start_round_number=result.completed_rounds + 1,
+                        )
+                        await self._run_24h_session(
                             sdk=sdk,
                             router=router,
                             account=account,
@@ -273,75 +279,32 @@ class AutoswapBot:
                             used_network_fee=used_network_fee,
                             used_swap_fee=used_swap_fee,
                             result=result,
+                            session_end_utc=session_end_utc,
+                            schedule=schedule,
                         )
-                    else:
-                        while result.completed_rounds < prepared_run.rounds:
-                            session_start_utc = datetime.now(timezone.utc)
-                            session_end_utc = self._next_utc_midnight(session_start_utc)
-                            remaining_rounds = prepared_run.rounds - result.completed_rounds
-                            execution_buffer_seconds = self._estimate_24h_execution_buffer_seconds(remaining_rounds)
-                            schedule = self._build_24h_schedule(
-                                rounds=remaining_rounds,
-                                start_utc=session_start_utc,
-                                end_utc=session_end_utc,
-                                execution_buffer_seconds=execution_buffer_seconds,
+                        if result.completed_rounds < prepared_run.rounds:
+                            logger.info(
+                                "Rounds tersisa %s, lanjut ke sesi UTC berikutnya",
+                                prepared_run.rounds - result.completed_rounds,
                             )
-                            self._log_24h_schedule(
-                                logger,
-                                remaining_rounds,
-                                session_start_utc,
-                                session_end_utc,
-                                schedule,
-                                execution_buffer_seconds,
-                                start_round_number=result.completed_rounds + 1,
+                            await self.monitor.log_event(
+                                monitor_card,
+                                f"⏭️ {prepared_run.rounds - result.completed_rounds} rounds remaining, continue next UTC session",
+                                force=True,
                             )
-                            await self._run_24h_session(
-                                sdk=sdk,
-                                router=router,
-                                account=account,
-                                prepared_run=prepared_run,
-                                strategy_state=strategy_state,
-                                logger=logger,
-                                monitor_card=monitor_card,
-                                used_network_fee=used_network_fee,
-                                used_swap_fee=used_swap_fee,
-                                result=result,
-                                session_end_utc=session_end_utc,
-                                schedule=schedule,
-                            )
-                            if result.completed_rounds < prepared_run.rounds:
-                                logger.info(
-                                    "Rounds tersisa %s, lanjut ke sesi UTC berikutnya",
-                                    prepared_run.rounds - result.completed_rounds,
-                                )
-                                await self.monitor.log_event(
-                                    monitor_card,
-                                    f"⏭️ {prepared_run.rounds - result.completed_rounds} rounds remaining, continue next UTC session",
-                                    force=True,
-                                )
                 else:
-                    while result.completed_rounds < prepared_run.rounds:
-                        current_round_number = result.completed_rounds + 1
-                        round_result = await self._execute_round(
-                            sdk=sdk,
-                            router=router,
-                            account=account,
-                            prepared_run=prepared_run,
-                            round_number=current_round_number,
-                            strategy_state=strategy_state,
-                            fee_retry_deadline_utc=None,
-                            logger=logger,
-                            monitor_card=monitor_card,
-                            used_network_fee=used_network_fee,
-                            used_swap_fee=used_swap_fee,
-                        )
-                        if round_result.completed:
-                            result.completed_rounds += 1
-                            result.swap_transactions += 1
-                            continue
-                        if round_result.skipped:
-                            result.skipped_rounds += 1
-                        await self._sleep_between_swaps()
+                    await self._run_24h_direct_session(
+                        sdk=sdk,
+                        router=router,
+                        account=account,
+                        prepared_run=prepared_run,
+                        strategy_state=strategy_state,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                        used_network_fee=used_network_fee,
+                        used_swap_fee=used_swap_fee,
+                        result=result,
+                    )
 
                 final_info = await sdk.get_account_info()
                 result.final_balances = self._balances_by_symbol(final_info)
@@ -1795,6 +1758,7 @@ class AutoswapBot:
                         buy_instrument=hop.raw_quote.buy_instrument,
                         timeout=confirm_timeout,
                     )
+                    await self.monitor.record_tx_success(monitor_card)
                     return (
                         {
                             "id": getattr(event, "event_id", ""),
@@ -1807,6 +1771,7 @@ class AutoswapBot:
                     )
                 except Exception as exc:
                     if self._is_signature_verification_error(exc):
+                        await self.monitor.record_tx_failure(monitor_card)
                         raise RuntimeError(
                             "Signature verification failed untuk swap intent. "
                             "Kemungkinan CANTEX_TRADING_KEY tidak cocok dengan intent account wallet ini."
@@ -1819,34 +1784,36 @@ class AutoswapBot:
                             round_number,
                             exc,
                         )
+                        await self.monitor.record_tx_failure(monitor_card)
                         await self.monitor.log_event(
-                        monitor_card,
-                        f"⏭️ Hop {hop_index}/{hop_total} skipped: minimum ticket size",
-                        force=True,
-                    )
+                            monitor_card,
+                            f"⏭️ Hop {hop_index}/{hop_total} skipped: minimum ticket size",
+                            force=True,
+                        )
                         return None, "MIN_TICKET_SIZE"
                     logger.warning(
-                    "Swap gagal pada hop %s/%s round %s percobaan %s/%s: %s",
+                        "Swap gagal pada hop %s/%s round %s percobaan %s/%s: %s",
                     hop_index,
                     hop_total,
                     round_number,
                     attempt,
-                    max_attempts,
-                    exc,
-                )
-                    if attempt >= max_attempts:
-                        await self.monitor.log_event(
-                        monitor_card,
-                        f"❌ Hop {hop_index}/{hop_total} failed after {max_attempts} attempts: {exc}",
-                        force=True,
+                        max_attempts,
+                        exc,
                     )
+                    if attempt >= max_attempts:
+                        await self.monitor.record_tx_failure(monitor_card)
+                        await self.monitor.log_event(
+                            monitor_card,
+                            f"❌ Hop {hop_index}/{hop_total} failed after {max_attempts} attempts: {exc}",
+                            force=True,
+                        )
                         return None, "SWAP_RETRY_EXHAUSTED"
 
                     wait_seconds = max(self.config.runtime.retry_base_delay, 1.0) * attempt
                     await self.monitor.log_event(
-                    monitor_card,
-                    f"🔁 Retry hop {hop_index}/{hop_total} attempt {attempt + 1}/{max_attempts} in {int(wait_seconds)}s",
-                )
+                        monitor_card,
+                        f"🔁 Retry hop {hop_index}/{hop_total} attempt {attempt + 1}/{max_attempts} in {int(wait_seconds)}s",
+                    )
                     await self._sleep_or_stop(wait_seconds)
             return None, "SWAP_RETRY_EXHAUSTED"
         finally:
@@ -1881,7 +1848,7 @@ class AutoswapBot:
         while route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0")) > fee_cap:
             self._raise_if_stop_requested()
             current_fee = route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0"))
-            if account_name is not None:
+            if account_name is not None and self._startup_mode_uses_free_swap():
                 daily_free_fee_status = await self._sync_daily_free_fee_state_from_history(
                     sdk=sdk,
                     account_name=account_name,
@@ -2385,6 +2352,43 @@ class AutoswapBot:
             self._raise_if_stop_requested()
             current_round_number = result.completed_rounds + 1
 
+            if self._startup_mode_is_free_only():
+                daily_free_fee_status = await self._sync_daily_free_fee_state_from_history(
+                    sdk=sdk,
+                    account_name=account.name,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                )
+                if not daily_free_fee_status.window_open:
+                    wait_seconds = max(
+                        1.0,
+                        (daily_free_fee_status.window_opens_at_utc - datetime.now(timezone.utc)).total_seconds(),
+                    )
+                    logger.info(
+                        "Mode free swap menunggu window buka pada %s UTC",
+                        self._format_utc(daily_free_fee_status.window_opens_at_utc),
+                    )
+                    await self.monitor.update_status(
+                        monitor_card,
+                        round_number=current_round_number,
+                        phase="WAITING",
+                        next_scheduled_utc=daily_free_fee_status.window_opens_at_utc,
+                        next_wait_seconds=wait_seconds,
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        f"🎁 Free swap window opens in {int(wait_seconds)}s",
+                    )
+                    await self._sleep_or_stop(wait_seconds)
+                    continue
+                if daily_free_fee_status.remaining <= 0:
+                    if self.config.runtime.full_24h_auto_restart:
+                        await self._wait_until_next_utc_day_after_quota(
+                            logger=logger,
+                            monitor_card=monitor_card,
+                        )
+                    return
+
             round_result = await self._execute_round(
                 sdk=sdk,
                 router=router,
@@ -2685,6 +2689,24 @@ class AutoswapBot:
 
     def _sample_network_fee_poll_seconds(self) -> float:
         return max(1.0, self.config.runtime.network_fee_poll_seconds_range.sample(self._rng))
+
+    def _startup_mode_label(self) -> str:
+        labels = {
+            "free_only": "free-only",
+            "free_then_swap": "free-then-swap",
+            "swap_only": "swap-only",
+            "planned_fee": "planned-fee",
+        }
+        return labels.get(self.startup_mode, self.startup_mode)
+
+    def _startup_mode_is_planned(self) -> bool:
+        return self.startup_mode == "planned_fee"
+
+    def _startup_mode_is_free_only(self) -> bool:
+        return self.startup_mode == "free_only"
+
+    def _startup_mode_uses_free_swap(self) -> bool:
+        return self.startup_mode in {"free_only", "free_then_swap"}
 
     def _daily_free_fee_status(self, account_name: str) -> DailyFreeFeeStatus:
         return self.runtime_state.get_daily_free_fee_status(account_name)
