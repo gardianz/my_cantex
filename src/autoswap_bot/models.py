@@ -74,8 +74,14 @@ class AccountPlan:
 @dataclass(frozen=True)
 class ActivitySummary:
     source_path: str | None = None
+    history_source_path: str | None = None
+    swaps_24h: str | None = None
+    volume_24h: str | None = None
+    volume_24h_usd: str | None = None
     swaps_7d: str | None = None
     volume_7d: str | None = None
+    swaps_30d: str | None = None
+    volume_30d: str | None = None
     total_swaps: str | None = None
     total_volume: str | None = None
     reward_total: str | None = None

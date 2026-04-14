@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import sys
 import time
 from collections import defaultdict
 from copy import deepcopy
@@ -77,6 +78,7 @@ class AutoswapBot:
         self.repo_root = repo_root
         self.log = logging.getLogger("autoswap_bot")
         self._prompt_lock = asyncio.Lock()
+        self._free_fee_swap_lock = asyncio.Lock()
         self._rng = random.Random(self.config.runtime.random_seed)
         self.monitor = TelegramMonitor(self.config.runtime)
         self.runtime_state = BotRuntimeStateStore(
@@ -171,7 +173,8 @@ class AutoswapBot:
                     f"🚀 Session {session_number} started",
                     force=True,
                 )
-                await sdk.authenticate()
+                await sdk.authenticate(force=True)
+                logger.info("Autentikasi sukses | sesi=%s", session_number)
                 await self._sync_daily_free_fee_state_from_history(
                     sdk=sdk,
                     account_name=account.name,
@@ -188,6 +191,10 @@ class AutoswapBot:
                             monitor_card,
                             "🧩 Intent account created",
                         )
+
+                intent_mismatch = await sdk.detect_intent_signer_mismatch()
+                if intent_mismatch:
+                    raise RuntimeError(intent_mismatch)
 
                 admin = await sdk.get_account_admin()
                 info = await sdk.get_account_info()
@@ -937,7 +944,7 @@ class AutoswapBot:
             )
 
         try:
-            route, issue = await self._wait_for_network_fee_below_cap(
+            route, issue, daily_free_fee_status = await self._wait_for_network_fee_below_cap(
                 sdk=sdk,
                 router=router,
                 balances=balances,
@@ -1059,6 +1066,9 @@ class AutoswapBot:
                 round_number=round_number,
                 logger=logger,
                 monitor_card=monitor_card,
+                free_fee_sequential_account_name=(
+                    account.name if daily_free_fee_status is not None and hop_index == 1 else None
+                ),
             )
             if tx_result is None:
                 await self.monitor.log_event(
@@ -1302,7 +1312,8 @@ class AutoswapBot:
             )
 
         try:
-            route, issue = await self._wait_for_network_fee_below_cap(
+            route, issue, daily_free_fee_status = await self._wait_for_network_fee_below_cap(
+                sdk=sdk,
                 router=router,
                 balances=balances,
                 sell_symbol=sell_symbol,
@@ -1313,6 +1324,7 @@ class AutoswapBot:
                 logger=logger,
                 monitor_card=monitor_card,
                 current_route=route,
+                account_name=account.name,
             )
         except (CantexAPIError, CantexTimeoutError) as exc:
             logger.warning(
@@ -1403,6 +1415,9 @@ class AutoswapBot:
                 round_number=round_number,
                 logger=logger,
                 monitor_card=monitor_card,
+                free_fee_sequential_account_name=(
+                    account.name if daily_free_fee_status is not None and hop_index == 1 else None
+                ),
             )
             if tx_result is None:
                 await self.monitor.log_event(
@@ -1421,6 +1436,12 @@ class AutoswapBot:
             if daily_free_fee_status is not None and not daily_free_fee_consumed:
                 updated_free_fee_status = self._consume_daily_free_fee_swap(account.name)
                 daily_free_fee_consumed = True
+                await self.monitor.update_free_fee_status(
+                    monitor_card,
+                    used=updated_free_fee_status.used,
+                    limit=3,
+                    force=True,
+                )
                 logger.info(
                     "Free fee swap harian terpakai | %s | %s/3 | tanggal UTC=%s",
                     account.name,
@@ -1700,6 +1721,9 @@ class AutoswapBot:
             or "10 cc" in message
         )
 
+    def _is_signature_verification_error(self, exc: Exception) -> bool:
+        return "signature verification failed" in str(exc).lower()
+
     def _is_retryable_route_error(self, exc: Exception) -> bool:
         message = str(exc).lower()
         return (
@@ -1749,44 +1773,59 @@ class AutoswapBot:
         round_number: int,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
+        free_fee_sequential_account_name: str | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         max_attempts = max(1, self.config.runtime.max_retries)
         confirm_timeout = max(float(hop.estimated_time_seconds) * 3.0, 30.0)
-        for attempt in range(1, max_attempts + 1):
-            self._raise_if_stop_requested()
-            try:
-                event = await sdk.swap_and_confirm(
-                    sell_amount=hop.sell_amount,
-                    sell_instrument=hop.raw_quote.sell_instrument,
-                    buy_instrument=hop.raw_quote.buy_instrument,
-                    timeout=confirm_timeout,
-                )
-                return (
-                    {
-                        "id": getattr(event, "event_id", ""),
-                        "ledger_created_at": getattr(event, "ledger_created_at", ""),
-                        "output_amount": getattr(event, "output_amount", None),
-                        "output_instrument": getattr(getattr(event, "output_instrument", None), "id", ""),
-                        "raw": getattr(event, "raw", {}),
-                    },
-                    None,
-                )
-            except Exception as exc:
-                if self._is_min_ticket_error(exc):
-                    logger.warning(
-                        "Swap hop %s/%s round %s gagal karena minimum ticket size: %s",
-                        hop_index,
-                        hop_total,
-                        round_number,
-                        exc,
+        lock_acquired = False
+        if free_fee_sequential_account_name is not None:
+            lock_acquired = await self._acquire_free_fee_sequence_slot(
+                account_name=free_fee_sequential_account_name,
+                round_number=round_number,
+                logger=logger,
+                monitor_card=monitor_card,
+            )
+        try:
+            for attempt in range(1, max_attempts + 1):
+                self._raise_if_stop_requested()
+                try:
+                    event = await sdk.swap_and_confirm(
+                        sell_amount=hop.sell_amount,
+                        sell_instrument=hop.raw_quote.sell_instrument,
+                        buy_instrument=hop.raw_quote.buy_instrument,
+                        timeout=confirm_timeout,
                     )
-                    await self.monitor.log_event(
+                    return (
+                        {
+                            "id": getattr(event, "event_id", ""),
+                            "ledger_created_at": getattr(event, "ledger_created_at", ""),
+                            "output_amount": getattr(event, "output_amount", None),
+                            "output_instrument": getattr(getattr(event, "output_instrument", None), "id", ""),
+                            "raw": getattr(event, "raw", {}),
+                        },
+                        None,
+                    )
+                except Exception as exc:
+                    if self._is_signature_verification_error(exc):
+                        raise RuntimeError(
+                            "Signature verification failed untuk swap intent. "
+                            "Kemungkinan CANTEX_TRADING_KEY tidak cocok dengan intent account wallet ini."
+                        ) from exc
+                    if self._is_min_ticket_error(exc):
+                        logger.warning(
+                            "Swap hop %s/%s round %s gagal karena minimum ticket size: %s",
+                            hop_index,
+                            hop_total,
+                            round_number,
+                            exc,
+                        )
+                        await self.monitor.log_event(
                         monitor_card,
                         f"⏭️ Hop {hop_index}/{hop_total} skipped: minimum ticket size",
                         force=True,
                     )
-                    return None, "MIN_TICKET_SIZE"
-                logger.warning(
+                        return None, "MIN_TICKET_SIZE"
+                    logger.warning(
                     "Swap gagal pada hop %s/%s round %s percobaan %s/%s: %s",
                     hop_index,
                     hop_total,
@@ -1795,21 +1834,28 @@ class AutoswapBot:
                     max_attempts,
                     exc,
                 )
-                if attempt >= max_attempts:
-                    await self.monitor.log_event(
+                    if attempt >= max_attempts:
+                        await self.monitor.log_event(
                         monitor_card,
                         f"❌ Hop {hop_index}/{hop_total} failed after {max_attempts} attempts: {exc}",
                         force=True,
                     )
-                    return None, "SWAP_RETRY_EXHAUSTED"
+                        return None, "SWAP_RETRY_EXHAUSTED"
 
-                wait_seconds = max(self.config.runtime.retry_base_delay, 1.0) * attempt
-                await self.monitor.log_event(
+                    wait_seconds = max(self.config.runtime.retry_base_delay, 1.0) * attempt
+                    await self.monitor.log_event(
                     monitor_card,
                     f"🔁 Retry hop {hop_index}/{hop_total} attempt {attempt + 1}/{max_attempts} in {int(wait_seconds)}s",
                 )
-                await self._sleep_or_stop(wait_seconds)
-        return None, "SWAP_RETRY_EXHAUSTED"
+                    await self._sleep_or_stop(wait_seconds)
+            return None, "SWAP_RETRY_EXHAUSTED"
+        finally:
+            await self._release_free_fee_sequence_slot(
+                lock_acquired=lock_acquired,
+                logger=logger,
+                monitor_card=monitor_card,
+                apply_delay=free_fee_sequential_account_name is not None,
+            )
 
     async def _wait_for_network_fee_below_cap(
         self,
@@ -1826,10 +1872,10 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
         current_route: RoutePlan,
         account_name: str | None = None,
-    ) -> tuple[RoutePlan, PlanIssue | None]:
+    ) -> tuple[RoutePlan, PlanIssue | None, DailyFreeFeeStatus | None]:
         fee_cap = self.config.runtime.max_network_fee_cc_per_execution
         if fee_cap is None:
-            return current_route, None
+            return current_route, None, None
 
         route = current_route
         while route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0")) > fee_cap:
@@ -1856,27 +1902,35 @@ class AutoswapBot:
                         f"🎁 Free fee swap {free_swap_number}/3 active, fee cap bypassed ({current_fee} CC)",
                         force=True,
                     )
-                    return route, None
+                    return route, None, daily_free_fee_status
             now_utc = datetime.now(timezone.utc)
             if fee_retry_deadline_utc is not None and now_utc >= fee_retry_deadline_utc:
-                return route, PlanIssue(
-                    round_number=round_number,
-                    sell_symbol=sell_symbol,
-                    requested_amount=actual_amount,
-                    available_amount=balances.get(sell_symbol, Decimal("0")),
-                    reason="network fee tetap di atas batas sampai 30 detik sebelum jadwal berikutnya",
+                return (
+                    route,
+                    PlanIssue(
+                        round_number=round_number,
+                        sell_symbol=sell_symbol,
+                        requested_amount=actual_amount,
+                        available_amount=balances.get(sell_symbol, Decimal("0")),
+                        reason="network fee tetap di atas batas sampai 30 detik sebelum jadwal berikutnya",
+                    ),
+                    None,
                 )
 
             wait_seconds = self._sample_network_fee_poll_seconds()
             if fee_retry_deadline_utc is not None:
                 seconds_left = (fee_retry_deadline_utc - now_utc).total_seconds()
                 if seconds_left <= 0:
-                    return route, PlanIssue(
-                        round_number=round_number,
-                        sell_symbol=sell_symbol,
-                        requested_amount=actual_amount,
-                        available_amount=balances.get(sell_symbol, Decimal("0")),
-                        reason="network fee tetap di atas batas sampai 30 detik sebelum jadwal berikutnya",
+                    return (
+                        route,
+                        PlanIssue(
+                            round_number=round_number,
+                            sell_symbol=sell_symbol,
+                            requested_amount=actual_amount,
+                            available_amount=balances.get(sell_symbol, Decimal("0")),
+                            reason="network fee tetap di atas batas sampai 30 detik sebelum jadwal berikutnya",
+                        ),
+                        None,
                     )
                 wait_seconds = min(wait_seconds, max(1.0, seconds_left))
 
@@ -1923,8 +1977,71 @@ class AutoswapBot:
                 )
                 continue
             if issue is not None:
-                return route, issue
-        return route, None
+                return route, issue, None
+        return route, None, None
+
+    async def _acquire_free_fee_sequence_slot(
+        self,
+        *,
+        account_name: str,
+        round_number: int,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+    ) -> bool:
+        if self._free_fee_swap_lock.locked():
+            logger.info(
+                "Round %s menunggu giliran free fee sequential",
+                round_number,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"â³ Free fee queue: waiting turn for {account_name}",
+            )
+        await self._free_fee_swap_lock.acquire()
+        logger.info(
+            "Round %s masuk giliran free fee sequential",
+            round_number,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            f"ðŸŽ Free fee sequential turn active for {account_name}",
+            force=True,
+        )
+        return True
+
+    async def _release_free_fee_sequence_slot(
+        self,
+        *,
+        lock_acquired: bool,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        apply_delay: bool,
+    ) -> None:
+        if not lock_acquired:
+            return
+
+        stop_requested: StopRequested | None = None
+        try:
+            if apply_delay:
+                wait_seconds = self._sample_swap_delay_seconds()
+                logger.info(
+                    "Free fee sequential cooldown %.0f detik sebelum akun berikutnya",
+                    wait_seconds,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"â³ Free fee queue cooldown {int(wait_seconds)}s",
+                )
+                try:
+                    await self._sleep_or_stop(wait_seconds)
+                except StopRequested as exc:
+                    stop_requested = exc
+        finally:
+            if self._free_fee_swap_lock.locked():
+                self._free_fee_swap_lock.release()
+
+        if stop_requested is not None:
+            raise stop_requested
 
     async def _wait_for_recovery_route_ready(
         self,
@@ -1947,7 +2064,7 @@ class AutoswapBot:
         while True:
             self._raise_if_stop_requested()
             if issue is None:
-                route, issue = await self._wait_for_network_fee_below_cap(
+                route, issue, _ = await self._wait_for_network_fee_below_cap(
                     sdk=sdk,
                     router=router,
                     balances=balances,
@@ -2595,6 +2712,12 @@ class AutoswapBot:
             source_path, payload = await sdk.get_trading_history_payload()
         except Exception as exc:
             logger.warning("Gagal mengambil trading history untuk free fee sync: %s", exc)
+            await self.monitor.update_free_fee_status(
+                monitor_card,
+                used=local_status.used,
+                limit=3,
+                force=force_log,
+            )
             if force_log:
                 await self.monitor.log_event(
                     monitor_card,
@@ -2603,6 +2726,12 @@ class AutoswapBot:
             return local_status
 
         if payload is None:
+            await self.monitor.update_free_fee_status(
+                monitor_card,
+                used=local_status.used,
+                limit=3,
+                force=force_log,
+            )
             if force_log:
                 await self.monitor.log_event(
                     monitor_card,
@@ -2612,6 +2741,12 @@ class AutoswapBot:
 
         history_today_count = self._count_today_trading_history_swaps(payload)
         if history_today_count is None:
+            await self.monitor.update_free_fee_status(
+                monitor_card,
+                used=local_status.used,
+                limit=3,
+                force=force_log,
+            )
             if force_log:
                 await self.monitor.log_event(
                     monitor_card,
@@ -2622,6 +2757,12 @@ class AutoswapBot:
         synced_status = self.runtime_state.sync_daily_free_fee_swaps(
             account_name,
             min(history_today_count, 3),
+        )
+        await self.monitor.update_free_fee_status(
+            monitor_card,
+            used=synced_status.used,
+            limit=3,
+            force=force_log,
         )
         if force_log or synced_status.used != local_status.used:
             logger.info(
@@ -2708,6 +2849,7 @@ class AutoswapBot:
             "createdAt",
             "created_at",
             "timestamp",
+            "timestamp_utc",
             "time",
             "updatedAt",
             "updated_at",
@@ -2865,43 +3007,80 @@ class AutoswapBot:
         if not self.config.runtime.activity_enabled:
             return None
 
+        activity_source_path: str | None = None
+        activity_payload: Any | None = None
+        history_source_path: str | None = None
+        history_payload: Any | None = None
+
         try:
-            source_path, payload = await sdk.get_activity_payload()
+            activity_source_path, activity_payload = await sdk.get_activity_payload()
         except Exception as exc:
             logger.warning("Gagal mengambil activity: %s", exc)
-            return None
-        if payload is None:
+        try:
+            history_source_path, history_payload = await sdk.get_trading_history_payload()
+        except Exception as exc:
+            logger.warning("Gagal mengambil trading history: %s", exc)
+
+        if activity_payload is None and history_payload is None:
             logger.info("Activity user tidak tersedia dari endpoint yang dicoba")
             return None
 
-        summary = self._normalize_activity_payload(source_path, payload)
+        summary = self._normalize_activity_payload(
+            source_path=activity_source_path,
+            payload=activity_payload,
+            history_source_path=history_source_path,
+            history_payload=history_payload,
+        )
         self._log_activity_summary(logger, summary)
         return summary
 
     def _normalize_activity_payload(
         self,
+        *,
         source_path: str | None,
-        payload: Any,
+        payload: Any | None,
+        history_source_path: str | None,
+        history_payload: Any | None,
     ) -> ActivitySummary:
-        swaps_7d = self._find_value(payload, {"swaps7d", "swaps_7d", "seven_day_swaps", "sevenDaySwaps"})
-        volume_7d = self._find_value(payload, {"volume7d", "volume_7d", "seven_day_volume", "sevenDayVolume"})
-        total_swaps = self._find_value(payload, {"total_swaps", "totalSwaps", "all_time_swaps"})
-        total_volume = self._find_value(payload, {"total_volume", "totalVolume", "all_time_volume"})
-        reward_total = self._find_value(payload, {"reward", "rewards", "total_reward", "totalReward"})
-        tx_count = self._find_value(payload, {"tx", "tx_count", "transactions", "transactionCount", "total_tx"})
-        rank = self._find_value(payload, {"rank", "leaderboard_rank", "leaderboardRank"})
-        volume_usd = self._find_value(payload, {"volume_usd", "volumeUsd", "usd_volume", "usdVolume"})
+        if (
+            isinstance(payload, dict)
+            and isinstance(payload.get("stats"), dict)
+            and isinstance(payload.get("rebates"), dict)
+        ):
+            return self._normalize_reward_activity_payload(
+                source_path=source_path,
+                payload=payload,
+                history_source_path=history_source_path,
+                history_payload=history_payload,
+            )
+
+        effective_payload = payload if payload is not None else history_payload
+        if effective_payload is None:
+            return ActivitySummary()
+
+        swaps_7d = self._find_value(effective_payload, {"swaps7d", "swaps_7d", "seven_day_swaps", "sevenDaySwaps"})
+        volume_7d = self._find_value(effective_payload, {"volume7d", "volume_7d", "seven_day_volume", "sevenDayVolume"})
+        total_swaps = self._find_value(effective_payload, {"total_swaps", "totalSwaps", "all_time_swaps"})
+        total_volume = self._find_value(effective_payload, {"total_volume", "totalVolume", "all_time_volume"})
+        reward_total = self._find_value(effective_payload, {"reward", "rewards", "total_reward", "totalReward"})
+        tx_count = self._find_value(
+            effective_payload,
+            {"tx", "tx_count", "transactions", "transactionCount", "total_tx"},
+        )
+        rank = self._find_value(effective_payload, {"rank", "leaderboard_rank", "leaderboardRank"})
+        volume_usd = self._find_value(effective_payload, {"volume_usd", "volumeUsd", "usd_volume", "usdVolume"})
         rebates: dict[str, str] = {}
 
-        rebate_payload = self._find_container(payload, "rebate")
+        rebate_payload = self._find_container(effective_payload, "rebate")
         if isinstance(rebate_payload, dict):
             for label, value in rebate_payload.items():
                 rebates[str(label)] = self._stringify_value(value)
 
-        recent_items = self._extract_recent_items(payload)
-        raw_preview = json.dumps(payload, default=str)[:400]
+        recent_items = self._extract_recent_items(history_payload if history_payload is not None else effective_payload)
+        raw_preview = json.dumps(effective_payload, default=str)[:400]
         return ActivitySummary(
             source_path=source_path,
+            history_source_path=history_source_path,
             swaps_7d=self._stringify_optional(swaps_7d),
             volume_7d=self._stringify_optional(volume_7d),
             total_swaps=self._stringify_optional(total_swaps),
@@ -2915,7 +3094,69 @@ class AutoswapBot:
             raw_preview=raw_preview,
         )
 
+    def _normalize_reward_activity_payload(
+        self,
+        *,
+        source_path: str | None,
+        payload: dict[str, Any],
+        history_source_path: str | None,
+        history_payload: Any | None,
+    ) -> ActivitySummary:
+        stats = payload.get("stats") or {}
+        rebates_payload = payload.get("rebates") or {}
+        rebates: dict[str, str] = {}
+        for label, entry in rebates_payload.items():
+            if isinstance(entry, dict):
+                amount = entry.get("cc_amount")
+                status = str(entry.get("status", "")).strip()
+                parts: list[str] = []
+                if amount not in {None, ""}:
+                    parts.append(f"{amount} CC")
+                if status:
+                    parts.append(status)
+                rebates[str(label)] = " | ".join(parts) if parts else self._stringify_value(entry)
+            else:
+                rebates[str(label)] = self._stringify_value(entry)
+
+        recent_items = self._extract_recent_trading_items(history_payload)
+        history_preview = self._extract_trading_history_items(history_payload)[:2] if history_payload is not None else []
+        raw_preview = json.dumps(
+            {
+                "reward_activity": payload,
+                "history_trading": history_preview,
+            },
+            default=str,
+        )[:400]
+        this_week_rebate = rebates_payload.get("this_week") if isinstance(rebates_payload, dict) else None
+
+        return ActivitySummary(
+            source_path=source_path,
+            history_source_path=history_source_path,
+            swaps_24h=self._stringify_optional(stats.get("count_24h")),
+            volume_24h=self._stringify_optional(stats.get("cc_volume_24h")),
+            volume_24h_usd=self._stringify_optional(
+                stats.get("usd_volume_24h")
+                or stats.get("volume_usd_24h")
+                or stats.get("cc_volume_24h_usd")
+            ),
+            swaps_7d=self._stringify_optional(stats.get("count_7d")),
+            volume_7d=self._stringify_optional(stats.get("cc_volume_7d")),
+            swaps_30d=self._stringify_optional(stats.get("count_30d")),
+            volume_30d=self._stringify_optional(stats.get("cc_volume_30d")),
+            total_swaps=self._stringify_optional(stats.get("count_alltime")),
+            total_volume=self._stringify_optional(stats.get("cc_volume_alltime")),
+            reward_total=self._extract_rebate_cc_amount(this_week_rebate),
+            tx_count=self._stringify_optional(stats.get("count_alltime")),
+            rebates=rebates,
+            recent_items=tuple(recent_items[: self.config.runtime.activity_items_limit]),
+            raw_preview=raw_preview,
+        )
+
     def _extract_recent_items(self, payload: Any) -> list[str]:
+        trading_items = self._extract_recent_trading_items(payload)
+        if trading_items:
+            return trading_items
+
         items: list[str] = []
         if isinstance(payload, list):
             iterable = payload
@@ -2930,12 +3171,87 @@ class AutoswapBot:
         for item in iterable[: self.config.runtime.activity_items_limit]:
             if isinstance(item, dict):
                 parts = []
-                for key in ("type", "status", "instrument", "instrumentSymbol", "amount", "createdAt", "timestamp"):
+                for key in (
+                    "type",
+                    "status",
+                    "instrument",
+                    "instrumentSymbol",
+                    "amount",
+                    "createdAt",
+                    "timestamp",
+                    "timestamp_utc",
+                ):
                     if key in item:
                         parts.append(f"{key}={item[key]}")
                 if parts:
                     items.append(", ".join(parts))
         return items
+
+    def _extract_recent_trading_items(self, payload: Any) -> list[str]:
+        history_items = self._extract_trading_history_items(payload)
+        formatted: list[str] = []
+        for item in history_items[: self.config.runtime.activity_items_limit]:
+            rendered = self._format_trading_history_item(item)
+            if rendered:
+                formatted.append(rendered)
+        return formatted
+
+    def _format_trading_history_item(self, item: dict[str, Any]) -> str | None:
+        sell_symbol = self._history_symbol(item.get("token_input_instrument_id"))
+        buy_symbol = self._history_symbol(item.get("token_output_instrument_id"))
+        amount_input = self._compact_decimal_text(item.get("amount_input"))
+        amount_output = self._compact_decimal_text(item.get("amount_output"))
+        timestamp = self._extract_item_timestamp(item)
+        timestamp_text = (
+            timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+            if timestamp is not None
+            else self._stringify_optional(item.get("timestamp_utc"))
+        )
+        if sell_symbol is None or buy_symbol is None:
+            return None
+
+        parts = [f"{sell_symbol}->{buy_symbol}"]
+        if amount_input is not None and amount_output is not None:
+            parts.append(f"in {amount_input}")
+            parts.append(f"out {amount_output}")
+        price = str(item.get("trade_prices_display", "")).strip()
+        if price:
+            parts.append(f"price {price}")
+        if timestamp_text:
+            parts.insert(0, timestamp_text)
+        return " | ".join(parts)
+
+    def _history_symbol(self, value: Any) -> str | None:
+        if value in {None, ""}:
+            return None
+        symbol = str(value).strip()
+        if symbol == "Amulet":
+            return CC_SYMBOL
+        return symbol
+
+    def _compact_decimal_text(self, value: Any, *, places: int = 4) -> str | None:
+        if value in {None, ""}:
+            return None
+        try:
+            decimal_value = Decimal(str(value))
+        except Exception:
+            return str(value)
+        if decimal_value == 0:
+            return "0"
+        quantizer = Decimal("1").scaleb(-places)
+        rounded = decimal_value.quantize(quantizer)
+        rendered = format(rounded, "f")
+        if "." in rendered:
+            rendered = rendered.rstrip("0").rstrip(".")
+        return rendered
+
+    def _extract_rebate_cc_amount(self, rebate_entry: Any) -> str | None:
+        if not isinstance(rebate_entry, dict):
+            return None
+        amount = rebate_entry.get("cc_amount")
+        if amount in {None, ""}:
+            return None
+        return f"{amount} CC"
 
     def _find_value(self, payload: Any, candidates: set[str]) -> Any | None:
         normalized_candidates = {candidate.lower() for candidate in candidates}
@@ -2975,17 +3291,27 @@ class AutoswapBot:
         summary: ActivitySummary,
     ) -> None:
         logger.info(
-            "Activity | source=%s | 7d swaps=%s | 7d volume=%s | total swaps=%s | total volume=%s",
+            (
+                "Activity | source=%s | 24h swaps=%s | 24h volume=%s | "
+                "7d swaps=%s | 7d volume=%s | 30d swaps=%s | 30d volume=%s | "
+                "all-time swaps=%s | all-time volume=%s"
+            ),
             summary.source_path or "-",
+            summary.swaps_24h or "-",
+            summary.volume_24h or "-",
             summary.swaps_7d or "-",
             summary.volume_7d or "-",
+            summary.swaps_30d or "-",
+            summary.volume_30d or "-",
             summary.total_swaps or "-",
             summary.total_volume or "-",
         )
+        if summary.history_source_path:
+            logger.info("Trading history | source=%s", summary.history_source_path)
         if summary.rebates:
             logger.info("Activity rebates | %s", self._format_text_map(summary.rebates))
         for item in summary.recent_items:
-            logger.info("Activity recent | %s", item)
+            logger.info("Trading recent | %s", item)
 
     def _log_balances(self, logger: AccountLoggerAdapter, info: AccountInfo, title: str) -> None:
         logger.info("%s | %s", title, self._format_amount_map(self._balances_by_symbol(info)))
@@ -3066,13 +3392,29 @@ class AutoswapBot:
         return mapping.get(stop_reason, f"Eksekusi berhenti: {stop_reason}")
 
 
-def configure_logging(level: str, *, use_utc: bool = False) -> None:
+def configure_logging(
+    level: str,
+    *,
+    use_utc: bool = False,
+    terminal_dashboard_enabled: bool = False,
+) -> None:
     if use_utc:
         logging.Formatter.converter = time.gmtime
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    )
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+    root_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    if not (terminal_dashboard_enabled and sys.stdout.isatty()):
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
+        )
+        root_logger.addHandler(handler)
+    else:
+        root_logger.addHandler(logging.NullHandler())
+    sdk_log_level = logging.DEBUG if level.upper() == "DEBUG" else logging.WARNING
+    logging.getLogger("cantex_sdk").setLevel(sdk_log_level)
+    logging.getLogger("cantex_sdk._sdk").setLevel(sdk_log_level)
 
 
 def summarize_results(results: list[AccountResult]) -> str:

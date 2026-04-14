@@ -4,6 +4,7 @@ import html
 import json
 import logging
 import re
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -47,6 +48,8 @@ class TelegramCardState:
     balances: dict[str, Decimal] = field(default_factory=dict)
     total_network_fee: dict[str, Decimal] = field(default_factory=dict)
     total_swap_fee: dict[str, Decimal] = field(default_factory=dict)
+    daily_free_fee_used: int = 0
+    daily_free_fee_limit: int = 3
     swap_transactions: int = 0
     pair_completed: dict[str, int] = field(default_factory=dict)
     activity_summary: ActivitySummary | None = None
@@ -70,14 +73,29 @@ class TelegramAccountTotals:
     lifetime_network_fee: dict[str, Decimal] = field(default_factory=dict)
 
 
+class TelegramRateLimitError(RuntimeError):
+    def __init__(self, retry_after_seconds: int, description: str) -> None:
+        super().__init__(description)
+        self.retry_after_seconds = max(int(retry_after_seconds), 1)
+        self.description = description
+
+
 class TelegramMonitor:
     def __init__(self, runtime: RuntimeConfig) -> None:
         self.runtime = runtime
         self.log = logging.getLogger("autoswap_bot.telegram")
         self._session: aiohttp.ClientSession | None = None
         self._account_totals: dict[str, TelegramAccountTotals] = {}
+        self._cards: dict[str, TelegramCardState] = {}
+        self._terminal_logs: deque[str] = deque(
+            maxlen=self.runtime.terminal_dashboard_logs_limit
+        )
+        self._terminal_last_render_monotonic: float = 0.0
+        self._terminal_dashboard_paused = False
         self._state_file = runtime.telegram_state_file
         self._state_loaded = False
+        self._telegram_backoff_until_monotonic: float = 0.0
+        self._telegram_backoff_last_logged_second: int = 0
 
     async def start(self) -> None:
         self._load_state()
@@ -90,6 +108,17 @@ class TelegramMonitor:
         if self._session is not None:
             await self._session.close()
             self._session = None
+
+    def set_terminal_dashboard_paused(self, paused: bool) -> None:
+        self._terminal_dashboard_paused = paused
+        if not paused:
+            self._render_terminal_dashboard(force=True)
+
+    async def _refresh_outputs(self, card: TelegramCardState, *, force: bool) -> None:
+        self._cards[card.account_name] = card
+        self._render_terminal_dashboard(force=force)
+        if self.runtime.telegram_enabled:
+            await self._publish(card, force=force)
 
     def create_card(
         self,
@@ -116,13 +145,14 @@ class TelegramMonitor:
             balances={symbol: Decimal("0") for symbol in SYMBOL_SHORT},
             latest_logs=deque(maxlen=self.runtime.telegram_latest_logs_limit),
         )
+        self._cards[account.name] = card
         self._persist_card_state(card)
         return card
 
     async def attach_card(self, card: TelegramCardState | None) -> None:
-        if card is None or not self.runtime.telegram_enabled:
+        if card is None:
             return
-        await self._publish(card, force=True)
+        await self._refresh_outputs(card, force=True)
 
     async def log_event(
         self,
@@ -135,7 +165,8 @@ class TelegramMonitor:
             return
         self._rollover_card_if_needed(card)
         card.latest_logs.append(self._timestamped_log(message))
-        await self._publish(card, force=force)
+        self._append_terminal_log(card, message)
+        await self._refresh_outputs(card, force=force)
 
     async def update_status(
         self,
@@ -159,7 +190,7 @@ class TelegramMonitor:
             card.phase = phase
         card.next_scheduled_utc = next_scheduled_utc
         card.next_wait_seconds = next_wait_seconds
-        await self._publish(card, force=force)
+        await self._refresh_outputs(card, force=force)
 
     async def update_balances(
         self,
@@ -172,7 +203,7 @@ class TelegramMonitor:
             return
         self._rollover_card_if_needed(card)
         card.balances.update(balances)
-        await self._publish(card, force=force)
+        await self._refresh_outputs(card, force=force)
 
     async def update_fee_totals(
         self,
@@ -188,7 +219,23 @@ class TelegramMonitor:
         card.total_network_fee = dict(total_network_fee)
         card.total_swap_fee = dict(total_swap_fee)
         self._persist_card_state(card)
-        await self._publish(card, force=force)
+        await self._refresh_outputs(card, force=force)
+
+    async def update_free_fee_status(
+        self,
+        card: TelegramCardState | None,
+        *,
+        used: int,
+        limit: int,
+        force: bool = False,
+    ) -> None:
+        if card is None:
+            return
+        self._rollover_card_if_needed(card)
+        card.daily_free_fee_used = max(int(used), 0)
+        card.daily_free_fee_limit = max(int(limit), 0)
+        self._persist_card_state(card)
+        await self._refresh_outputs(card, force=force)
 
     async def record_round_completed(
         self,
@@ -206,7 +253,7 @@ class TelegramMonitor:
         card.next_scheduled_utc = None
         card.next_wait_seconds = None
         self._persist_card_state(card)
-        await self._publish(card, force=force)
+        await self._refresh_outputs(card, force=force)
 
     async def update_activity(
         self,
@@ -221,7 +268,7 @@ class TelegramMonitor:
         if card.baseline_activity is None:
             card.baseline_activity = summary
         card.activity_summary = summary
-        await self._publish(card, force=force)
+        await self._refresh_outputs(card, force=force)
 
     async def finalize(
         self,
@@ -237,7 +284,7 @@ class TelegramMonitor:
         card.next_scheduled_utc = None
         card.next_wait_seconds = None
         self._persist_card_state(card)
-        await self._publish(card, force=True)
+        await self._refresh_outputs(card, force=True)
 
     async def _publish(self, card: TelegramCardState, *, force: bool) -> None:
         self._rollover_card_if_needed(card)
@@ -247,6 +294,8 @@ class TelegramMonitor:
             raise RuntimeError("TelegramMonitor belum di-start")
 
         now = time.monotonic()
+        if now < self._telegram_backoff_until_monotonic:
+            return
         if (
             not force
             and card.message_id is not None
@@ -283,8 +332,289 @@ class TelegramMonitor:
                 )
             card.last_render_text = text
             card.last_publish_monotonic = now
+        except TelegramRateLimitError as exc:
+            self._telegram_backoff_until_monotonic = max(
+                self._telegram_backoff_until_monotonic,
+                time.monotonic() + exc.retry_after_seconds,
+            )
+            current_second = int(self._telegram_backoff_until_monotonic)
+            if current_second != self._telegram_backoff_last_logged_second:
+                self._telegram_backoff_last_logged_second = current_second
+                self.log.warning(
+                    "Telegram rate limit, jeda update %s detik: %s",
+                    exc.retry_after_seconds,
+                    exc.description,
+                )
         except Exception as exc:  # pragma: no cover - network/runtime guard
             self.log.warning("Gagal update Telegram card %s: %s", card.account_name, exc)
+
+    def _append_terminal_log(self, card: TelegramCardState, message: str) -> None:
+        timestamp = datetime.now().astimezone().strftime("%H:%M:%S")
+        account_label = f"A{card.display_index}"
+        rendered = self._terminalize_text(message, preserve_case=True)
+        self._terminal_logs.append(f"[{timestamp}] {account_label:<4} {rendered}")
+
+    def _render_terminal_dashboard(self, *, force: bool) -> None:
+        if (
+            not self.runtime.terminal_dashboard_enabled
+            or self._terminal_dashboard_paused
+            or not sys.stdout.isatty()
+        ):
+            return
+
+        now = time.monotonic()
+        if (
+            not force
+            and now - self._terminal_last_render_monotonic
+            < self.runtime.terminal_dashboard_min_interval_seconds
+        ):
+            return
+
+        cards = sorted(self._cards.values(), key=lambda item: item.display_index)
+        if not cards:
+            return
+
+        col_widths = (12, 9, 10, 12, 30, 69)
+        header_row = self._table_row(
+            ("Akun", "Status", "CC", "Progress", "Plan", "Metrics"),
+            col_widths,
+        )
+        metrics_header_row = self._table_row(
+            ("", "", "", "", "", self._dashboard_metrics_header()),
+            col_widths,
+        )
+        separator_row = self._table_row(
+            tuple("-" * width for width in col_widths),
+            col_widths,
+        )
+        row_width = len(header_row) - 2
+        border = "+" + ("-" * row_width) + "+"
+        strong_border = "+" + ("=" * row_width) + "+"
+
+        total_round_targets = sum(card.total_rounds for card in cards)
+        total_swaps = sum(card.swap_transactions for card in cards)
+        failed_accounts = sum(1 for card in cards if card.phase.startswith("FAILED"))
+        stopped_accounts = sum(1 for card in cards if card.phase.startswith("STOPPED"))
+        active_accounts = len(cards) - failed_accounts - stopped_accounts
+        local_now = datetime.now().astimezone()
+
+        lines = [
+            strong_border,
+            self._padded_line(
+                (
+                    f"Cantex Autoswap Bot  |  "
+                    f"{local_now.strftime('%d/%m/%Y, %H.%M.%S %Z')}  |  "
+                    f"{len(cards)} akun  |  Mode: {self._dashboard_mode_label()}"
+                ),
+                row_width,
+            ),
+            self._padded_line(
+                (
+                    f"Swaps: {total_swaps}/{total_round_targets} total  |  "
+                    f"{active_accounts} active  {failed_accounts} fail  {stopped_accounts} stopped"
+                ),
+                row_width,
+            ),
+            self._padded_line(
+                f"State: {self._dashboard_state_label(cards)}",
+                row_width,
+            ),
+            border,
+            header_row,
+            metrics_header_row,
+            separator_row,
+        ]
+
+        for card in cards:
+            lines.append(
+                self._table_row(
+                    (
+                        card.account_name,
+                        self._dashboard_status(card),
+                        self._fmt_balance(card.balances.get("CC", Decimal("0")), 4),
+                        self._dashboard_progress(card),
+                        self._dashboard_plan(card),
+                        self._dashboard_metrics(card),
+                    ),
+                    col_widths,
+                )
+            )
+
+        lines.extend(
+            [
+                border,
+                "",
+                f"--- Execution Logs (last {self.runtime.terminal_dashboard_logs_limit}) ---",
+            ]
+        )
+        if self._terminal_logs:
+            lines.extend(self._terminal_logs)
+        else:
+            lines.append("-")
+        lines.extend(
+            [
+                "",
+                (
+                    "Ctrl+C to stop  |  Round delay: "
+                    f"{self.runtime.swap_delay_seconds_range.describe()}"
+                ),
+            ]
+        )
+
+        rendered = "\n".join(lines)
+        sys.stdout.write("\x1b[2J\x1b[H")
+        sys.stdout.write(rendered + "\n")
+        sys.stdout.flush()
+        self._terminal_last_render_monotonic = now
+
+    def _dashboard_mode_label(self) -> str:
+        if self.runtime.full_24h_mode:
+            return f"24H-{self.runtime.full_24h_startup_mode.upper()}"
+        return self.runtime.execution_mode.upper()
+
+    def _dashboard_state_label(self, cards: list[TelegramCardState]) -> str:
+        phases = {card.phase for card in cards}
+        if any(phase == "PROCESSING" for phase in phases):
+            return "processing"
+        if any(phase in {"WAITING", "WAITING_FEE", "WAITING_NEXT_DAY"} for phase in phases):
+            return "cooldown"
+        if all(phase in {"FINISHED", "STOPPED_MANUAL"} or phase.startswith("FAILED") for phase in phases):
+            return "finished"
+        if any(phase == "STARTING" for phase in phases):
+            return "starting"
+        return "live"
+
+    def _dashboard_status(self, card: TelegramCardState) -> str:
+        if card.phase == "WAITING":
+            return "COOLDOWN"
+        if card.phase == "WAITING_FEE":
+            return "WAIT-FEE"
+        if card.phase == "WAITING_NEXT_DAY":
+            return "NEXT-DAY"
+        if card.phase == "PROCESSING":
+            return "PROCESS"
+        if card.phase == "COMPLETED":
+            return "OK"
+        if card.phase == "FINISHED":
+            return "FINISHED"
+        if card.phase.startswith("FAILED"):
+            return "FAILED"
+        if card.phase.startswith("STOPPED"):
+            return "STOPPED"
+        return self._terminalize_text(card.phase)
+
+    def _dashboard_progress(self, card: TelegramCardState) -> str:
+        current_round = max(card.current_round_number, card.swap_transactions)
+        return f"R{current_round}/{card.total_rounds} ok{card.swap_transactions}"
+
+    def _dashboard_plan(self, card: TelegramCardState) -> str:
+        strategy = self._build_strategy_line(card).split(":", 1)[-1].strip()
+        pair = self._short_pair_ascii(card.current_pair_key) if card.current_pair_key else self._strategy_ascii(card.strategy_label)
+        if card.phase == "WAITING_FEE" and card.next_wait_seconds is not None:
+            return f"S{strategy} {pair} fee {int(max(card.next_wait_seconds, 0))}s"
+        if card.phase == "WAITING" and card.next_wait_seconds is not None:
+            return f"S{strategy} {pair} cd {int(max(card.next_wait_seconds, 0))}s"
+        if card.phase == "WAITING_NEXT_DAY" and card.next_wait_seconds is not None:
+            return f"S{strategy} quota done {int(max(card.next_wait_seconds, 0))}s"
+        if card.phase == "PROCESSING":
+            return f"S{strategy} {pair} processing"
+        if card.phase == "COMPLETED":
+            return f"S{strategy} {pair} completed"
+        return f"S{strategy} {pair} {self._dashboard_status(card).lower()}"
+
+    def _dashboard_metrics(self, card: TelegramCardState) -> str:
+        summary = card.activity_summary
+        activity_24h = self._dashboard_24h_activity(summary)
+        yesterday = self._rebate_amount_compact(summary.rebates.get("yesterday")) if summary else "-"
+        this_week = self._rebate_amount_compact(summary.rebates.get("this_week")) if summary else "-"
+        gas_today = self._dashboard_gas(self._current_day_network_fee(card))
+        free_fee = f"{card.daily_free_fee_used}/{card.daily_free_fee_limit}" if card.daily_free_fee_limit > 0 else "-"
+        return self._compose_dashboard_metrics(
+            activity_24h,
+            yesterday,
+            this_week,
+            gas_today,
+            free_fee,
+        )
+
+    def _dashboard_metrics_header(self) -> str:
+        return self._compose_dashboard_metrics(
+            "24h",
+            "yesterday",
+            "t week",
+            "gas fee",
+            "free swap",
+        )
+
+    def _compose_dashboard_metrics(
+        self,
+        activity: str,
+        yesterday: str,
+        this_week: str,
+        gas_fee: str,
+        free_swap: str,
+    ) -> str:
+        parts = (
+            self._truncate_terminal(activity, 17).ljust(17),
+            self._truncate_terminal(yesterday, 9).ljust(9),
+            self._truncate_terminal(this_week, 8).ljust(8),
+            self._truncate_terminal(gas_fee, 8).ljust(8),
+            self._truncate_terminal(free_swap, 9).ljust(9),
+        )
+        return " | ".join(parts)
+
+    def _dashboard_24h_activity(self, summary: ActivitySummary | None) -> str:
+        if summary is None:
+            return "-"
+        volume_24h = self._metric_decimal(summary.volume_24h)
+        swaps_24h = self._metric_value(summary.swaps_24h)
+        usd_24h = self._metric_decimal(summary.volume_24h_usd, places=0)
+        if usd_24h != "-":
+            return f"{volume_24h} CC (${usd_24h}) {swaps_24h} swap"
+        return f"{volume_24h} CC {swaps_24h} swap"
+
+    def _table_row(self, values: tuple[str, ...], widths: tuple[int, ...]) -> str:
+        padded = [
+            self._truncate_terminal(value, width).ljust(width)
+            for value, width in zip(values, widths)
+        ]
+        return "| " + " | ".join(padded) + " |"
+
+    def _truncate_terminal(self, value: str, width: int) -> str:
+        text = self._terminalize_text(value)
+        if len(text) <= width:
+            return text
+        if width <= 3:
+            return text[:width]
+        return text[: width - 3] + "..."
+
+    def _padded_line(self, value: str, width: int) -> str:
+        text = self._truncate_terminal(value, width)
+        return "| " + text.ljust(width) + " |"
+
+    def _terminalize_text(self, value: str, *, preserve_case: bool = False) -> str:
+        text = str(value)
+        replacements = {
+            "→": "->",
+            "🎁": "[free]",
+            "⏳": "[wait]",
+            "🔄": "[step]",
+            "✅": "[ok]",
+            "❌": "[fail]",
+            "⏭️": "[skip]",
+            "⏭": "[skip]",
+            "🛟": "[refill]",
+            "🚀": "[start]",
+            "🏁": "[done]",
+            "🎉": "[done]",
+            "ℹ️": "[info]",
+            "⚠️": "[warn]",
+        }
+        for source, target in replacements.items():
+            text = text.replace(source, target)
+        text = re.sub(r"[^\x20-\x7E]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text if preserve_case else text
 
     async def _request(self, method: str, payload: dict) -> dict:
         if self._session is None:
@@ -292,6 +622,13 @@ class TelegramMonitor:
         url = f"https://api.telegram.org/bot{self.runtime.telegram_bot_token}/{method}"
         async with self._session.post(url, json=payload) as response:
             data = await response.json(content_type=None)
+            if response.status == 429 or data.get("error_code") == 429:
+                parameters = data.get("parameters") or {}
+                retry_after = parameters.get("retry_after", 30)
+                raise TelegramRateLimitError(
+                    retry_after_seconds=int(retry_after),
+                    description=str(data.get("description", "Too Many Requests")),
+                )
             if not response.ok or not data.get("ok", False):
                 raise RuntimeError(f"Telegram API error: {data}")
             return data
@@ -312,7 +649,8 @@ class TelegramMonitor:
             html.escape(self._build_gas_totals_line(card)),
             f"Uptime: {html.escape(self._format_duration(datetime.now(timezone.utc) - card.session_started_utc))}",
             f"🌐 Proxy: {html.escape(card.proxy_label)}",
-            html.escape(self._build_reward_line(card)),
+            html.escape(self._build_activity_line(card)),
+            html.escape(self._build_rebates_line(card)),
             "",
             "<b>📝 Latest Logs</b>",
             f"<pre>{html.escape(latest_logs)}</pre>",
@@ -391,15 +729,34 @@ class TelegramMonitor:
                 parts.append(f"{self._short_pair(pair_key)}: {completed}")
         return " | ".join(parts)
 
-    def _build_reward_line(self, card: TelegramCardState) -> str:
+    def _build_activity_line(self, card: TelegramCardState) -> str:
         summary = card.activity_summary
-        reward = self._metric_value(summary.reward_total if summary else None)
-        volume = self._metric_value(
-            summary.volume_usd if summary and summary.volume_usd is not None else (summary.total_volume if summary else None)
-        )
-        tx = self._metric_value(summary.tx_count if summary else None)
-        rank = self._metric_value(summary.rank if summary else None)
+        if summary is None:
+            return "🏆 Activity 24h: -"
+
+        if summary.swaps_24h is not None or summary.volume_24h is not None:
+            return (
+                "🏆 Activity 24h: "
+                f"{self._metric_value(summary.swaps_24h)} swaps | "
+                f"{self._metric_decimal(summary.volume_24h)} CC"
+            )
+
+        reward = self._metric_value(summary.reward_total)
+        volume = self._metric_value(summary.volume_usd if summary.volume_usd is not None else summary.total_volume)
+        tx = self._metric_value(summary.tx_count)
+        rank = self._metric_value(summary.rank)
         return f"🏆 Stats: Reward {reward} | Volume {volume} | Tx {tx} | Rank {rank}"
+
+    def _build_rebates_line(self, card: TelegramCardState) -> str:
+        summary = card.activity_summary
+        if summary is None or not summary.rebates:
+            return "💸 CC Rebates: Yesterday - | This Week - | Last Week -"
+        return (
+            "💸 CC Rebates: "
+            f"Yesterday {self._rebate_amount(summary.rebates.get('yesterday'))} | "
+            f"This Week {self._rebate_amount(summary.rebates.get('this_week'))} | "
+            f"Last Week {self._rebate_amount(summary.rebates.get('last_week'))}"
+        )
 
     def _timestamped_log(self, message: str) -> str:
         now = datetime.now(timezone.utc)
@@ -438,10 +795,27 @@ class TelegramMonitor:
                 return f"{SYMBOL_SHORT.get(left, left)}→{SYMBOL_SHORT.get(right, right)}"
         return strategy_label
 
+    def _short_pair_ascii(self, pair_key: str) -> str:
+        sell_symbol, buy_symbol = pair_key.split("->", 1)
+        return f"{SYMBOL_SHORT.get(sell_symbol, sell_symbol)}->{SYMBOL_SHORT.get(buy_symbol, buy_symbol)}"
+
+    def _strategy_ascii(self, strategy_label: str) -> str:
+        upper = strategy_label.upper()
+        if "CC -> USDCX -> CBTC" in upper:
+            return "CC->U->B"
+        for left, right in (
+            ("CC", "USDCX"),
+            ("CC", "CBTC"),
+        ):
+            token = f"{left} -> {right}"
+            if token in upper:
+                return f"{SYMBOL_SHORT.get(left, left)}->{SYMBOL_SHORT.get(right, right)}"
+        return self._terminalize_text(strategy_label)
+
     def _to_decimal_like(self, value: str | None) -> Decimal | None:
         if value in {None, ""}:
             return None
-        cleaned = re.sub(r"[^0-9.\-]+", "", value)
+        cleaned = re.sub(r"[^0-9eE+.\-]+", "", value)
         if cleaned in {"", "-", ".", "-."}:
             return None
         try:
@@ -451,6 +825,68 @@ class TelegramMonitor:
 
     def _metric_value(self, value: str | None) -> str:
         return value if value not in {None, ""} else "-"
+
+    def _metric_decimal(self, value: str | None, *, places: int = 3) -> str:
+        decimal_value = self._to_decimal_like(value)
+        if decimal_value is None:
+            return self._metric_value(value)
+        return self._format_decimal_value(decimal_value, places=places)
+
+    def _format_decimal_value(self, value: Decimal, *, places: int = 3) -> str:
+        quantizer = Decimal("1").scaleb(-places)
+        rendered = format(value.quantize(quantizer), ",f")
+        if "." in rendered:
+            rendered = rendered.rstrip("0").rstrip(".")
+        return rendered
+
+    def _rebate_amount(self, value: str | None) -> str:
+        if value in {None, ""}:
+            return "-"
+        match = re.search(r"(-?[0-9][0-9,]*\.?[0-9]*)\s*CC", value, re.IGNORECASE)
+        if match:
+            decimal_value = self._to_decimal_like(match.group(1))
+            if decimal_value is None:
+                return f"{match.group(1)} CC"
+            return f"{self._format_decimal_value(decimal_value, places=4)} CC"
+        decimal_value = self._to_decimal_like(value)
+        if decimal_value is not None:
+            return f"{self._format_decimal_value(decimal_value, places=4)} CC"
+        return value
+
+    def _rebates_summary(self, summary: ActivitySummary | None) -> str:
+        if summary is None:
+            return "Y- TW- LW-"
+        return (
+            f"Y{self._rebate_amount(summary.rebates.get('yesterday'))} "
+            f"TW{self._rebate_amount(summary.rebates.get('this_week'))} "
+            f"LW{self._rebate_amount(summary.rebates.get('last_week'))}"
+        )
+
+    def _rebates_summary_compact(self, summary: ActivitySummary | None) -> str:
+        if summary is None:
+            return "Y- TW- LW-"
+        return (
+            f"Y{self._rebate_amount_compact(summary.rebates.get('yesterday'))} "
+            f"TW{self._rebate_amount_compact(summary.rebates.get('this_week'))} "
+            f"LW{self._rebate_amount_compact(summary.rebates.get('last_week'))}"
+        )
+
+    def _rebate_amount_compact(self, value: str | None) -> str:
+        rendered = self._rebate_amount(value)
+        if rendered == "-":
+            return rendered
+        return rendered.removesuffix(" CC")
+
+    def _dashboard_gas(self, values: dict[str, Decimal]) -> str:
+        rendered = self._format_amount_map(values)
+        if rendered == "-":
+            return rendered
+        return (
+            rendered.replace("CC ", "")
+            .replace("U ", "U")
+            .replace("B ", "B")
+            .replace(", ", " ")
+        )
 
     def _display_phase(self, phase: str) -> str:
         mapping = {

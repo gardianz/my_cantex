@@ -39,6 +39,8 @@ class InterruptController:
 
     def _confirm_stop_blocking(self) -> None:
         try:
+            if self.bot is not None:
+                self.bot.monitor.set_terminal_dashboard_paused(True)
             print("\nberhenti? (y/n) ", end="", flush=True)
             answer = input().strip().lower()
             if answer == "y" and self.bot is not None and self.loop is not None and not self.loop.is_closed():
@@ -48,6 +50,8 @@ class InterruptController:
         except (EOFError, KeyboardInterrupt):
             return
         finally:
+            if self.bot is not None:
+                self.bot.monitor.set_terminal_dashboard_paused(False)
             with self._prompt_lock:
                 self._prompt_active = False
 
@@ -69,6 +73,7 @@ async def _run(config_path: str, interrupt_controller: InterruptController) -> i
     configure_logging(
         config.runtime.log_level,
         use_utc=config.runtime.full_24h_mode,
+        terminal_dashboard_enabled=config.runtime.terminal_dashboard_enabled,
     )
     bot = AutoswapBot(config, repo_root=repo_root)
     interrupt_controller.attach_bot(bot)

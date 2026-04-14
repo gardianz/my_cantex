@@ -14,6 +14,7 @@ Fitur utama:
 - `1 swap sukses = 1 round selesai`
 - Mode 24 jam berbasis UTC
 - Monitor Telegram berbentuk kartu
+- Dashboard terminal live berbentuk tabel per account
 - Best-effort fetch activity user dari endpoint web Cantex
 - Konfirmasi swap via WebSocket (`swap_and_confirm`) dari SDK 4.0
 
@@ -127,6 +128,9 @@ full_24h_mode = true
 full_24h_startup_mode = "planned"
 full_24h_auto_restart = true
 telegram_enabled = false
+terminal_dashboard_enabled = true
+terminal_dashboard_logs_limit = 20
+terminal_dashboard_min_interval_seconds = 0.25
 default_continue_on_low_balance = true
 max_retries = 3
 retry_base_delay = 5.0
@@ -218,6 +222,16 @@ auto_create_intent_account = true
 
 - `telegram_chat_id`
   - Disarankan diisi lewat `.env` dengan `env:TELEGRAM_CHAT_ID`
+
+- `terminal_dashboard_enabled`
+  - Jika `true` dan bot dijalankan di terminal interaktif, output console akan berubah menjadi dashboard tabel live per account
+  - Log mentah biasa disembunyikan agar tampilan tidak campur
+
+- `terminal_dashboard_logs_limit`
+  - Jumlah log terakhir yang ditampilkan di bagian bawah dashboard terminal
+
+- `terminal_dashboard_min_interval_seconds`
+  - Jeda minimum refresh dashboard terminal agar layar tidak terlalu sering redraw
 
 - `default_continue_on_low_balance`
   - Default perilaku untuk semua account jika balance kurang

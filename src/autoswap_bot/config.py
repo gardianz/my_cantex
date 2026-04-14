@@ -191,6 +191,9 @@ class RuntimeConfig:
     telegram_bot_token: str | None
     telegram_chat_id: str | None
     telegram_state_file: Path
+    terminal_dashboard_enabled: bool
+    terminal_dashboard_logs_limit: int
+    terminal_dashboard_min_interval_seconds: float
     telegram_update_min_interval_seconds: float
     telegram_latest_logs_limit: int
     activity_enabled: bool
@@ -325,6 +328,11 @@ def load_config(path: str | Path) -> BotConfig:
             else None
         ),
         telegram_state_file=(config_path.parent / ".autoswap_telegram_state.json").resolve(),
+        terminal_dashboard_enabled=bool(settings.get("terminal_dashboard_enabled", True)),
+        terminal_dashboard_logs_limit=int(settings.get("terminal_dashboard_logs_limit", 20)),
+        terminal_dashboard_min_interval_seconds=float(
+            settings.get("terminal_dashboard_min_interval_seconds", 0.25)
+        ),
         telegram_update_min_interval_seconds=float(
             settings.get("telegram_update_min_interval_seconds", 5.0)
         ),
@@ -370,6 +378,10 @@ def load_config(path: str | Path) -> BotConfig:
         raise ValueError("settings.telegram_update_min_interval_seconds tidak boleh negatif")
     if runtime.telegram_latest_logs_limit < 1:
         raise ValueError("settings.telegram_latest_logs_limit minimal 1")
+    if runtime.terminal_dashboard_logs_limit < 1:
+        raise ValueError("settings.terminal_dashboard_logs_limit minimal 1")
+    if runtime.terminal_dashboard_min_interval_seconds < 0:
+        raise ValueError("settings.terminal_dashboard_min_interval_seconds tidak boleh negatif")
     if runtime.telegram_enabled and (
         not runtime.telegram_bot_token or not runtime.telegram_chat_id
     ):
