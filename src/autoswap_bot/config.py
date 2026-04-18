@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from .constants import DEFAULT_MIN_CC_RESERVE, TRACKED_SYMBOLS, get_strategy_definition
+from .constants import DEFAULT_RESERVE_FEE, TRACKED_SYMBOLS, get_strategy_definition
 
 
 def _to_decimal(value: Any, field_name: str) -> Decimal:
@@ -137,6 +137,12 @@ def _parse_decimal_range(value: Any, field_name: str) -> DecimalRange:
     return DecimalRange(min_value=min_value, max_value=max_value)
 
 
+def _parse_optional_decimal(value: Any, field_name: str) -> Decimal | None:
+    if value in {None, ""}:
+        return None
+    return _to_decimal(value, field_name)
+
+
 def _normalize_full_24h_startup_mode(value: Any) -> str:
     mode = str(value).strip().lower()
     aliases = {
@@ -177,7 +183,6 @@ class RuntimeConfig:
     bot_state_file: Path
     execution_mode: str
     max_concurrency: int
-    min_cc_reserve: Decimal
     swap_delay_seconds_range: FloatRange
     max_network_fee_cc_per_execution: Decimal | None
     network_fee_poll_seconds_range: FloatRange
@@ -215,6 +220,8 @@ class AccountConfig:
     strategy_name: str
     rounds_range: IntRange
     amount_ranges: dict[str, DecimalRange]
+    reserve_fee: Decimal
+    reserve_kritis: Decimal | None
     allow_continue_on_low_balance: bool
     auto_create_intent_account: bool
     key_slug: str
@@ -274,10 +281,6 @@ def load_config(path: str | Path) -> BotConfig:
         bot_state_file=(config_path.parent / ".autoswap_bot_runtime_state.json").resolve(),
         execution_mode=str(settings.get("execution_mode", "sequential")).lower(),
         max_concurrency=int(settings.get("max_concurrency", 1)),
-        min_cc_reserve=_to_decimal(
-            settings.get("min_cc_reserve", str(DEFAULT_MIN_CC_RESERVE)),
-            "settings.min_cc_reserve",
-        ),
         swap_delay_seconds_range=_parse_float_range(
             settings.get("swap_delay_seconds", 2.0),
             "settings.swap_delay_seconds",
@@ -399,6 +402,23 @@ def load_config(path: str | Path) -> BotConfig:
         defaults.get("amounts", {}),
         "defaults.amounts",
     )
+    legacy_reserve_fee = _parse_optional_decimal(
+        settings.get("min_cc_reserve"),
+        "settings.min_cc_reserve",
+    )
+    default_reserve_fee = _to_decimal(
+        defaults.get(
+            "reserve_fee",
+            legacy_reserve_fee if legacy_reserve_fee is not None else str(DEFAULT_RESERVE_FEE),
+        ),
+        "defaults.reserve_fee",
+    )
+    default_reserve_kritis = _parse_optional_decimal(
+        defaults.get("reserve_kritis"),
+        "defaults.reserve_kritis",
+    )
+    if default_reserve_fee <= 0:
+        raise ValueError("defaults.reserve_fee harus > 0")
 
     accounts: list[AccountConfig] = []
     for index, raw_account in enumerate(raw.get("accounts", []), start=1):
@@ -440,6 +460,14 @@ def load_config(path: str | Path) -> BotConfig:
                 f"accounts[{index}].rounds",
             ),
             amount_ranges=account_amount_ranges,
+            reserve_fee=_to_decimal(
+                raw_account.get("reserve_fee", default_reserve_fee),
+                f"accounts[{index}].reserve_fee",
+            ),
+            reserve_kritis=_parse_optional_decimal(
+                raw_account.get("reserve_kritis", default_reserve_kritis),
+                f"accounts[{index}].reserve_kritis",
+            ),
             allow_continue_on_low_balance=bool(
                 raw_account.get(
                     "allow_continue_on_low_balance",
@@ -453,7 +481,23 @@ def load_config(path: str | Path) -> BotConfig:
             display_index=len(accounts) + 1,
             proxy_label=str(raw_account.get("proxy_label", "No proxy")),
         )
-        account.strategy()
+        strategy_definition = account.strategy()
+        if account.reserve_fee <= 0:
+            raise ValueError(f"accounts[{index}].reserve_fee harus > 0")
+        if account.reserve_kritis is not None and account.reserve_kritis < 0:
+            raise ValueError(f"accounts[{index}].reserve_kritis tidak boleh negatif")
+        if (
+            account.reserve_kritis is not None
+            and account.reserve_kritis > account.reserve_fee
+        ):
+            raise ValueError(
+                f"accounts[{index}].reserve_kritis tidak boleh lebih besar dari reserve_fee"
+            )
+        if strategy_definition.key == "strategy_4_reserve":
+            if account.reserve_kritis is None:
+                raise ValueError(
+                    f"accounts[{index}] memakai strategi 4 sehingga reserve_kritis wajib diisi"
+                )
         accounts.append(account)
 
     enabled_accounts = tuple(accounts)

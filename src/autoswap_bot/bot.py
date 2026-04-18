@@ -52,6 +52,8 @@ class ScheduledRound:
 class StrategyRuntimeState:
     primary_index: int = 0
     recycle_index: int = 0
+    recovery_index: int = 0
+    reserve_recovery_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ class StrategyAction:
     pointer_group: str | None = None
     pointer_next_index: int | None = None
     fraction: Decimal | None = None
+    cc_reserve_override: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -421,10 +424,16 @@ class AutoswapBot:
         strategy_key = account.strategy().key
         if strategy_key == "strategy_1":
             return self._strategy_1_action_candidates(account=account, balances=balances)
-        if strategy_key == "strategy_3":
-            return self._strategy_3_action_candidates(account=account, balances=balances)
-        if strategy_key == "strategy_7":
-            return self._strategy_7_action_candidates(
+        if strategy_key == "strategy_2":
+            return self._strategy_2_action_candidates(account=account, balances=balances)
+        if strategy_key == "strategy_3_cycle":
+            return self._strategy_3_action_candidates(
+                account=account,
+                balances=balances,
+                strategy_state=strategy_state,
+            )
+        if strategy_key == "strategy_4_reserve":
+            return self._strategy_4_action_candidates(
                 account=account,
                 balances=balances,
                 strategy_state=strategy_state,
@@ -438,10 +447,11 @@ class AutoswapBot:
         balances: dict[str, Decimal],
     ) -> tuple[list[StrategyAction], str]:
         candidates: list[StrategyAction] = []
+        reserve_fee = self._effective_cc_reserve(account)
         foreign_balance = self._spendable_amount(
             "CBTC",
             balances.get("CBTC", Decimal("0")),
-            self.config.runtime.min_cc_reserve,
+            reserve_fee,
         )
         if foreign_balance > dust_for_symbol("CBTC"):
             candidates.append(StrategyAction(sell_symbol="CBTC", buy_symbol="CC", amount_mode="max"))
@@ -450,7 +460,7 @@ class AutoswapBot:
         spendable_cc = self._spendable_amount(
             CC_SYMBOL,
             balances.get(CC_SYMBOL, Decimal("0")),
-            self.config.runtime.min_cc_reserve,
+            reserve_fee,
         )
         if spendable_cc >= cc_amount_range.min_value:
             candidates.append(StrategyAction(sell_symbol="CC", buy_symbol="USDCx", amount_mode="config"))
@@ -458,7 +468,7 @@ class AutoswapBot:
         strategy_balance = self._spendable_amount(
             "USDCx",
             balances.get("USDCx", Decimal("0")),
-            self.config.runtime.min_cc_reserve,
+            reserve_fee,
         )
         if strategy_balance > dust_for_symbol("USDCx"):
             candidates.append(StrategyAction(sell_symbol="USDCx", buy_symbol="CC", amount_mode="max"))
@@ -469,19 +479,21 @@ class AutoswapBot:
             balance_cc=balances.get(CC_SYMBOL, Decimal("0")),
             spendable_cc=spendable_cc,
             required_min_amount=cc_amount_range.min_value,
+            reserve_threshold=reserve_fee,
         )
 
-    def _strategy_3_action_candidates(
+    def _strategy_2_action_candidates(
         self,
         *,
         account: AccountConfig,
         balances: dict[str, Decimal],
     ) -> tuple[list[StrategyAction], str]:
         candidates: list[StrategyAction] = []
+        reserve_fee = self._effective_cc_reserve(account)
         foreign_balance = self._spendable_amount(
             "USDCx",
             balances.get("USDCx", Decimal("0")),
-            self.config.runtime.min_cc_reserve,
+            reserve_fee,
         )
         if foreign_balance > dust_for_symbol("USDCx"):
             candidates.append(StrategyAction(sell_symbol="USDCx", buy_symbol="CC", amount_mode="max"))
@@ -490,7 +502,7 @@ class AutoswapBot:
         spendable_cc = self._spendable_amount(
             CC_SYMBOL,
             balances.get(CC_SYMBOL, Decimal("0")),
-            self.config.runtime.min_cc_reserve,
+            reserve_fee,
         )
         if spendable_cc >= cc_amount_range.min_value:
             candidates.append(StrategyAction(sell_symbol="CC", buy_symbol="CBTC", amount_mode="config"))
@@ -498,31 +510,33 @@ class AutoswapBot:
         strategy_balance = self._spendable_amount(
             "CBTC",
             balances.get("CBTC", Decimal("0")),
-            self.config.runtime.min_cc_reserve,
+            reserve_fee,
         )
         if strategy_balance > dust_for_symbol("CBTC"):
             candidates.append(StrategyAction(sell_symbol="CBTC", buy_symbol="CC", amount_mode="max"))
 
         if candidates:
-            return candidates, "strategy_3 ready"
+            return candidates, "strategy_2 ready"
         return [], self._cc_source_block_reason(
             balance_cc=balances.get(CC_SYMBOL, Decimal("0")),
             spendable_cc=spendable_cc,
             required_min_amount=cc_amount_range.min_value,
+            reserve_threshold=reserve_fee,
         )
 
-    def _strategy_7_action_candidates(
+    def _strategy_3_action_candidates(
         self,
         *,
         account: AccountConfig,
         balances: dict[str, Decimal],
         strategy_state: StrategyRuntimeState,
     ) -> tuple[list[StrategyAction], str]:
+        reserve_fee = self._effective_cc_reserve(account)
         cc_amount_range = account.amount_range_for_symbol(CC_SYMBOL)
         spendable_cc = self._spendable_amount(
             CC_SYMBOL,
             balances.get(CC_SYMBOL, Decimal("0")),
-            self.config.runtime.min_cc_reserve,
+            reserve_fee,
         )
         if spendable_cc >= cc_amount_range.min_value:
             return self._build_round_robin_candidates(
@@ -532,7 +546,7 @@ class AutoswapBot:
                 ),
                 start_index=strategy_state.primary_index,
                 pointer_group="primary",
-            ), "strategy_7 spend phase"
+            ), "strategy_3 spend phase"
 
         recycle_candidates: list[StrategyAction] = []
         recycle_actions = self._build_round_robin_candidates(
@@ -549,17 +563,114 @@ class AutoswapBot:
             spendable_source = self._spendable_amount(
                 action.sell_symbol,
                 balances.get(action.sell_symbol, Decimal("0")),
-                self.config.runtime.min_cc_reserve,
+                reserve_fee,
             )
             if spendable_source <= dust_for_symbol(action.sell_symbol):
                 continue
             recycle_candidates.append(action)
         if recycle_candidates:
-            return recycle_candidates, "strategy_7 recycle phase"
+            return recycle_candidates, "strategy_3 recycle phase"
         return [], self._cc_source_block_reason(
             balance_cc=balances.get(CC_SYMBOL, Decimal("0")),
             spendable_cc=spendable_cc,
             required_min_amount=cc_amount_range.min_value,
+            reserve_threshold=reserve_fee,
+        )
+
+    def _strategy_4_action_candidates(
+        self,
+        *,
+        account: AccountConfig,
+        balances: dict[str, Decimal],
+        strategy_state: StrategyRuntimeState,
+    ) -> tuple[list[StrategyAction], str]:
+        reserve_fee = self._strategy_4_reserve_fee(account)
+        reserve_kritis = self._strategy_4_reserve_kritis(account)
+        cc_balance = balances.get(CC_SYMBOL, Decimal("0"))
+
+        foreign_available = {
+            symbol: self._spendable_amount(
+                symbol,
+                balances.get(symbol, Decimal("0")),
+                reserve_fee,
+            )
+            for symbol in ("USDCx", "CBTC")
+        }
+        has_foreign_balance = any(
+            amount > dust_for_symbol(symbol)
+            for symbol, amount in foreign_available.items()
+        )
+
+        if strategy_state.reserve_recovery_active and not has_foreign_balance:
+            strategy_state.reserve_recovery_active = False
+
+        if has_foreign_balance and (
+            strategy_state.reserve_recovery_active or cc_balance <= reserve_kritis
+        ):
+            strategy_state.reserve_recovery_active = True
+            recovery_candidates: list[StrategyAction] = []
+            recovery_actions = self._build_round_robin_candidates(
+                (
+                    ("USDCx", "CC", "max", None),
+                    ("CBTC", "CC", "max", None),
+                ),
+                start_index=strategy_state.recovery_index,
+                pointer_group="recovery",
+            )
+            for action in recovery_actions:
+                spendable_source = self._spendable_amount(
+                    action.sell_symbol,
+                    balances.get(action.sell_symbol, Decimal("0")),
+                    reserve_fee,
+                )
+                if spendable_source <= dust_for_symbol(action.sell_symbol):
+                    continue
+                recovery_candidates.append(action)
+            if recovery_candidates:
+                return recovery_candidates, "strategy_4 recovery phase"
+            return [], "strategy_4 recovery waiting foreign balance"
+
+        recycle_candidates: list[StrategyAction] = []
+        recycle_actions = self._build_round_robin_candidates(
+            (
+                ("USDCx", "CBTC", "max", None),
+                ("CBTC", "USDCx", "max", None),
+            ),
+            start_index=strategy_state.recycle_index,
+            pointer_group="recycle",
+        )
+        for action in recycle_actions:
+            spendable_source = self._spendable_amount(
+                action.sell_symbol,
+                balances.get(action.sell_symbol, Decimal("0")),
+                reserve_fee,
+            )
+            if spendable_source <= dust_for_symbol(action.sell_symbol):
+                continue
+            recycle_candidates.append(action)
+        if recycle_candidates:
+            return recycle_candidates, "strategy_4 recycle phase"
+
+        spendable_cc = self._spendable_amount(
+            CC_SYMBOL,
+            cc_balance,
+            reserve_fee,
+        )
+        if spendable_cc > dust_for_symbol(CC_SYMBOL):
+            return [
+                StrategyAction(
+                    sell_symbol="CC",
+                    buy_symbol="USDCx",
+                    amount_mode="max",
+                    cc_reserve_override=reserve_fee,
+                )
+            ], "strategy_4 spend phase"
+
+        return [], self._cc_source_block_reason(
+            balance_cc=cc_balance,
+            spendable_cc=spendable_cc,
+            required_min_amount=Decimal("0"),
+            reserve_threshold=reserve_fee,
         )
 
     async def _resolve_strategy_action_amount(
@@ -570,10 +681,11 @@ class AutoswapBot:
         balances: dict[str, Decimal],
         router: RouteOptimizer,
     ) -> tuple[Decimal | None, Decimal | None, str | None]:
+        cc_reserve = self._effective_cc_reserve(account, action.cc_reserve_override)
         available_amount = self._spendable_amount(
             action.sell_symbol,
             balances.get(action.sell_symbol, Decimal("0")),
-            self.config.runtime.min_cc_reserve,
+            cc_reserve,
         )
         if available_amount <= dust_for_symbol(action.sell_symbol):
             return None, None, f"{action.sell_symbol} balance terlalu kecil"
@@ -587,6 +699,7 @@ class AutoswapBot:
                         balance_cc=balances.get(CC_SYMBOL, Decimal("0")),
                         spendable_cc=available_amount,
                         required_min_amount=amount_range.min_value,
+                        reserve_threshold=cc_reserve,
                     )
                     if action.sell_symbol == CC_SYMBOL
                     else f"{action.sell_symbol} balance below user config min ({available_amount} < {amount_range.min_value})"
@@ -638,6 +751,8 @@ class AutoswapBot:
             strategy_state.primary_index = action.pointer_next_index
         if action.pointer_group == "recycle" and action.pointer_next_index is not None:
             strategy_state.recycle_index = action.pointer_next_index
+        if action.pointer_group == "recovery" and action.pointer_next_index is not None:
+            strategy_state.recovery_index = action.pointer_next_index
 
     async def _execute_round(
         self,
@@ -711,7 +826,7 @@ class AutoswapBot:
             available_amount = self._spendable_amount(
                 sell_symbol,
                 balances.get(sell_symbol, Decimal("0")),
-                self.config.runtime.min_cc_reserve,
+                self._effective_cc_reserve(account),
             )
             max_allowed_amount = min(available_amount, amount_range.max_value)
             if max_allowed_amount < amount_range.min_value or max_allowed_amount <= dust_for_symbol(sell_symbol):
@@ -720,6 +835,7 @@ class AutoswapBot:
                         sdk=sdk,
                         router=router,
                         required_amount=amount_range.min_value,
+                        cc_reserve=self._effective_cc_reserve(account),
                         logger=logger,
                         monitor_card=monitor_card,
                         used_network_fee=used_network_fee,
@@ -729,7 +845,7 @@ class AutoswapBot:
                     available_amount = self._spendable_amount(
                         sell_symbol,
                         balances.get(sell_symbol, Decimal("0")),
-                        self.config.runtime.min_cc_reserve,
+                        self._effective_cc_reserve(account),
                     )
                     max_allowed_amount = min(available_amount, amount_range.max_value)
                     if not refill_satisfied and max_allowed_amount < amount_range.min_value:
@@ -817,6 +933,7 @@ class AutoswapBot:
                 buy_symbol=buy_symbol,
                 proposed_amount=actual_amount,
                 round_number=round_number,
+                cc_reserve=self._effective_cc_reserve(account),
             )
             if issue is not None:
                 if sell_symbol == CC_SYMBOL and issue.sell_symbol == CC_SYMBOL:
@@ -824,6 +941,7 @@ class AutoswapBot:
                         sdk=sdk,
                         router=router,
                         required_amount=amount_range.min_value,
+                        cc_reserve=self._effective_cc_reserve(account),
                         logger=logger,
                         monitor_card=monitor_card,
                         used_network_fee=used_network_fee,
@@ -841,10 +959,11 @@ class AutoswapBot:
                                 self._spendable_amount(
                                     sell_symbol,
                                     balances.get(sell_symbol, Decimal("0")),
-                                    self.config.runtime.min_cc_reserve,
+                                    self._effective_cc_reserve(account),
                                 ),
                             ),
                             round_number=round_number,
+                            cc_reserve=self._effective_cc_reserve(account),
                         )
                 if issue is not None:
                     logger.info(
@@ -915,6 +1034,7 @@ class AutoswapBot:
                 buy_symbol=buy_symbol,
                 actual_amount=actual_amount,
                 round_number=round_number,
+                cc_reserve=self._effective_cc_reserve(account, selected_action.cc_reserve_override),
                 fee_retry_deadline_utc=fee_retry_deadline_utc,
                 logger=logger,
                 monitor_card=monitor_card,
@@ -1004,6 +1124,7 @@ class AutoswapBot:
             pair_key=self._monitor_pair_key(pair_key),
             round_number=round_number,
             phase="PROCESSING",
+            route_plan=route,
         )
         logger.info(
             "Putaran %s | %s -> %s | nominal=%s | route=%s | fee est=%s | network fee est=%s",
@@ -1193,6 +1314,7 @@ class AutoswapBot:
                     buy_symbol=buy_symbol,
                     proposed_amount=actual_amount,
                     round_number=round_number,
+                    cc_reserve=self._effective_cc_reserve(account, action.cc_reserve_override),
                 )
                 if issue is not None:
                     last_invalid_reason = issue.reason
@@ -1283,6 +1405,7 @@ class AutoswapBot:
                 buy_symbol=buy_symbol,
                 actual_amount=actual_amount,
                 round_number=round_number,
+                cc_reserve=self._effective_cc_reserve(account, selected_action.cc_reserve_override),
                 fee_retry_deadline_utc=fee_retry_deadline_utc,
                 logger=logger,
                 monitor_card=monitor_card,
@@ -1353,6 +1476,7 @@ class AutoswapBot:
             pair_key=self._monitor_pair_key(pair_key),
             round_number=round_number,
             phase="PROCESSING",
+            route_plan=route,
         )
         logger.info(
             "Putaran %s | %s -> %s | nominal=%s | route=%s | fee est=%s | network fee est=%s",
@@ -1403,6 +1527,7 @@ class AutoswapBot:
                     monitor_card,
                     used=updated_free_fee_status.used,
                     limit=3,
+                    network_fee_credit={hop.network_fee_symbol: hop.network_fee_amount},
                     force=True,
                 )
                 logger.info(
@@ -1495,6 +1620,7 @@ class AutoswapBot:
         router: RouteOptimizer,
         target_symbol: str,
         required_amount: Decimal,
+        cc_reserve: Decimal,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         used_network_fee: defaultdict[str, Decimal],
@@ -1507,7 +1633,7 @@ class AutoswapBot:
             spendable = self._spendable_amount(
                 target_symbol,
                 last_balances.get(target_symbol, Decimal("0")),
-                self.config.runtime.min_cc_reserve,
+                cc_reserve,
             )
             if spendable >= required_amount:
                 return total_tx, last_balances, True
@@ -1516,6 +1642,7 @@ class AutoswapBot:
                 sdk=sdk,
                 router=router,
                 target_symbol=target_symbol,
+                cc_reserve=cc_reserve,
                 logger=logger,
                 monitor_card=monitor_card,
                 used_network_fee=used_network_fee,
@@ -1530,6 +1657,7 @@ class AutoswapBot:
                 target_symbol=target_symbol,
                 previous_balances=last_balances,
                 required_amount=required_amount,
+                cc_reserve=cc_reserve,
                 logger=logger,
                 monitor_card=monitor_card,
             )
@@ -1544,6 +1672,7 @@ class AutoswapBot:
         target_symbol: str,
         previous_balances: dict[str, Decimal],
         required_amount: Decimal,
+        cc_reserve: Decimal,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
     ) -> dict[str, Decimal]:
@@ -1559,7 +1688,7 @@ class AutoswapBot:
             spendable = self._spendable_amount(
                 target_symbol,
                 current_amount,
-                self.config.runtime.min_cc_reserve,
+                cc_reserve,
             )
             if current_amount > previous_amount or spendable >= required_amount:
                 return balances
@@ -1586,9 +1715,11 @@ class AutoswapBot:
         balance_cc: Decimal,
         spendable_cc: Decimal,
         required_min_amount: Decimal,
+        reserve_threshold: Decimal | None = None,
     ) -> str:
-        if balance_cc <= self.config.runtime.min_cc_reserve or spendable_cc <= dust_for_symbol(CC_SYMBOL):
-            return f"CC reserve reached ({balance_cc} <= {self.config.runtime.min_cc_reserve})"
+        effective_reserve = reserve_threshold if reserve_threshold is not None else Decimal("0")
+        if balance_cc <= effective_reserve or spendable_cc <= dust_for_symbol(CC_SYMBOL):
+            return f"CC reserve reached ({balance_cc} <= {effective_reserve})"
         return f"CC spendable below user config min ({spendable_cc} < {required_min_amount})"
 
     async def _refill_cc_for_source_step(
@@ -1597,6 +1728,7 @@ class AutoswapBot:
         sdk: ExtendedCantexSDK,
         router: RouteOptimizer,
         required_amount: Decimal,
+        cc_reserve: Decimal,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         used_network_fee: defaultdict[str, Decimal],
@@ -1615,6 +1747,7 @@ class AutoswapBot:
             router=router,
             target_symbol=CC_SYMBOL,
             required_amount=required_amount,
+            cc_reserve=cc_reserve,
             logger=logger,
             monitor_card=monitor_card,
             used_network_fee=used_network_fee,
@@ -1834,6 +1967,7 @@ class AutoswapBot:
         buy_symbol: str,
         actual_amount: Decimal,
         round_number: int,
+        cc_reserve: Decimal,
         fee_retry_deadline_utc: datetime | None,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
@@ -1845,10 +1979,19 @@ class AutoswapBot:
             return current_route, None, None
 
         route = current_route
-        while route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0")) > fee_cap:
+        while True:
             self._raise_if_stop_requested()
-            current_fee = route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0"))
-            if account_name is not None and self._startup_mode_uses_free_swap():
+            violating_hop = self._first_network_fee_cap_violation(
+                route,
+                fee_cap=fee_cap,
+            )
+            bypassed_free_fee_status: DailyFreeFeeStatus | None = None
+            if (
+                violating_hop is not None
+                and violating_hop[0] == 1
+                and account_name is not None
+                and self._startup_mode_uses_free_swap()
+            ):
                 daily_free_fee_status = await self._sync_daily_free_fee_state_from_history(
                     sdk=sdk,
                     account_name=account_name,
@@ -1856,7 +1999,56 @@ class AutoswapBot:
                     monitor_card=monitor_card,
                 )
                 if daily_free_fee_status.window_open and daily_free_fee_status.remaining > 0:
-                    free_swap_number = daily_free_fee_status.used + 1
+                    bypass_candidate = self._first_network_fee_cap_violation(
+                        route,
+                        fee_cap=fee_cap,
+                        allow_first_hop_free=True,
+                    )
+                    if bypass_candidate is None:
+                        bypassed_free_fee_status = daily_free_fee_status
+
+            if violating_hop is None:
+                return route, None, None
+
+            if bypassed_free_fee_status is not None:
+                free_swap_number = bypassed_free_fee_status.used + 1
+                first_hop = route.hops[0]
+                logger.info(
+                    "Round %s memakai free fee swap harian %s/3 | hop 1 %s -> %s | fee=%s CC | batas=%s CC",
+                    round_number,
+                    free_swap_number,
+                    first_hop.sell_symbol,
+                    first_hop.buy_symbol,
+                    first_hop.network_fee_amount,
+                    fee_cap,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    (
+                        f"🎁 Free fee swap {free_swap_number}/3 active for "
+                        f"{first_hop.sell_symbol}->{first_hop.buy_symbol}, fee cap bypassed "
+                        f"({first_hop.network_fee_amount} CC)"
+                    ),
+                    force=True,
+                )
+                return route, None, bypassed_free_fee_status
+
+            violating_hop_index, violating_hop_data = violating_hop
+            current_fee = violating_hop_data.network_fee_amount
+            account_name = None
+            if False:
+                daily_free_fee_status = await self._sync_daily_free_fee_state_from_history(
+                    sdk=sdk,
+                    account_name=account_name,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                )
+                if daily_free_fee_status.window_open and daily_free_fee_status.remaining > 0:
+                    bypass_candidate = self._first_network_fee_cap_violation(
+                        route,
+                        fee_cap=fee_cap,
+                        allow_first_hop_free=True,
+                    )
                     logger.info(
                         "Round %s memakai free fee swap harian %s/3 | fee=%s CC | batas=%s CC",
                         round_number,
@@ -1902,22 +2094,33 @@ class AutoswapBot:
                 wait_seconds = min(wait_seconds, max(1.0, seconds_left))
 
             logger.warning(
-                "Round %s menunggu network fee turun | fee=%s CC | batas=%s CC",
+                "Round %s menunggu network fee turun | hop=%s/%s | %s -> %s | fee=%s CC | batas=%s CC",
                 round_number,
+                violating_hop_index,
+                len(route.hops),
+                violating_hop_data.sell_symbol,
+                violating_hop_data.buy_symbol,
                 current_fee,
                 fee_cap,
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"⏳ Network fee {current_fee} CC > limit {fee_cap} CC, waiting {int(wait_seconds)}s",
+                (
+                    f"⏳ Network fee hop {violating_hop_index}/{len(route.hops)} "
+                    f"{violating_hop_data.sell_symbol}->{violating_hop_data.buy_symbol} "
+                    f"{current_fee} CC > limit {fee_cap} CC, waiting {int(wait_seconds)}s"
+                ),
             )
             await self.monitor.update_status(
                 monitor_card,
                 round_number=round_number,
                 phase="WAITING_FEE",
                 next_wait_seconds=wait_seconds,
+                route_plan=route,
             )
             await self._sleep_or_stop(wait_seconds)
+            info = await sdk.get_account_info()
+            balances = self._balances_by_symbol(info)
             try:
                 route, issue = await self._prepare_affordable_route(
                     router=router,
@@ -1926,6 +2129,7 @@ class AutoswapBot:
                     buy_symbol=buy_symbol,
                     proposed_amount=actual_amount,
                     round_number=round_number,
+                    cc_reserve=cc_reserve,
                 )
             except RuntimeError as exc:
                 if not self._is_retryable_route_error(exc):
@@ -1946,6 +2150,22 @@ class AutoswapBot:
             if issue is not None:
                 return route, issue, None
         return route, None, None
+
+    def _first_network_fee_cap_violation(
+        self,
+        route: RoutePlan,
+        *,
+        fee_cap: Decimal,
+        allow_first_hop_free: bool = False,
+    ) -> tuple[int, RouteHop] | None:
+        for hop_index, hop in enumerate(route.hops, start=1):
+            if hop.network_fee_symbol != CC_SYMBOL:
+                continue
+            if allow_first_hop_free and hop_index == 1:
+                continue
+            if hop.network_fee_amount > fee_cap:
+                return hop_index, hop
+        return None
 
     async def _acquire_free_fee_sequence_slot(
         self,
@@ -2021,6 +2241,7 @@ class AutoswapBot:
         recovery_amount: Decimal,
         initial_route: RoutePlan,
         initial_issue: PlanIssue | None,
+        cc_reserve: Decimal,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
     ) -> tuple[RoutePlan, PlanIssue | None]:
@@ -2039,6 +2260,7 @@ class AutoswapBot:
                     buy_symbol=target_symbol,
                     actual_amount=route.hops[0].sell_amount if route.hops else recovery_amount,
                     round_number=0,
+                    cc_reserve=cc_reserve,
                     fee_retry_deadline_utc=None,
                     logger=logger,
                     monitor_card=monitor_card,
@@ -2068,13 +2290,22 @@ class AutoswapBot:
                 waiting_logged = True
 
             poll_seconds = self._sample_network_fee_poll_seconds()
-            if (
-                self.config.runtime.max_network_fee_cc_per_execution is not None
-                and current_fee > self.config.runtime.max_network_fee_cc_per_execution
-            ):
+            fee_cap = self.config.runtime.max_network_fee_cc_per_execution
+            violating_hop = (
+                self._first_network_fee_cap_violation(route, fee_cap=fee_cap)
+                if fee_cap is not None
+                else None
+            )
+            if violating_hop is not None:
+                violating_hop_index, violating_hop_data = violating_hop
                 await self.monitor.log_event(
                     monitor_card,
-                    f"⏳ Network fee {current_fee} CC > limit {self.config.runtime.max_network_fee_cc_per_execution} CC, waiting {int(poll_seconds)}s",
+                    (
+                        f"⏳ Network fee hop {violating_hop_index}/{len(route.hops)} "
+                        f"{violating_hop_data.sell_symbol}->{violating_hop_data.buy_symbol} "
+                        f"{violating_hop_data.network_fee_amount} CC > limit {fee_cap} CC, "
+                        f"waiting {int(poll_seconds)}s"
+                    ),
                 )
 
             await self._sleep_or_stop(poll_seconds)
@@ -2083,7 +2314,7 @@ class AutoswapBot:
             available_amount = self._spendable_amount(
                 source_symbol,
                 balances.get(source_symbol, Decimal("0")),
-                self.config.runtime.min_cc_reserve,
+                cc_reserve,
             )
             if available_amount <= dust_for_symbol(source_symbol):
                 return route, PlanIssue(
@@ -2102,6 +2333,7 @@ class AutoswapBot:
                     buy_symbol=target_symbol,
                     proposed_amount=recovery_amount,
                     round_number=0,
+                    cc_reserve=cc_reserve,
                 )
             except RuntimeError as exc:
                 if not self._is_retryable_route_error(exc):
@@ -2150,6 +2382,7 @@ class AutoswapBot:
         sdk: ExtendedCantexSDK,
         router: RouteOptimizer,
         target_symbol: str,
+        cc_reserve: Decimal,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         used_network_fee: defaultdict[str, Decimal],
@@ -2162,7 +2395,7 @@ class AutoswapBot:
             available_amount = self._spendable_amount(
                 source_symbol,
                 balances.get(source_symbol, Decimal("0")),
-                self.config.runtime.min_cc_reserve,
+                cc_reserve,
             )
             if available_amount <= dust_for_symbol(source_symbol):
                 continue
@@ -2197,6 +2430,7 @@ class AutoswapBot:
                         buy_symbol=target_symbol,
                         proposed_amount=recovery_amount,
                         round_number=0,
+                        cc_reserve=cc_reserve,
                     )
                     break
                 except RuntimeError as exc:
@@ -2219,7 +2453,7 @@ class AutoswapBot:
                     available_amount = self._spendable_amount(
                         source_symbol,
                         balances.get(source_symbol, Decimal("0")),
-                        self.config.runtime.min_cc_reserve,
+                        cc_reserve,
                     )
                     if available_amount <= dust_for_symbol(source_symbol):
                         route = None
@@ -2255,6 +2489,7 @@ class AutoswapBot:
                 recovery_amount=recovery_amount,
                 initial_route=route,
                 initial_issue=issue,
+                cc_reserve=cc_reserve,
                 logger=logger,
                 monitor_card=monitor_card,
             )
@@ -2374,6 +2609,7 @@ class AutoswapBot:
                         phase="WAITING",
                         next_scheduled_utc=daily_free_fee_status.window_opens_at_utc,
                         next_wait_seconds=wait_seconds,
+                        clear_route=True,
                     )
                     await self.monitor.log_event(
                         monitor_card,
@@ -2479,6 +2715,7 @@ class AutoswapBot:
                     phase="WAITING",
                     next_scheduled_utc=scheduled_round.execute_at_utc,
                     next_wait_seconds=wait_seconds,
+                    clear_route=True,
                 )
                 await self.monitor.log_event(
                     monitor_card,
@@ -2619,6 +2856,7 @@ class AutoswapBot:
             phase="WAITING_NEXT_DAY",
             next_scheduled_utc=next_midnight_utc,
             next_wait_seconds=wait_seconds,
+            clear_route=True,
         )
         await self.monitor.log_event(
             monitor_card,
@@ -2646,6 +2884,7 @@ class AutoswapBot:
             round_number=next_round_number,
             phase="WAITING",
             next_wait_seconds=wait_seconds,
+            clear_route=True,
         )
         await self.monitor.log_event(
             monitor_card,
@@ -2672,6 +2911,7 @@ class AutoswapBot:
             round_number=next_round_number,
             phase="WAITING",
             next_wait_seconds=wait_seconds,
+            clear_route=True,
         )
         await self.monitor.log_event(
             monitor_card,
@@ -2935,12 +3175,14 @@ class AutoswapBot:
         buy_symbol: str,
         proposed_amount: Decimal,
         round_number: int,
+        cc_reserve: Decimal,
     ) -> tuple[RoutePlan, PlanIssue | None]:
+        effective_cc_reserve = cc_reserve
         route = await router.choose_best_route(sell_symbol, buy_symbol, proposed_amount)
         issue = self._check_route_affordability(
             balances=balances,
             route=route,
-            min_cc_reserve=self.config.runtime.min_cc_reserve,
+            cc_reserve=effective_cc_reserve,
             round_number=round_number,
         )
         if issue is None:
@@ -2953,7 +3195,7 @@ class AutoswapBot:
                 self._spendable_amount(
                     CC_SYMBOL,
                     balances.get(CC_SYMBOL, Decimal("0")),
-                    self.config.runtime.min_cc_reserve,
+                    effective_cc_reserve,
                 )
                 - fee_buffer,
             )
@@ -2962,7 +3204,7 @@ class AutoswapBot:
                 issue = self._check_route_affordability(
                     balances=balances,
                     route=route,
-                    min_cc_reserve=self.config.runtime.min_cc_reserve,
+                    cc_reserve=effective_cc_reserve,
                     round_number=round_number,
                 )
         return route, issue
@@ -2972,7 +3214,7 @@ class AutoswapBot:
         *,
         balances: dict[str, Decimal],
         route: RoutePlan,
-        min_cc_reserve: Decimal,
+        cc_reserve: Decimal,
         round_number: int,
     ) -> PlanIssue | None:
         simulated = deepcopy(balances)
@@ -2982,7 +3224,7 @@ class AutoswapBot:
                 sell_symbol=hop.sell_symbol,
                 buy_symbol=hop.buy_symbol,
                 balance=current_sell,
-                min_cc_reserve=min_cc_reserve,
+                cc_reserve=cc_reserve,
             )
             combined_spend = hop.sell_amount
             if hop.sell_symbol == hop.network_fee_symbol:
@@ -3355,11 +3597,28 @@ class AutoswapBot:
         self,
         symbol: str,
         balance: Decimal,
-        min_cc_reserve: Decimal,
+        cc_reserve: Decimal,
     ) -> Decimal:
         if symbol == CC_SYMBOL:
-            return max(Decimal("0"), balance - min_cc_reserve)
+            return max(Decimal("0"), balance - cc_reserve)
         return max(Decimal("0"), balance)
+
+    def _effective_cc_reserve(
+        self,
+        account: AccountConfig,
+        reserve_override: Decimal | None = None,
+    ) -> Decimal:
+        if reserve_override is None:
+            return account.reserve_fee
+        return max(account.reserve_fee, reserve_override)
+
+    def _strategy_4_reserve_fee(self, account: AccountConfig) -> Decimal:
+        return account.reserve_fee
+
+    def _strategy_4_reserve_kritis(self, account: AccountConfig) -> Decimal:
+        if account.reserve_kritis is None:
+            raise RuntimeError("Strategi 4 membutuhkan reserve_kritis")
+        return account.reserve_kritis
 
     def _source_spendable_amount(
         self,
@@ -3367,10 +3626,10 @@ class AutoswapBot:
         sell_symbol: str,
         buy_symbol: str,
         balance: Decimal,
-        min_cc_reserve: Decimal,
+        cc_reserve: Decimal,
     ) -> Decimal:
         if sell_symbol == CC_SYMBOL and buy_symbol != CC_SYMBOL:
-            return self._spendable_amount(sell_symbol, balance, min_cc_reserve)
+            return self._spendable_amount(sell_symbol, balance, cc_reserve)
         return max(Decimal("0"), balance)
 
     def _fee_spendable_amount(

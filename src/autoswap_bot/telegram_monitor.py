@@ -16,7 +16,7 @@ from pathlib import Path
 import aiohttp
 
 from .config import AccountConfig, PreparedAccountRun, RuntimeConfig
-from .models import ActivitySummary
+from .models import ActivitySummary, RoutePlan
 
 
 SYMBOL_SHORT = {
@@ -45,6 +45,7 @@ class TelegramCardState:
     day_session_ok_tx_offset: int = 0
     day_session_fail_tx_offset: int = 0
     day_session_network_fee_offset: dict[str, Decimal] = field(default_factory=dict)
+    day_session_free_network_fee_offset: dict[str, Decimal] = field(default_factory=dict)
     lifetime_swap_base: int = 0
     lifetime_ok_tx_base: int = 0
     lifetime_fail_tx_base: int = 0
@@ -55,6 +56,10 @@ class TelegramCardState:
     balances: dict[str, Decimal] = field(default_factory=dict)
     total_network_fee: dict[str, Decimal] = field(default_factory=dict)
     total_swap_fee: dict[str, Decimal] = field(default_factory=dict)
+    free_network_fee_credit: dict[str, Decimal] = field(default_factory=dict)
+    current_route_label: str | None = None
+    current_route_network_fee: dict[str, Decimal] = field(default_factory=dict)
+    current_route_swap_fee: dict[str, Decimal] = field(default_factory=dict)
     daily_free_fee_used: int = 0
     daily_free_fee_limit: int = 3
     swap_transactions: int = 0
@@ -201,6 +206,8 @@ class TelegramMonitor:
         phase: str | None = None,
         next_scheduled_utc: datetime | None = None,
         next_wait_seconds: float | None = None,
+        route_plan: RoutePlan | None = None,
+        clear_route: bool = False,
         force: bool = False,
     ) -> None:
         if card is None:
@@ -214,6 +221,12 @@ class TelegramMonitor:
             card.phase = phase
         card.next_scheduled_utc = next_scheduled_utc
         card.next_wait_seconds = next_wait_seconds
+        if clear_route:
+            self._clear_route_preview(card)
+        elif route_plan is not None:
+            self._set_route_preview(card, route_plan)
+        elif phase in {"WAITING", "WAITING_NEXT_DAY", "FINISHED"}:
+            self._clear_route_preview(card)
         await self._refresh_outputs(card, force=force)
 
     async def update_balances(
@@ -251,6 +264,7 @@ class TelegramMonitor:
         *,
         used: int,
         limit: int,
+        network_fee_credit: dict[str, Decimal] | None = None,
         force: bool = False,
     ) -> None:
         if card is None:
@@ -258,6 +272,11 @@ class TelegramMonitor:
         self._rollover_card_if_needed(card)
         card.daily_free_fee_used = max(int(used), 0)
         card.daily_free_fee_limit = max(int(limit), 0)
+        if network_fee_credit:
+            card.free_network_fee_credit = self._merge_amount_maps(
+                card.free_network_fee_credit,
+                network_fee_credit,
+            )
         self._persist_card_state(card)
         await self._refresh_outputs(card, force=force)
 
@@ -329,6 +348,16 @@ class TelegramMonitor:
         card.activity_summary = summary
         await self._refresh_outputs(card, force=force)
 
+    def _set_route_preview(self, card: TelegramCardState, route_plan: RoutePlan) -> None:
+        card.current_route_label = route_plan.label
+        card.current_route_network_fee = dict(route_plan.total_network_fee_by_symbol)
+        card.current_route_swap_fee = dict(route_plan.total_admin_and_liquidity_by_symbol)
+
+    def _clear_route_preview(self, card: TelegramCardState) -> None:
+        card.current_route_label = None
+        card.current_route_network_fee = {}
+        card.current_route_swap_fee = {}
+
     async def finalize(
         self,
         card: TelegramCardState | None,
@@ -342,6 +371,7 @@ class TelegramMonitor:
         card.session_finished_utc = datetime.now(timezone.utc)
         card.next_scheduled_utc = None
         card.next_wait_seconds = None
+        self._clear_route_preview(card)
         self._persist_card_state(card)
         await self._refresh_outputs(card, force=True)
 
@@ -438,71 +468,18 @@ class TelegramMonitor:
         if not cards:
             return
 
-        col_widths = (12, 9, 10, 12, 30, 69)
-        header_row = self._table_row(
-            ("Akun", "Status", "CC", "Progress", "Plan", "Metrics"),
-            col_widths,
-        )
-        metrics_header_row = self._table_row(
-            ("", "", "", "", "", self._dashboard_metrics_header()),
-            col_widths,
-        )
-        separator_row = self._table_row(
-            tuple("-" * width for width in col_widths),
-            col_widths,
-        )
+        col_widths, table_lines = self._dashboard_table_lines(cards)
+        header_row = table_lines[0]
         row_width = len(header_row) - 2
         border = "+" + ("-" * row_width) + "+"
         strong_border = "+" + ("=" * row_width) + "+"
 
-        total_round_targets = sum(card.total_rounds for card in cards)
-        total_swaps = sum(card.swap_transactions for card in cards)
-        failed_accounts = sum(1 for card in cards if card.phase.startswith("FAILED"))
-        stopped_accounts = sum(1 for card in cards if card.phase.startswith("STOPPED"))
-        active_accounts = len(cards) - failed_accounts - stopped_accounts
-        local_now = datetime.now().astimezone()
-
         lines = [
             strong_border,
-            self._padded_line(
-                (
-                    f"Cantex Autoswap Bot  |  "
-                    f"{local_now.strftime('%d/%m/%Y, %H.%M.%S %Z')}  |  "
-                    f"{len(cards)} akun  |  Mode: {self._dashboard_mode_label()}"
-                ),
-                row_width,
-            ),
-            self._padded_line(
-                (
-                    f"Swaps: {total_swaps}/{total_round_targets} total  |  "
-                    f"{active_accounts} active  {failed_accounts} fail  {stopped_accounts} stopped"
-                ),
-                row_width,
-            ),
-            self._padded_line(
-                f"State: {self._dashboard_state_label(cards)}",
-                row_width,
-            ),
+            *self._dashboard_summary_lines(cards, row_width=row_width),
             border,
-            header_row,
-            metrics_header_row,
-            separator_row,
+            *table_lines,
         ]
-
-        for card in cards:
-            lines.append(
-                self._table_row(
-                    (
-                        card.account_name,
-                        self._dashboard_status(card),
-                        self._fmt_balance(card.balances.get("CC", Decimal("0")), 4),
-                        self._dashboard_progress(card),
-                        self._dashboard_plan(card),
-                        self._dashboard_metrics(card),
-                    ),
-                    col_widths,
-                )
-            )
 
         lines.extend(
             [
@@ -530,6 +507,84 @@ class TelegramMonitor:
         sys.stdout.write(rendered + "\n")
         sys.stdout.flush()
         self._terminal_last_render_monotonic = now
+
+    def _dashboard_col_widths(self) -> tuple[int, ...]:
+        return (12, 9, 10, 12, 24, 22, 64)
+
+    def _dashboard_table_lines(self, cards: list[TelegramCardState]) -> tuple[tuple[int, ...], list[str]]:
+        col_widths = self._dashboard_col_widths()
+        lines = [
+            self._table_row(
+                ("Akun", "Status", "CC", "Progress", "Plan", "Fee Route", "Metrics"),
+                col_widths,
+            ),
+            self._table_row(
+                ("", "", "", "", "", "", self._dashboard_metrics_header()),
+                col_widths,
+            ),
+            self._table_row(
+                tuple("-" * width for width in col_widths),
+                col_widths,
+            ),
+        ]
+        for card in cards:
+            lines.append(
+                self._table_row(
+                    (
+                        card.account_name,
+                        self._dashboard_status(card),
+                        self._fmt_balance(card.balances.get("CC", Decimal("0")), 4),
+                        self._dashboard_progress(card),
+                        self._dashboard_plan(card),
+                        self._dashboard_route_fee(card),
+                        self._dashboard_metrics(card),
+                    ),
+                    col_widths,
+                )
+            )
+        return col_widths, lines
+
+    def _dashboard_summary_lines(self, cards: list[TelegramCardState], *, row_width: int) -> list[str]:
+        total_round_targets = sum(card.total_rounds for card in cards)
+        total_swaps = sum(card.swap_transactions for card in cards)
+        failed_accounts = sum(1 for card in cards if card.phase.startswith("FAILED"))
+        stopped_accounts = sum(1 for card in cards if card.phase.startswith("STOPPED"))
+        active_accounts = len(cards) - failed_accounts - stopped_accounts
+        local_now = datetime.now().astimezone()
+        yesterday_total = self._aggregate_rebate_total(cards, "yesterday")
+        this_week_total = self._aggregate_rebate_total(cards, "this_week")
+        paid_fee_total = self._aggregate_session_total_fee(cards)
+        return [
+            self._padded_line(
+                (
+                    f"Cantex Autoswap Bot | {local_now.strftime('%d/%m/%Y, %H.%M.%S %Z')} | "
+                    f"{len(cards)} akun | Mode: {self._dashboard_mode_label()}"
+                ),
+                row_width,
+            ),
+            self._padded_line(
+                (
+                    f"Swaps: {total_swaps}/{total_round_targets} total | "
+                    f"Active: {active_accounts} | Fail: {failed_accounts} | Stopped: {stopped_accounts}"
+                ),
+                row_width,
+            ),
+            self._padded_line(
+                (
+                    f"Rewards | yesterday: {self._format_cc_total(yesterday_total)} | "
+                    f"this week: {self._format_cc_total(this_week_total)}"
+                ),
+                row_width,
+            ),
+            self._padded_line(
+                f"Fee paid (run, excl free): {self._format_amount_map_display(paid_fee_total)}",
+                row_width,
+            ),
+            self._padded_line(
+                f"State: {self._dashboard_state_label(cards)}",
+                row_width,
+            ),
+        ]
 
     def _dashboard_mode_label(self) -> str:
         if self.runtime.full_24h_mode:
@@ -573,18 +628,37 @@ class TelegramMonitor:
 
     def _dashboard_plan(self, card: TelegramCardState) -> str:
         strategy = self._build_strategy_line(card).split(":", 1)[-1].strip()
-        pair = self._short_pair_ascii(card.current_pair_key) if card.current_pair_key else self._strategy_ascii(card.strategy_label)
+        route = (
+            self._route_label_ascii(card.current_route_label)
+            if card.current_route_label
+            else (
+                self._short_pair_ascii(card.current_pair_key)
+                if card.current_pair_key
+                else self._strategy_ascii(card.strategy_label)
+            )
+        )
         if card.phase == "WAITING_FEE" and card.next_wait_seconds is not None:
-            return f"S{strategy} {pair} fee {int(max(card.next_wait_seconds, 0))}s"
+            return f"S{strategy} {route} fee {int(max(card.next_wait_seconds, 0))}s"
         if card.phase == "WAITING" and card.next_wait_seconds is not None:
-            return f"S{strategy} {pair} cd {int(max(card.next_wait_seconds, 0))}s"
+            return f"S{strategy} {route} cd {int(max(card.next_wait_seconds, 0))}s"
         if card.phase == "WAITING_NEXT_DAY" and card.next_wait_seconds is not None:
             return f"S{strategy} quota done {int(max(card.next_wait_seconds, 0))}s"
         if card.phase == "PROCESSING":
-            return f"S{strategy} {pair} processing"
+            return f"S{strategy} {route} processing"
         if card.phase == "COMPLETED":
-            return f"S{strategy} {pair} completed"
-        return f"S{strategy} {pair} {self._dashboard_status(card).lower()}"
+            return f"S{strategy} {route} completed"
+        return f"S{strategy} {route} {self._dashboard_status(card).lower()}"
+
+    def _dashboard_route_fee(self, card: TelegramCardState) -> str:
+        network_fee = self._dashboard_compact_amount_map(card.current_route_network_fee)
+        swap_fee = self._dashboard_compact_amount_map(card.current_route_swap_fee)
+        if network_fee == "-" and swap_fee == "-":
+            return "-"
+        if swap_fee == "-":
+            return f"N {network_fee}"
+        if network_fee == "-":
+            return f"S {swap_fee}"
+        return f"N {network_fee} / S {swap_fee}"
 
     def _dashboard_metrics(self, card: TelegramCardState) -> str:
         summary = card.activity_summary
@@ -608,6 +682,7 @@ class TelegramMonitor:
             "t week",
             "gas fee",
             "free swap",
+            header=True,
         )
 
     def _compose_dashboard_metrics(
@@ -617,25 +692,31 @@ class TelegramMonitor:
         this_week: str,
         gas_fee: str,
         free_swap: str,
+        *,
+        header: bool = False,
     ) -> str:
+        align = "center" if header else "right"
         parts = (
-            self._truncate_terminal(activity, 17).ljust(17),
-            self._truncate_terminal(yesterday, 9).ljust(9),
-            self._truncate_terminal(this_week, 8).ljust(8),
-            self._truncate_terminal(gas_fee, 8).ljust(8),
-            self._truncate_terminal(free_swap, 9).ljust(9),
+            self._align_terminal(activity, 17, align=align),
+            self._align_terminal(yesterday, 9, align=align),
+            self._align_terminal(this_week, 8, align=align),
+            self._align_terminal(gas_fee, 9, align=align),
+            self._align_terminal(free_swap, 9, align=align),
         )
         return " | ".join(parts)
 
     def _dashboard_24h_activity(self, summary: ActivitySummary | None) -> str:
         if summary is None:
             return "-"
-        volume_24h = self._metric_decimal(summary.volume_24h)
+        volume_24h = self._metric_decimal(summary.volume_24h, places=2)
         swaps_24h = self._metric_value(summary.swaps_24h)
-        usd_24h = self._metric_decimal(summary.volume_24h_usd, places=0)
-        if usd_24h != "-":
-            return f"{volume_24h} CC (${usd_24h}) {swaps_24h} swap"
-        return f"{volume_24h} CC {swaps_24h} swap"
+        if volume_24h == "-" and swaps_24h == "-":
+            return "-"
+        if swaps_24h == "-":
+            return f"{volume_24h} CC"
+        if volume_24h == "-":
+            return f"{swaps_24h}x"
+        return f"{volume_24h} CC / {swaps_24h}x"
 
     def _table_row(self, values: tuple[str, ...], widths: tuple[int, ...]) -> str:
         padded = [
@@ -645,18 +726,32 @@ class TelegramMonitor:
         return "| " + " | ".join(padded) + " |"
 
     def _truncate_terminal(self, value: str, width: int) -> str:
-        text = self._terminalize_text(value)
+        text = self._terminalize_text(value, preserve_spacing=True)
         if len(text) <= width:
             return text
         if width <= 3:
             return text[:width]
         return text[: width - 3] + "..."
 
+    def _align_terminal(self, value: str, width: int, *, align: str) -> str:
+        text = self._truncate_terminal(value, width)
+        if align == "right":
+            return text.rjust(width)
+        if align == "center":
+            return text.center(width)
+        return text.ljust(width)
+
     def _padded_line(self, value: str, width: int) -> str:
         text = self._truncate_terminal(value, width)
         return "| " + text.ljust(width) + " |"
 
-    def _terminalize_text(self, value: str, *, preserve_case: bool = False) -> str:
+    def _terminalize_text(
+        self,
+        value: str,
+        *,
+        preserve_case: bool = False,
+        preserve_spacing: bool = False,
+    ) -> str:
         text = str(value)
         replacements = {
             "→": "->",
@@ -677,7 +772,10 @@ class TelegramMonitor:
         for source, target in replacements.items():
             text = text.replace(source, target)
         text = re.sub(r"[^\x20-\x7E]", "", text)
-        text = re.sub(r"\s+", " ", text).strip()
+        if preserve_spacing:
+            text = text.replace("\t", " ").rstrip()
+        else:
+            text = re.sub(r"\s+", " ", text).strip()
         return text if preserve_case else text
 
     async def _request(self, method: str, payload: dict) -> dict:
@@ -723,12 +821,50 @@ class TelegramMonitor:
         return "\n".join(sections)
 
     def _render_combined_card(self, cards: list[TelegramCardState]) -> str:
-        sections: list[str] = []
-        for card in cards:
-            sections.extend(self._render_combined_account_section(card))
-            sections.append("")
-        sections.append(f"<i>Edited {html.escape(datetime.now(timezone.utc).strftime('%H.%M.%S'))} UTC</i>")
+        local_now = datetime.now().astimezone()
+        total_round_targets = sum(card.total_rounds for card in cards)
+        total_swaps = sum(card.swap_transactions for card in cards)
+        failed_accounts = sum(1 for card in cards if card.phase.startswith("FAILED"))
+        stopped_accounts = sum(1 for card in cards if card.phase.startswith("STOPPED"))
+        active_accounts = len(cards) - failed_accounts - stopped_accounts
+        yesterday_total = self._aggregate_rebate_total(cards, "yesterday")
+        this_week_total = self._aggregate_rebate_total(cards, "this_week")
+        paid_fee_total = self._aggregate_session_total_fee(cards)
+        dashboard_table = self._render_combined_dashboard_table(cards)
+        recent_logs = self._render_combined_logs()
+        edited_at = datetime.now(timezone.utc).strftime("%H.%M.%S")
+
+        sections = [
+            "<b>🚀 Cantex Autoswap Bot</b>",
+            html.escape(f"🕒 {local_now.strftime('%d/%m/%Y, %H.%M.%S %Z')}"),
+            html.escape(
+                f"📦 {len(cards)} akun | Mode: {self._dashboard_mode_label()} | State: {self._dashboard_state_label(cards)}"
+            ),
+            html.escape(
+                f"🔁 Swaps: {total_swaps}/{total_round_targets} total | Active: {active_accounts} | Fail: {failed_accounts} | Stopped: {stopped_accounts}"
+            ),
+            html.escape(f"🎁 Reward yesterday total: {self._format_cc_total(yesterday_total)}"),
+            html.escape(f"🏆 Reward this week total: {self._format_cc_total(this_week_total)}"),
+            html.escape(
+                f"💸 Fee paid total (run, excl free): {self._format_amount_map_display(paid_fee_total)}"
+            ),
+            "",
+            "<b>📊 Dashboard</b>",
+            f"<pre>{html.escape(dashboard_table)}</pre>",
+            "",
+            "<b>📝 Recent Logs</b>",
+            f"<pre>{html.escape(recent_logs)}</pre>",
+            f"<i>Edited {html.escape(edited_at)} UTC</i>",
+        ]
         return "\n".join(sections)
+
+    def _render_combined_dashboard_table(self, cards: list[TelegramCardState]) -> str:
+        _, table_lines = self._dashboard_table_lines(cards)
+        header_row = table_lines[0]
+        row_width = len(header_row) - 2
+        border = "+" + ("-" * row_width) + "+"
+        strong_border = "+" + ("=" * row_width) + "+"
+        return "\n".join([strong_border, *table_lines, border])
 
     def _render_combined_account_section(self, card: TelegramCardState) -> list[str]:
         summary = card.activity_summary
@@ -736,7 +872,7 @@ class TelegramMonitor:
         this_week_rebate = self._rebate_amount(summary.rebates.get("this_week")) if summary else "-"
         daily_fee_spent = self._format_amount_map_display(self._current_day_network_fee(card))
         lifetime_fee_spent = self._format_amount_map_display(
-            self._merge_amount_maps(card.lifetime_network_fee_base, card.total_network_fee)
+            self._current_lifetime_network_fee(card)
         )
         daily_swap_total = self._current_day_swap_total(card)
         lifetime_swap_total = card.lifetime_swap_base + card.swap_transactions
@@ -880,16 +1016,17 @@ class TelegramMonitor:
 
     def _build_gas_totals_line(self, card: TelegramCardState) -> str:
         total_daily_fee = self._current_day_network_fee(card)
-        total_lifetime_fee = self._merge_amount_maps(card.lifetime_network_fee_base, card.total_network_fee)
+        total_lifetime_fee = self._current_lifetime_network_fee(card)
         return (
-            f"⛽ Gas Fee Hari Ini: {self._format_amount_map(total_daily_fee)} | "
-            f"Total Gas Fee Sejak Bot Start: {self._format_amount_map(total_lifetime_fee)}"
+            f"Gas Fee Hari Ini: {self._format_amount_map(total_daily_fee)} | "
+            f"Total Gas Fee Dibayar: {self._format_amount_map(total_lifetime_fee)}"
         )
 
     def _build_fee_line(self, card: TelegramCardState) -> str:
-        total_fee = self._merge_amount_maps(card.total_network_fee, card.total_swap_fee)
+        paid_network_fee = self._session_paid_network_fee(card)
+        total_fee = self._merge_amount_maps(paid_network_fee, card.total_swap_fee)
         return (
-            f"⛽ Fees: Net {self._format_amount_map(card.total_network_fee)} | "
+            f"Fees: Net {self._format_amount_map(paid_network_fee)} | "
             f"Swap {self._format_amount_map(card.total_swap_fee)} | "
             f"Total {self._format_amount_map(total_fee)}"
         )
@@ -989,6 +1126,25 @@ class TelegramMonitor:
                 return f"{SYMBOL_SHORT.get(left, left)}->{SYMBOL_SHORT.get(right, right)}"
         return self._terminalize_text(strategy_label)
 
+    def _route_label_ascii(self, route_label: str | None) -> str:
+        if not route_label:
+            return "-"
+        symbols = [segment.strip() for segment in route_label.split("->")]
+        shortened = [SYMBOL_SHORT.get(symbol, symbol) for symbol in symbols]
+        return "->".join(shortened)
+
+    def _dashboard_compact_amount_map(self, values: dict[str, Decimal]) -> str:
+        if not values:
+            return "-"
+        parts: list[str] = []
+        for symbol, amount in sorted(values.items()):
+            rendered = self._fmt_fee(amount)
+            if rendered == "0":
+                continue
+            short_symbol = SYMBOL_SHORT.get(symbol, symbol)
+            parts.append(rendered if short_symbol == "CC" else f"{short_symbol}{rendered}")
+        return " ".join(parts) if parts else "-"
+
     def _to_decimal_like(self, value: str | None) -> Decimal | None:
         if value in {None, ""}:
             return None
@@ -1066,6 +1222,26 @@ class TelegramMonitor:
         if rendered == "-":
             return rendered
         return rendered.removesuffix(" CC")
+
+    def _aggregate_rebate_total(self, cards: list[TelegramCardState], rebate_key: str) -> Decimal | None:
+        total = Decimal("0")
+        found = False
+        for card in cards:
+            summary = card.activity_summary
+            if summary is None:
+                continue
+            rebate_value = self._rebate_amount(summary.rebates.get(rebate_key))
+            decimal_value = self._to_decimal_like(rebate_value)
+            if decimal_value is None:
+                continue
+            total += decimal_value
+            found = True
+        return total if found else None
+
+    def _format_cc_total(self, value: Decimal | None) -> str:
+        if value is None:
+            return "-"
+        return f"{self._format_decimal_value(value, places=4)} CC"
 
     def _dashboard_gas(self, values: dict[str, Decimal]) -> str:
         rendered = self._format_amount_map(values)
@@ -1158,6 +1334,30 @@ class TelegramMonitor:
             if amount > Decimal("0")
         }
 
+    def _session_paid_network_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
+        return self._subtract_amount_maps(
+            card.total_network_fee,
+            card.free_network_fee_credit,
+        )
+
+    def _current_lifetime_network_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
+        return self._merge_amount_maps(
+            card.lifetime_network_fee_base,
+            self._session_paid_network_fee(card),
+        )
+
+    def _session_total_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
+        return self._merge_amount_maps(
+            self._session_paid_network_fee(card),
+            card.total_swap_fee,
+        )
+
+    def _aggregate_session_total_fee(self, cards: list[TelegramCardState]) -> dict[str, Decimal]:
+        merged: dict[str, Decimal] = {}
+        for card in cards:
+            merged = self._merge_amount_maps(merged, self._session_total_fee(card))
+        return merged
+
     def _current_day_swap_total(self, card: TelegramCardState) -> int:
         return card.daily_swap_base + max(card.swap_transactions - card.day_session_swap_offset, 0)
 
@@ -1178,7 +1378,15 @@ class TelegramMonitor:
             card.total_network_fee,
             card.day_session_network_fee_offset,
         )
-        return self._merge_amount_maps(card.daily_network_fee_base, session_today_fee)
+        session_today_free_fee = self._subtract_amount_maps(
+            card.free_network_fee_credit,
+            card.day_session_free_network_fee_offset,
+        )
+        session_today_paid_fee = self._subtract_amount_maps(
+            session_today_fee,
+            session_today_free_fee,
+        )
+        return self._merge_amount_maps(card.daily_network_fee_base, session_today_paid_fee)
 
     def _utc_today(self) -> date:
         return datetime.now(timezone.utc).date()
@@ -1275,6 +1483,7 @@ class TelegramMonitor:
         card.day_session_ok_tx_offset = card.tx_ok_count
         card.day_session_fail_tx_offset = card.tx_fail_count
         card.day_session_network_fee_offset = dict(card.total_network_fee)
+        card.day_session_free_network_fee_offset = dict(card.free_network_fee_credit)
         self._persist_card_state(card)
 
     def _persist_card_state(self, card: TelegramCardState) -> None:
@@ -1288,10 +1497,7 @@ class TelegramMonitor:
         totals.lifetime_swaps = card.lifetime_swap_base + card.swap_transactions
         totals.lifetime_ok_tx = self._lifetime_ok_tx_total(card)
         totals.lifetime_fail_tx = self._lifetime_fail_tx_total(card)
-        totals.lifetime_network_fee = self._merge_amount_maps(
-            card.lifetime_network_fee_base,
-            card.total_network_fee,
-        )
+        totals.lifetime_network_fee = self._current_lifetime_network_fee(card)
         self._account_totals[card.account_name] = totals
         self._save_state()
 

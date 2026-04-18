@@ -7,9 +7,9 @@ Bot autoswap multi-account untuk Cantex yang dibangun di atas SDK lokal pada `ca
 Fitur utama:
 
 - Multi-account
-- Strategi swap `1`, `3`, dan `7`
+- Strategi swap `1`, `2`, `3`, dan `4`
 - Validasi balance, minimum protocol, dan fee sebelum submit swap
-- Reserve minimal `5 CC` per account
+- Reserve `CC` berbasis `reserve_fee` per account
 - Optimasi route `direct` vs `1-hop`
 - `1 swap sukses = 1 round selesai`
 - Bot selalu berjalan dalam mode 24 jam berbasis UTC
@@ -120,7 +120,6 @@ Struktur dasarnya:
 
 ```toml
 [settings]
-min_cc_reserve = "5"
 swap_delay_seconds = { min = 20.0, max = 100.0 }
 max_network_fee_cc_per_execution = "0.12"
 network_fee_poll_seconds = { min = 20.0, max = 40.0 }
@@ -134,9 +133,10 @@ max_retries = 3
 retry_base_delay = 5.0
 
 [defaults]
-strategy = "7"
+strategy = "3"
 rounds = { min = 70, max = 72 }
 amounts = { CC = { min = "11", max = "13" }, USDCx = { min = "1.5", max = "1.7" }, CBTC = { min = "0.000023", max = "0.000025" } }
+reserve_fee = "5"
 
 [[accounts]]
 name = "wallet-1"
@@ -151,24 +151,21 @@ auto_create_intent_account = true
 
 ### `[settings]`
 
-- `min_cc_reserve`
-  - Reserve minimum `CC` yang selalu disisakan untuk fee
-  - Bot tidak akan menghabiskan seluruh `CC`
-
 - `swap_delay_seconds`
   - Delay antar swap pada mode normal
   - Bisa angka tetap atau range `{ min, max }`
 
 - `max_network_fee_cc_per_execution`
-  - Batas maksimum network fee untuk 1 percobaan swap dalam satuan `CC`
+  - Batas maksimum network fee untuk setiap transaksi swap / hop dalam satuan `CC`
   - Bot akan cek quote terlebih dahulu sebelum submit transaksi
-  - Jika network fee quote saat itu lebih tinggi dari batas ini, transaksi tidak dikirim
+  - Jika ada hop yang network fee quote-nya lebih tinggi dari batas ini, transaksi tidak dikirim
   - Bot akan menunggu sesuai `network_fee_poll_seconds`, lalu quote ulang sampai fee turun
   - Jika saat menunggu muncul quote error sementara seperti `HTTP 502`, bot tidak dianggap gagal; bot tetap hidup dan akan quote ulang lagi
   - Setting ini hanya membatasi network fee, bukan swap fee admin/liquidity
+  - Aturan ini berlaku untuk swap normal, recovery, dan refill
   - Cantex saat ini memberi `3x free fee swap` per account per hari UTC
   - Bot otomatis mencoba memakai jatah ini mulai `01:00 UTC`
-  - Untuk 3 swap sukses pertama setelah `01:00 UTC`, bot akan tetap submit swap walaupun quote UI masih menampilkan fee
+  - Hanya hop pertama yang benar-benar memakai jatah free swap harian boleh bypass batas fee ini
   - Bot akan mencoba menyinkronkan pemakaian jatah ini dari endpoint history trading lebih dulu
   - Jika history hari ini sudah menunjukkan `3` swap, bot akan menganggap jatah free swap hari itu sudah habis
   - State lokal tetap disimpan sebagai fallback agar restart bot tidak mengulang jatah yang sudah terpakai walaupun endpoint history sedang tidak tersedia
@@ -235,6 +232,11 @@ Dipakai sebagai default untuk semua account aktif, kecuali di-override pada `[[a
 - `strategy`
 - `rounds`
 - `amounts`
+- `reserve_fee`
+- `reserve_kritis`
+
+`reserve_fee` adalah reserve `CC` utama per account untuk semua strategi.
+`reserve_kritis` hanya wajib diisi jika account memakai strategi `4`.
 
 Contoh:
 
@@ -243,6 +245,7 @@ Contoh:
 strategy = "3"
 rounds = { min = 5, max = 7 }
 amounts = { CC = { min = "9", max = "12" }, USDCx = { min = "8", max = "11" }, CBTC = { min = "0.0005", max = "0.0010" } }
+reserve_fee = "5"
 ```
 
 ### `[[accounts]]`
@@ -259,6 +262,8 @@ Setting yang sering dipakai per account:
 - `strategy`
 - `rounds`
 - `amounts`
+- `reserve_fee`
+- `reserve_kritis`
 - `allow_continue_on_low_balance`
 - `auto_create_intent_account`
 - `proxy_label`
@@ -288,33 +293,56 @@ Artinya account `wallet-2` tetap memakai `false`, walaupun default global `true`
 
 ## Strategi
 
-`strategy` sekarang hanya menerima nilai `1`, `3`, atau `7`:
+`strategy` sekarang menerima nilai `1`, `2`, `3`, atau `4`:
 
 1. `CC -> USDCx`
-3. `CC -> CBTC`
-7. `CC -> USDCx -> CBTC`
+2. `CC -> CBTC`
+3. `CC -> USDCx -> CBTC`
+4. `CC -> USDCx -> CBTC`
 
 Catatan:
 
 - `rounds` adalah jumlah swap sukses yang ingin dicapai
 - `1 swap sukses = 1 round selesai`
 - Strategi `1` akan memprioritaskan refill token luar strategi ke `CC`, lalu `CC -> USDCx`, lalu unwind `USDCx -> CC` saat `CC` tidak cukup
-- Strategi `3` akan memprioritaskan refill token luar strategi ke `CC`, lalu `CC -> CBTC`, lalu unwind `CBTC -> CC` saat `CC` tidak cukup
-- Strategi `7` memakai static round robin dinamis:
+- Strategi `2` akan memprioritaskan refill token luar strategi ke `CC`, lalu `CC -> CBTC`, lalu unwind `CBTC -> CC` saat `CC` tidak cukup
+- Strategi `3` memakai static round robin dinamis:
   - selama `CC` masih cukup, bot bergantian `CC -> USDCx` lalu `CC -> CBTC`
   - saat `CC` tidak cukup untuk swap keluar, bot masuk fase recycle: `USDCx -> CBTC (50%)`, `CBTC -> USDCx (50%)`, `CBTC -> CC (max)`, `USDCx -> CC (max)`
+- Strategi `4` memakai mode reserve:
+  - bot swap `CC -> USDCx` memakai saldo maksimum sambil menyisakan `reserve_fee`
+  - setelah itu bot bolak-balik `USDCx -> CBTC` dan `CBTC -> USDCx` dengan `amount max`
+  - jika `CC <= reserve_kritis`, bot masuk fase recovery dan mengosongkan `USDCx` serta `CBTC` kembali ke `CC`
+  - setelah saldo token luar habis, flow kembali ke langkah `CC -> USDCx`
 - Langkah strategi hanya maju jika swap pada langkah saat ini benar-benar sukses
 - Constraint sementara seperti fee tinggi, minimum ticket protocol, atau source token belum cukup tidak mengurangi `rounds`
+- Alias lama `strategy = "7"` masih diterima dan dipetakan ke strategi `3` agar config lama tetap jalan
 
 Contoh:
 
 - `strategy = "1"` akan terus mengulang flow `refill luar strategi -> CC -> USDCx -> USDCx -> CC`
-- `strategy = "3"` akan terus mengulang flow `refill luar strategi -> CC -> CBTC -> CBTC -> CC`
-- `strategy = "7"` akan terus memakai round robin dinamis antara fase spend dan fase recycle sampai target `rounds` sukses terpenuhi
+- `strategy = "2"` akan terus mengulang flow `refill luar strategi -> CC -> CBTC -> CBTC -> CC`
+- `strategy = "3"` akan terus memakai round robin dinamis antara fase spend dan fase recycle sampai target `rounds` sukses terpenuhi
+- `strategy = "4"` akan mengulang flow `CC -> USDCx (sisakan reserve_fee) -> USDCx <-> CBTC (max) -> recovery ke CC saat reserve_kritis tersentuh`
+
+Contoh config untuk strategi `4`:
+
+```toml
+[defaults]
+strategy = "4"
+rounds = { min = 70, max = 72 }
+reserve_fee = "5"
+reserve_kritis = "1"
+```
 
 ## Amount dan Rounds
 
 `amounts` dipakai berdasarkan aset yang sedang menjadi token `sell`.
+
+Catatan penting:
+
+- Strategi `1`, `2`, dan `3` memakai `amounts`
+- Strategi `4` tidak memakai `amounts`; strategi ini memakai saldo maksimum berdasarkan `reserve_fee` dan `reserve_kritis`
 
 Contoh nilai tetap:
 
@@ -337,11 +365,13 @@ Artinya:
 
 ## Perilaku Saat Balance dan Reserve
 
-- `min_cc_reserve` hanya membatasi saat source token adalah `CC`
-- Jika step aktif adalah `CC -> token lain`, bot hanya boleh swap selama balance `CC` masih di atas reserve
-- Jika balance `CC <= min_cc_reserve`, bot tidak akan lagi memakai `CC` sebagai source token untuk swap keluar
+- `reserve_fee` membatasi saat source token adalah `CC`
+- Jika step aktif adalah `CC -> token lain`, bot hanya boleh swap selama balance `CC` masih di atas `reserve_fee`
+- Jika balance `CC <= reserve_fee`, bot tidak akan lagi memakai `CC` sebagai source token untuk swap keluar
 - Kondisi ini bukan berarti strategi selesai
-- Step lain seperti `USDCx -> CBTC`, `CBTC -> CC`, atau `USDCx -> CC` tetap boleh berjalan walaupun `CC <= min_cc_reserve`
+- Step lain seperti `USDCx -> CBTC`, `CBTC -> CC`, atau `USDCx -> CC` tetap boleh berjalan walaupun `CC <= reserve_fee`
+- Pada strategi `4`, `reserve_fee` adalah target saldo `CC` yang disisakan saat langkah `CC -> USDCx`
+- Pada strategi `4`, jika `CC <= reserve_kritis`, bot akan memaksa recovery `USDCx` dan `CBTC` ke `CC` sampai saldo token luar habis
 
 Catatan:
 
@@ -367,10 +397,11 @@ Arti mode:
   - Setelah jatah free swap hari itu habis, bot menunggu hari UTC berikutnya jika `full_24h_auto_restart = true`
 - Mode `2`
   - Bot memprioritaskan free swap harian lebih dulu
+  - Hanya hop free swap yang benar-benar memakai jatah harian boleh bypass fee cap
   - Setelah jatah free swap habis, bot lanjut swap normal dengan fee cap
 - Mode `3`
   - Bot langsung swap normal
-  - Free swap harian tidak dipakai sebagai bypass fee cap
+  - Semua swap tetap patuh pada fee cap
 - Mode `4`
   - Bot memakai plan jadwal random dalam window harian UTC
   - Fee cap tetap berlaku
@@ -383,7 +414,8 @@ Perilaku umum mode 24 jam:
 - jika `full_24h_auto_restart = true`, sesi berikutnya dimulai lagi untuk hari UTC berikutnya
 - jatah `3x free fee swap` harian per account akan reset saat hari UTC berganti, tetapi baru boleh dipakai mulai `01:00 UTC`
 - jadi bot tidak akan memakai free swap tepat setelah `00:00 UTC`, melainkan menunggu `+1 jam`
-- `max_network_fee_cc_per_execution` tetap berlaku
+- `max_network_fee_cc_per_execution` berlaku untuk semua swap normal, recovery, refill, dan hop lanjutan
+- pengecualian hanya untuk hop free swap yang benar-benar memakai jatah harian
 - jika fee terlalu tinggi, bot akan retry quote pada slot round itu
 - jika saat menunggu fee turun muncul quote error sementara seperti `HTTP 502`, bot tetap hidup dan akan mencoba quote ulang lagi
 - retry fee dilakukan sampai tersisa `30 detik` menuju jadwal round berikutnya
