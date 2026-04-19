@@ -146,10 +146,21 @@ class AutoswapBot:
         session_number: int,
     ) -> AccountResult:
         prepared_run = account.prepare_run(self._rng)
+        session_progress = self.runtime_state.start_or_resume_round_session(
+            account.name,
+            strategy_name=prepared_run.strategy_name,
+            requested_rounds=prepared_run.rounds,
+        )
+        prepared_run = PreparedAccountRun(
+            strategy_name=prepared_run.strategy_name,
+            rounds=session_progress.requested_rounds,
+        )
         result = AccountResult(
             account_name=account.name,
             strategy_label=account.strategy().label,
             requested_rounds=prepared_run.rounds,
+            completed_rounds=session_progress.completed_rounds,
+            swap_transactions=session_progress.completed_rounds,
         )
         monitor_card = self.monitor.create_card(
             account,
@@ -162,6 +173,12 @@ class AutoswapBot:
         try:
             async with sdk:
                 await self.monitor.attach_card(monitor_card)
+                if result.completed_rounds > 0:
+                    await self.monitor.sync_round_progress(
+                        monitor_card,
+                        completed_rounds=result.completed_rounds,
+                        force=True,
+                    )
                 logger.info("Autentikasi dimulai | sesi=%s", session_number)
                 await self.monitor.log_event(
                     monitor_card,
@@ -177,6 +194,17 @@ class AutoswapBot:
                     monitor_card=monitor_card,
                     force_log=True,
                 )
+                synced_completed_rounds = await self._sync_round_progress_from_history(
+                    sdk=sdk,
+                    account=account,
+                    prepared_run=prepared_run,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    fallback_completed_rounds=result.completed_rounds,
+                    force_log=True,
+                )
+                result.completed_rounds = synced_completed_rounds
+                result.swap_transactions = synced_completed_rounds
 
                 if account.auto_create_intent_account:
                     created = await sdk.ensure_intent_trading_account()
@@ -344,6 +372,7 @@ class AutoswapBot:
                             phase=f"STOPPED_{result.stop_reason}",
                         )
                     else:
+                        self.runtime_state.clear_round_session(account.name)
                         await self.monitor.log_event(
                             monitor_card,
                             "🏁 Session completed",
@@ -2774,6 +2803,11 @@ class AutoswapBot:
             if round_result.completed:
                 result.completed_rounds += 1
                 result.swap_transactions += 1
+                self._persist_round_session_progress(
+                    account=account,
+                    prepared_run=prepared_run,
+                    result=result,
+                )
                 if result.completed_rounds >= prepared_run.rounds:
                     if self.config.runtime.full_24h_auto_restart:
                         await self._wait_until_next_utc_day_after_quota(
@@ -2882,6 +2916,11 @@ class AutoswapBot:
             if round_result.completed:
                 result.completed_rounds += 1
                 result.swap_transactions += 1
+                self._persist_round_session_progress(
+                    account=account,
+                    prepared_run=prepared_run,
+                    result=result,
+                )
             elif not round_result.skipped and round_result.stop_reason is not None:
                 result.stop_reason = round_result.stop_reason
                 return
@@ -3187,6 +3226,76 @@ class AutoswapBot:
             )
         return synced_status
 
+    async def _sync_round_progress_from_history(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        account: AccountConfig,
+        prepared_run: PreparedAccountRun,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        fallback_completed_rounds: int,
+        force_log: bool = False,
+    ) -> int:
+        synced_completed_rounds = min(
+            max(int(fallback_completed_rounds), 0),
+            prepared_run.rounds,
+        )
+        try:
+            source_path, payload = await sdk.get_trading_history_payload()
+        except Exception as exc:
+            logger.warning("Gagal mengambil trading history untuk round sync: %s", exc)
+            await self.monitor.sync_round_progress(
+                monitor_card,
+                completed_rounds=synced_completed_rounds,
+                force=force_log,
+            )
+            return synced_completed_rounds
+
+        if payload is None:
+            await self.monitor.sync_round_progress(
+                monitor_card,
+                completed_rounds=synced_completed_rounds,
+                force=force_log,
+            )
+            return synced_completed_rounds
+
+        history_today_count = self._count_today_trading_history_swaps(payload)
+        if history_today_count is None:
+            await self.monitor.sync_round_progress(
+                monitor_card,
+                completed_rounds=synced_completed_rounds,
+                force=force_log,
+            )
+            return synced_completed_rounds
+
+        synced_completed_rounds = min(max(history_today_count, 0), prepared_run.rounds)
+        self.runtime_state.update_round_session_progress(
+            account.name,
+            strategy_name=prepared_run.strategy_name,
+            requested_rounds=prepared_run.rounds,
+            completed_rounds=synced_completed_rounds,
+        )
+        await self.monitor.sync_round_progress(
+            monitor_card,
+            completed_rounds=synced_completed_rounds,
+            force=force_log,
+        )
+        if force_log or synced_completed_rounds != fallback_completed_rounds:
+            logger.info(
+                "Round sync | source=%s | history_swap_hari_ini=%s | progress=%s/%s",
+                source_path or "-",
+                history_today_count,
+                synced_completed_rounds,
+                prepared_run.rounds,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"🔁 Round sync from history: {synced_completed_rounds}/{prepared_run.rounds}",
+                force=force_log,
+            )
+        return synced_completed_rounds
+
     async def _sleep_or_stop(self, seconds: float) -> None:
         if seconds <= 0:
             self._raise_if_stop_requested()
@@ -3200,6 +3309,20 @@ class AutoswapBot:
     def _raise_if_stop_requested(self) -> None:
         if self.stop_requested():
             raise StopRequested()
+
+    def _persist_round_session_progress(
+        self,
+        *,
+        account: AccountConfig,
+        prepared_run: PreparedAccountRun,
+        result: AccountResult,
+    ) -> None:
+        self.runtime_state.update_round_session_progress(
+            account.name,
+            strategy_name=prepared_run.strategy_name,
+            requested_rounds=prepared_run.rounds,
+            completed_rounds=result.completed_rounds,
+        )
 
     def _format_utc(self, dt: datetime) -> str:
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

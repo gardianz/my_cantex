@@ -51,6 +51,7 @@ class TelegramCardState:
     lifetime_fail_tx_base: int = 0
     lifetime_network_fee_base: dict[str, Decimal] = field(default_factory=dict)
     current_pair_key: str | None = None
+    progress_completed_base: int = 0
     current_round_number: int = 0
     phase: str = "STARTING"
     balances: dict[str, Decimal] = field(default_factory=dict)
@@ -182,6 +183,22 @@ class TelegramMonitor:
             return
         self._cards[card.account_name] = card
         self._render_terminal_dashboard(force=True)
+
+    async def sync_round_progress(
+        self,
+        card: TelegramCardState | None,
+        *,
+        completed_rounds: int,
+        force: bool = False,
+    ) -> None:
+        if card is None:
+            return
+        self._rollover_card_if_needed(card)
+        normalized_completed = max(int(completed_rounds), 0)
+        card.progress_completed_base = normalized_completed
+        card.current_round_number = normalized_completed
+        self._persist_card_state(card)
+        await self._refresh_outputs(card, force=force)
 
     async def log_event(
         self,
@@ -546,7 +563,7 @@ class TelegramMonitor:
 
     def _dashboard_summary_lines(self, cards: list[TelegramCardState], *, row_width: int) -> list[str]:
         total_round_targets = sum(card.total_rounds for card in cards)
-        total_swaps = sum(card.swap_transactions for card in cards)
+        total_swaps = sum(self._progress_completed_total(card) for card in cards)
         failed_accounts = sum(1 for card in cards if card.phase.startswith("FAILED"))
         stopped_accounts = sum(1 for card in cards if card.phase.startswith("STOPPED"))
         active_accounts = len(cards) - failed_accounts - stopped_accounts
@@ -625,8 +642,9 @@ class TelegramMonitor:
         return self._terminalize_text(card.phase)
 
     def _dashboard_progress(self, card: TelegramCardState) -> str:
-        current_round = max(card.current_round_number, card.swap_transactions)
-        return f"R{current_round}/{card.total_rounds} ok{card.swap_transactions}"
+        completed_total = self._progress_completed_total(card)
+        current_round = max(card.current_round_number, completed_total)
+        return f"R{current_round}/{card.total_rounds} ok{completed_total}"
 
     def _dashboard_plan(self, card: TelegramCardState) -> str:
         strategy = self._build_strategy_line(card).split(":", 1)[-1].strip()
@@ -825,7 +843,7 @@ class TelegramMonitor:
     def _render_combined_card(self, cards: list[TelegramCardState]) -> str:
         local_now = datetime.now().astimezone()
         total_round_targets = sum(card.total_rounds for card in cards)
-        total_swaps = sum(card.swap_transactions for card in cards)
+        total_swaps = sum(self._progress_completed_total(card) for card in cards)
         failed_accounts = sum(1 for card in cards if card.phase.startswith("FAILED"))
         stopped_accounts = sum(1 for card in cards if card.phase.startswith("STOPPED"))
         active_accounts = len(cards) - failed_accounts - stopped_accounts
@@ -995,7 +1013,7 @@ class TelegramMonitor:
             if card.current_pair_key
             else self._strategy_short(card.strategy_label)
         )
-        round_number = max(card.current_round_number, 0)
+        round_number = max(card.current_round_number, self._progress_completed_total(card), 0)
         if card.phase == "WAITING" and card.next_wait_seconds is not None:
             wait_seconds = int(max(card.next_wait_seconds, 0))
             return f"{pair} R{round_number}/{card.total_rounds} | ⏳ Wait {wait_seconds}s"
@@ -1375,6 +1393,9 @@ class TelegramMonitor:
         for card in cards:
             merged = self._merge_amount_maps(merged, self._session_total_fee(card))
         return merged
+
+    def _progress_completed_total(self, card: TelegramCardState) -> int:
+        return max(card.progress_completed_base, 0) + max(card.swap_transactions, 0)
 
     def _current_day_swap_total(self, card: TelegramCardState) -> int:
         return card.daily_swap_base + max(card.swap_transactions - card.day_session_swap_offset, 0)

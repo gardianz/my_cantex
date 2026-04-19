@@ -15,6 +15,10 @@ DAILY_FREE_FEE_WINDOW_HOUR_UTC = 1
 class AccountRuntimeState:
     current_utc_date: str = ""
     free_fee_swaps_used: int = 0
+    active_strategy_name: str = ""
+    active_requested_rounds: int = 0
+    active_completed_rounds: int = 0
+    active_updated_at_utc: str = ""
 
 
 @dataclass(frozen=True)
@@ -24,6 +28,14 @@ class DailyFreeFeeStatus:
     remaining: int
     window_open: bool
     window_opens_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class RoundSessionProgress:
+    strategy_name: str
+    requested_rounds: int
+    completed_rounds: int
+    resumed: bool
 
 
 class BotRuntimeStateStore:
@@ -96,6 +108,111 @@ class BotRuntimeStateStore:
             self._save()
         return self.get_daily_free_fee_status(account_name, now_utc=normalized_now)
 
+    def start_or_resume_round_session(
+        self,
+        account_name: str,
+        *,
+        strategy_name: str,
+        requested_rounds: int,
+        now_utc: datetime | None = None,
+    ) -> RoundSessionProgress:
+        self._load()
+        normalized_now = self._normalize_now(now_utc)
+        state = self._normalized_state(account_name, normalized_now, persist=False)
+        stored_requested = max(int(state.active_requested_rounds), 0)
+        stored_completed = min(max(int(state.active_completed_rounds), 0), stored_requested)
+        if (
+            state.active_strategy_name == strategy_name
+            and stored_requested > 0
+            and stored_completed < stored_requested
+        ):
+            should_save = (
+                stored_completed != state.active_completed_rounds
+                or stored_requested != state.active_requested_rounds
+            )
+            state.active_requested_rounds = stored_requested
+            state.active_completed_rounds = stored_completed
+            state.active_updated_at_utc = normalized_now.isoformat()
+            self._accounts[account_name] = state
+            if should_save:
+                self._save()
+            return RoundSessionProgress(
+                strategy_name=strategy_name,
+                requested_rounds=stored_requested,
+                completed_rounds=stored_completed,
+                resumed=True,
+            )
+
+        normalized_requested = max(int(requested_rounds), 1)
+        state.active_strategy_name = strategy_name
+        state.active_requested_rounds = normalized_requested
+        state.active_completed_rounds = 0
+        state.active_updated_at_utc = normalized_now.isoformat()
+        self._accounts[account_name] = state
+        self._save()
+        return RoundSessionProgress(
+            strategy_name=strategy_name,
+            requested_rounds=normalized_requested,
+            completed_rounds=0,
+            resumed=False,
+        )
+
+    def update_round_session_progress(
+        self,
+        account_name: str,
+        *,
+        strategy_name: str,
+        requested_rounds: int,
+        completed_rounds: int,
+        now_utc: datetime | None = None,
+    ) -> RoundSessionProgress:
+        self._load()
+        normalized_now = self._normalize_now(now_utc)
+        state = self._normalized_state(account_name, normalized_now, persist=False)
+        normalized_requested = max(int(requested_rounds), 1)
+        normalized_completed = min(max(int(completed_rounds), 0), normalized_requested)
+        should_save = (
+            state.active_strategy_name != strategy_name
+            or state.active_requested_rounds != normalized_requested
+            or state.active_completed_rounds != normalized_completed
+        )
+        state.active_strategy_name = strategy_name
+        state.active_requested_rounds = normalized_requested
+        state.active_completed_rounds = normalized_completed
+        state.active_updated_at_utc = normalized_now.isoformat()
+        self._accounts[account_name] = state
+        if should_save:
+            self._save()
+        return RoundSessionProgress(
+            strategy_name=strategy_name,
+            requested_rounds=normalized_requested,
+            completed_rounds=normalized_completed,
+            resumed=normalized_completed > 0,
+        )
+
+    def clear_round_session(
+        self,
+        account_name: str,
+        *,
+        now_utc: datetime | None = None,
+    ) -> None:
+        self._load()
+        normalized_now = self._normalize_now(now_utc)
+        state = self._normalized_state(account_name, normalized_now, persist=False)
+        if (
+            state.active_strategy_name in {"", None}
+            and state.active_requested_rounds == 0
+            and state.active_completed_rounds == 0
+            and state.active_updated_at_utc in {"", None}
+        ):
+            return
+        state.active_strategy_name = ""
+        state.active_requested_rounds = 0
+        state.active_completed_rounds = 0
+        state.active_updated_at_utc = ""
+        self._accounts[account_name] = state
+        self._save()
+
     def _normalize_now(self, now_utc: datetime | None) -> datetime:
         return (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
@@ -121,6 +238,10 @@ class BotRuntimeStateStore:
             self._accounts[str(account_name)] = AccountRuntimeState(
                 current_utc_date=str(payload.get("current_utc_date", "")),
                 free_fee_swaps_used=max(int(payload.get("free_fee_swaps_used", 0)), 0),
+                active_strategy_name=str(payload.get("active_strategy_name", "")),
+                active_requested_rounds=max(int(payload.get("active_requested_rounds", 0)), 0),
+                active_completed_rounds=max(int(payload.get("active_completed_rounds", 0)), 0),
+                active_updated_at_utc=str(payload.get("active_updated_at_utc", "")),
             )
 
     def _normalized_state(
@@ -133,7 +254,14 @@ class BotRuntimeStateStore:
         today = now_utc.date().isoformat()
         state = self._accounts.get(account_name, AccountRuntimeState())
         if state.current_utc_date != today:
-            state = AccountRuntimeState(current_utc_date=today, free_fee_swaps_used=0)
+            state = AccountRuntimeState(
+                current_utc_date=today,
+                free_fee_swaps_used=0,
+                active_strategy_name=state.active_strategy_name,
+                active_requested_rounds=state.active_requested_rounds,
+                active_completed_rounds=state.active_completed_rounds,
+                active_updated_at_utc=state.active_updated_at_utc,
+            )
             self._accounts[account_name] = state
             if persist:
                 self._save()
@@ -143,13 +271,17 @@ class BotRuntimeStateStore:
 
     def _save(self) -> None:
         payload = {
-            "version": 1,
+            "version": 2,
             "daily_free_fee_swap_limit": DAILY_FREE_FEE_SWAP_LIMIT,
             "window_hour_utc": DAILY_FREE_FEE_WINDOW_HOUR_UTC,
             "accounts": {
                 account_name: {
                     "current_utc_date": state.current_utc_date,
                     "free_fee_swaps_used": state.free_fee_swaps_used,
+                    "active_strategy_name": state.active_strategy_name,
+                    "active_requested_rounds": state.active_requested_rounds,
+                    "active_completed_rounds": state.active_completed_rounds,
+                    "active_updated_at_utc": state.active_updated_at_utc,
                 }
                 for account_name, state in sorted(self._accounts.items())
             },
