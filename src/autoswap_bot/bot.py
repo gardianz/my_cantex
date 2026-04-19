@@ -3159,7 +3159,7 @@ class AutoswapBot:
         synced_status = self.runtime_state.sync_daily_free_fee_swaps(
             account_name,
             min(history_today_count, 3),
-            exact=force_log,
+            exact=True,
         )
         await self.monitor.update_free_fee_status(
             monitor_card,
@@ -3169,7 +3169,7 @@ class AutoswapBot:
         )
         if force_log or synced_status.used != local_status.used:
             logger.info(
-                "Free fee sync | source=%s | swap_hari_ini=%s | used=%s/3 | remaining=%s",
+                "Free fee sync | source=%s | history_swap_hari_ini=%s | used=%s/3 | remaining=%s",
                 source_path or "-",
                 history_today_count,
                 synced_status.used,
@@ -3217,15 +3217,40 @@ class AutoswapBot:
         if not items:
             return None
         today_utc = datetime.now(timezone.utc).date()
-        count = 0
+        identified_trade_keys: set[str] = set()
+        fallback_count = 0
         for item in items:
             timestamp = self._extract_item_timestamp(item)
             if timestamp is None or timestamp.date() != today_utc:
                 continue
             if self._is_failed_history_item(item):
                 continue
-            count += 1
-        return count
+            trade_key = self._history_trade_key(item)
+            if trade_key is not None:
+                identified_trade_keys.add(trade_key)
+                continue
+            fallback_count += 1
+        if identified_trade_keys:
+            return len(identified_trade_keys)
+        return fallback_count
+
+    def _history_trade_key(self, item: dict[str, Any]) -> str | None:
+        for key in (
+            "update_id",
+            "updateId",
+            "updateID",
+            "trade_id",
+            "tradeId",
+            "event_id",
+            "eventId",
+            "transaction_id",
+            "transactionId",
+            "id",
+        ):
+            raw_value = item.get(key)
+            if raw_value not in {None, ""}:
+                return f"{key}:{str(raw_value).strip()}"
+        return None
 
     def _extract_trading_history_items(self, payload: Any) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
