@@ -54,6 +54,7 @@ class StrategyRuntimeState:
     recycle_index: int = 0
     recovery_index: int = 0
     reserve_recovery_active: bool = False
+    consecutive_balance_blocked_rounds: int = 0
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,9 @@ class RoundExecutionResult:
     tx_count: int
     stop_reason: str | None = None
     skipped: bool = False
+
+
+MAX_CONSECUTIVE_BALANCE_BLOCKED_ROUNDS = 5
 
 
 class AutoswapBot:
@@ -124,6 +128,7 @@ class AutoswapBot:
                 or not self.config.runtime.full_24h_auto_restart
                 or last_result.error is not None
                 or last_result.aborted
+                or last_result.stop_reason is not None
                 or self.config.runtime.dry_run
             ):
                 return last_result
@@ -285,6 +290,8 @@ class AutoswapBot:
                             session_end_utc=session_end_utc,
                             schedule=schedule,
                         )
+                        if result.stop_reason:
+                            break
                         if result.completed_rounds < prepared_run.rounds:
                             logger.info(
                                 "Rounds tersisa %s, lanjut ke sesi UTC berikutnya",
@@ -326,12 +333,23 @@ class AutoswapBot:
                     force=True,
                 )
                 if result.error is None and not result.aborted:
-                    await self.monitor.log_event(
-                        monitor_card,
-                        "🏁 Session completed",
-                        force=True,
-                    )
-                    await self.monitor.finalize(monitor_card, phase="FINISHED")
+                    if result.stop_reason:
+                        await self.monitor.log_event(
+                            monitor_card,
+                            f"⛔ Session stopped: {self._message_for_stop_reason(result.stop_reason)}",
+                            force=True,
+                        )
+                        await self.monitor.finalize(
+                            monitor_card,
+                            phase=f"STOPPED_{result.stop_reason}",
+                        )
+                    else:
+                        await self.monitor.log_event(
+                            monitor_card,
+                            "🏁 Session completed",
+                            force=True,
+                        )
+                        await self.monitor.finalize(monitor_card, phase="FINISHED")
         except StopRequested:
             result.aborted = True
             result.stop_reason = "MANUAL_STOP"
@@ -648,8 +666,6 @@ class AutoswapBot:
             if spendable_source <= dust_for_symbol(action.sell_symbol):
                 continue
             recycle_candidates.append(action)
-        if recycle_candidates:
-            return recycle_candidates, "strategy_4 recycle phase"
 
         spendable_cc = self._spendable_amount(
             CC_SYMBOL,
@@ -657,19 +673,25 @@ class AutoswapBot:
             reserve_fee,
         )
         if spendable_cc > dust_for_symbol(CC_SYMBOL):
-            return [
+            recycle_candidates.append(
                 StrategyAction(
                     sell_symbol="CC",
                     buy_symbol="USDCx",
-                    amount_mode="max",
+                    amount_mode="config",
                     cc_reserve_override=reserve_fee,
                 )
-            ], "strategy_4 spend phase"
+            )
+        if recycle_candidates:
+            return recycle_candidates, (
+                "strategy_4 recycle phase"
+                if any(action.sell_symbol != CC_SYMBOL for action in recycle_candidates)
+                else "strategy_4 spend phase"
+            )
 
         return [], self._cc_source_block_reason(
             balance_cc=cc_balance,
             spendable_cc=spendable_cc,
-            required_min_amount=Decimal("0"),
+            required_min_amount=account.amount_range_for_symbol(CC_SYMBOL).min_value,
             reserve_threshold=reserve_fee,
         )
 
@@ -753,6 +775,66 @@ class AutoswapBot:
             strategy_state.recycle_index = action.pointer_next_index
         if action.pointer_group == "recovery" and action.pointer_next_index is not None:
             strategy_state.recovery_index = action.pointer_next_index
+
+    def _is_balance_blocking_stop_reason(self, stop_reason: str | None) -> bool:
+        return stop_reason in {
+            "WAIT_SOURCE_BALANCE",
+            "MIN_TICKET_SIZE",
+            "USER_CONFIG_MIN_NOT_MET",
+        }
+
+    def _reset_balance_block_counter(self, strategy_state: StrategyRuntimeState) -> None:
+        strategy_state.consecutive_balance_blocked_rounds = 0
+
+    async def _build_skipped_round_result(
+        self,
+        *,
+        account: AccountConfig,
+        round_number: int,
+        tx_count: int,
+        strategy_state: StrategyRuntimeState,
+        stop_reason: str,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+    ) -> RoundExecutionResult:
+        if not self._is_balance_blocking_stop_reason(stop_reason):
+            self._reset_balance_block_counter(strategy_state)
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason=stop_reason,
+                skipped=True,
+            )
+
+        strategy_state.consecutive_balance_blocked_rounds += 1
+        blocked_rounds = strategy_state.consecutive_balance_blocked_rounds
+        if blocked_rounds <= MAX_CONSECUTIVE_BALANCE_BLOCKED_ROUNDS:
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason=stop_reason,
+                skipped=True,
+            )
+
+        logger.warning(
+            "Saldo akun %s tidak lagi cukup untuk lanjut setelah %s round tertahan berturut-turut",
+            account.name,
+            blocked_rounds,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            (
+                f"⛔ Round {round_number} stopped: saldo kurang "
+                f"setelah {blocked_rounds} pending berturut-turut"
+            ),
+            force=True,
+        )
+        return RoundExecutionResult(
+            completed=False,
+            tx_count=tx_count,
+            stop_reason="INSUFFICIENT_BALANCE",
+            skipped=False,
+        )
 
     async def _execute_round(
         self,
@@ -997,11 +1079,14 @@ class AutoswapBot:
                 f"⏭️ Round {round_number} pending: transient API error ({exc})",
                 force=True,
             )
-            return RoundExecutionResult(
-                completed=False,
+            return await self._build_skipped_round_result(
+                account=account,
+                round_number=round_number,
                 tx_count=tx_count,
+                strategy_state=strategy_state,
                 stop_reason="TRANSIENT_API_ERROR",
-                skipped=True,
+                logger=logger,
+                monitor_card=monitor_card,
             )
         except RuntimeError as exc:
             if not self._is_retryable_route_error(exc):
@@ -1018,11 +1103,14 @@ class AutoswapBot:
                 f"⏭️ Round {round_number} pending: transient quote error ({exc})",
                 force=True,
             )
-            return RoundExecutionResult(
-                completed=False,
+            return await self._build_skipped_round_result(
+                account=account,
+                round_number=round_number,
                 tx_count=tx_count,
+                strategy_state=strategy_state,
                 stop_reason="TRANSIENT_ROUTE_ERROR",
-                skipped=True,
+                logger=logger,
+                monitor_card=monitor_card,
             )
 
         try:
@@ -1054,11 +1142,14 @@ class AutoswapBot:
                 f"⏭️ Round {round_number} pending: transient API error ({exc})",
                 force=True,
             )
-            return RoundExecutionResult(
-                completed=False,
+            return await self._build_skipped_round_result(
+                account=account,
+                round_number=round_number,
                 tx_count=tx_count,
+                strategy_state=strategy_state,
                 stop_reason="TRANSIENT_API_ERROR",
-                skipped=True,
+                logger=logger,
+                monitor_card=monitor_card,
             )
         except RuntimeError as exc:
             if not self._is_retryable_route_error(exc):
@@ -1075,11 +1166,14 @@ class AutoswapBot:
                 f"⏭️ Round {round_number} pending: transient quote error ({exc})",
                 force=True,
             )
-            return RoundExecutionResult(
-                completed=False,
+            return await self._build_skipped_round_result(
+                account=account,
+                round_number=round_number,
                 tx_count=tx_count,
+                strategy_state=strategy_state,
                 stop_reason="TRANSIENT_ROUTE_ERROR",
-                skipped=True,
+                logger=logger,
+                monitor_card=monitor_card,
             )
         if issue is not None:
             message = (
@@ -1092,11 +1186,14 @@ class AutoswapBot:
                 message,
                 force=True,
             )
-            return RoundExecutionResult(
-                completed=False,
+            return await self._build_skipped_round_result(
+                account=account,
+                round_number=round_number,
                 tx_count=tx_count,
+                strategy_state=strategy_state,
                 stop_reason="ROUND_AFFORDABILITY_CHECK_FAILED",
-                skipped=True,
+                logger=logger,
+                monitor_card=monitor_card,
             )
         if route.hops and route.hops[0].sell_amount < amount_range.min_value:
             reason = f"route adjusted amount below user config min ({route.hops[0].sell_amount} < {amount_range.min_value})"
@@ -1160,11 +1257,14 @@ class AutoswapBot:
                     f"⏭️ Round {round_number} pending: {failure_reason or 'retry limit reached'}",
                     force=True,
                 )
-                return RoundExecutionResult(
-                    completed=False,
+                return await self._build_skipped_round_result(
+                    account=account,
+                    round_number=round_number,
                     tx_count=tx_count,
+                    strategy_state=strategy_state,
                     stop_reason=failure_reason or "SWAP_HOP_FAILED_SKIPPED",
-                    skipped=True,
+                    logger=logger,
+                    monitor_card=monitor_card,
                 )
 
             tx_count += 1
@@ -1274,16 +1374,20 @@ class AutoswapBot:
                     f"⏭️ Round {round_number} pending: {pending_reason}",
                     force=True,
                 )
-                return RoundExecutionResult(
-                    completed=False,
+                return await self._build_skipped_round_result(
+                    account=account,
+                    round_number=round_number,
                     tx_count=tx_count,
+                    strategy_state=strategy_state,
                     stop_reason="WAIT_SOURCE_BALANCE",
-                    skipped=True,
+                    logger=logger,
+                    monitor_card=monitor_card,
                 )
 
             route: RoutePlan | None = None
             actual_amount: Decimal | None = None
             last_invalid_reason = pending_reason
+            last_invalid_stop_reason = "WAIT_SOURCE_BALANCE"
 
             for action in action_candidates:
                 sell_symbol = action.sell_symbol
@@ -1298,6 +1402,11 @@ class AutoswapBot:
                 if actual_amount is None:
                     if amount_reason:
                         last_invalid_reason = amount_reason
+                        last_invalid_stop_reason = (
+                            "MIN_TICKET_SIZE"
+                            if "minimum ticket size" in amount_reason.lower()
+                            else "WAIT_SOURCE_BALANCE"
+                        )
                         logger.info(
                             "Putaran %s kandidat belum valid | %s -> %s | %s",
                             round_number,
@@ -1318,6 +1427,7 @@ class AutoswapBot:
                 )
                 if issue is not None:
                     last_invalid_reason = issue.reason
+                    last_invalid_stop_reason = "ROUND_AFFORDABILITY_CHECK_FAILED"
                     logger.info(
                         "Putaran %s kandidat belum affordable | %s -> %s | %s",
                         round_number,
@@ -1331,6 +1441,7 @@ class AutoswapBot:
                     last_invalid_reason = (
                         f"route adjusted amount below user config min ({route.hops[0].sell_amount} < {user_min_amount})"
                     )
+                    last_invalid_stop_reason = "USER_CONFIG_MIN_NOT_MET"
                     logger.info(
                         "Putaran %s kandidat belum bisa dieksekusi | %s -> %s | %s",
                         round_number,
@@ -1349,11 +1460,14 @@ class AutoswapBot:
                     f"⏭️ Round {round_number} pending: {last_invalid_reason}",
                     force=True,
                 )
-                return RoundExecutionResult(
-                    completed=False,
+                return await self._build_skipped_round_result(
+                    account=account,
+                    round_number=round_number,
                     tx_count=tx_count,
-                    stop_reason="ROUND_AFFORDABILITY_CHECK_FAILED",
-                    skipped=True,
+                    strategy_state=strategy_state,
+                    stop_reason=last_invalid_stop_reason,
+                    logger=logger,
+                    monitor_card=monitor_card,
                 )
         except (CantexAPIError, CantexTimeoutError) as exc:
             logger.warning(
@@ -1368,11 +1482,14 @@ class AutoswapBot:
                 f"⏭️ Round {round_number} pending: transient API error ({exc})",
                 force=True,
             )
-            return RoundExecutionResult(
-                completed=False,
+            return await self._build_skipped_round_result(
+                account=account,
+                round_number=round_number,
                 tx_count=tx_count,
+                strategy_state=strategy_state,
                 stop_reason="TRANSIENT_API_ERROR",
-                skipped=True,
+                logger=logger,
+                monitor_card=monitor_card,
             )
         except RuntimeError as exc:
             if not self._is_retryable_route_error(exc):
@@ -1389,11 +1506,14 @@ class AutoswapBot:
                 f"⏭️ Round {round_number} pending: transient quote error ({exc})",
                 force=True,
             )
-            return RoundExecutionResult(
-                completed=False,
+            return await self._build_skipped_round_result(
+                account=account,
+                round_number=round_number,
                 tx_count=tx_count,
+                strategy_state=strategy_state,
                 stop_reason="TRANSIENT_ROUTE_ERROR",
-                skipped=True,
+                logger=logger,
+                monitor_card=monitor_card,
             )
 
         try:
@@ -1425,11 +1545,14 @@ class AutoswapBot:
                 f"⏭️ Round {round_number} pending: transient API error ({exc})",
                 force=True,
             )
-            return RoundExecutionResult(
-                completed=False,
+            return await self._build_skipped_round_result(
+                account=account,
+                round_number=round_number,
                 tx_count=tx_count,
+                strategy_state=strategy_state,
                 stop_reason="TRANSIENT_API_ERROR",
-                skipped=True,
+                logger=logger,
+                monitor_card=monitor_card,
             )
         except RuntimeError as exc:
             if not self._is_retryable_route_error(exc):
@@ -1446,11 +1569,14 @@ class AutoswapBot:
                 f"⏭️ Round {round_number} pending: transient quote error ({exc})",
                 force=True,
             )
-            return RoundExecutionResult(
-                completed=False,
+            return await self._build_skipped_round_result(
+                account=account,
+                round_number=round_number,
                 tx_count=tx_count,
+                strategy_state=strategy_state,
                 stop_reason="TRANSIENT_ROUTE_ERROR",
-                skipped=True,
+                logger=logger,
+                monitor_card=monitor_card,
             )
 
         if issue is not None:
@@ -1464,11 +1590,14 @@ class AutoswapBot:
                 message,
                 force=True,
             )
-            return RoundExecutionResult(
-                completed=False,
+            return await self._build_skipped_round_result(
+                account=account,
+                round_number=round_number,
                 tx_count=tx_count,
+                strategy_state=strategy_state,
                 stop_reason="ROUND_AFFORDABILITY_CHECK_FAILED",
-                skipped=True,
+                logger=logger,
+                monitor_card=monitor_card,
             )
 
         await self.monitor.update_status(
@@ -1512,11 +1641,14 @@ class AutoswapBot:
                     f"⏭️ Round {round_number} pending: {failure_reason or 'retry limit reached'}",
                     force=True,
                 )
-                return RoundExecutionResult(
-                    completed=False,
+                return await self._build_skipped_round_result(
+                    account=account,
+                    round_number=round_number,
                     tx_count=tx_count,
+                    strategy_state=strategy_state,
                     stop_reason=failure_reason or "SWAP_HOP_FAILED_SKIPPED",
-                    skipped=True,
+                    logger=logger,
+                    monitor_card=monitor_card,
                 )
 
             tx_count += 1
@@ -1604,6 +1736,7 @@ class AutoswapBot:
             "🎉 Swap completed!",
             force=True,
         )
+        self._reset_balance_block_counter(strategy_state)
         self._advance_strategy_state_after_success(
             strategy_state=strategy_state,
             action=selected_action,
@@ -2656,6 +2789,10 @@ class AutoswapBot:
                 )
                 continue
 
+            if not round_result.skipped and round_result.stop_reason is not None:
+                result.stop_reason = round_result.stop_reason
+                return
+
             if round_result.skipped:
                 result.skipped_rounds += 1
             await self._sleep_after_direct_24h_pending(
@@ -2745,6 +2882,9 @@ class AutoswapBot:
             if round_result.completed:
                 result.completed_rounds += 1
                 result.swap_transactions += 1
+            elif not round_result.skipped and round_result.stop_reason is not None:
+                result.stop_reason = round_result.stop_reason
+                return
             elif round_result.skipped:
                 result.skipped_rounds += 1
         logger.info("Sesi 24 jam selesai pada %s UTC", self._format_utc(session_end_utc))
@@ -3667,13 +3807,14 @@ class AutoswapBot:
             "USER_ABORT_LOW_BALANCE_PROMPT": "Dihentikan user karena balance tidak cukup",
             "MANUAL_STOP": "Dihentikan user secara manual",
             "LOW_BALANCE_MODE_I": "Eksekusi berhenti karena balance kurang dan mode 'i' aktif",
-            "INSUFFICIENT_BALANCE": "Eksekusi berhenti karena balance tidak cukup",
+            "INSUFFICIENT_BALANCE": "saldo kurang",
             "RECOVERY_NOT_ENOUGH": "Round di-skip karena recovery belum menghasilkan balance yang cukup",
             "ROUND_AFFORDABILITY_CHECK_FAILED": "Eksekusi berhenti karena route tidak lagi affordable",
             "SWAP_HOP_FAILED": "Eksekusi berhenti karena transaksi swap gagal",
             "SWAP_HOP_FAILED_SKIPPED": "Round di-skip karena swap gagal setelah retry limit",
             "SWAP_RETRY_EXHAUSTED": "Round di-skip karena swap gagal setelah retry limit",
             "MIN_TICKET_SIZE": "Round di-skip karena nominal di bawah minimum ticket size",
+            "USER_CONFIG_MIN_NOT_MET": "Round di-skip karena nominal belum memenuhi amount minimum",
             "ROUND_STOPPED": "Eksekusi berhenti di tengah sesi",
         }
         return mapping.get(stop_reason, f"Eksekusi berhenti: {stop_reason}")

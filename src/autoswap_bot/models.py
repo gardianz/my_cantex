@@ -112,4 +112,4 @@ class AccountResult:
 
     @property
     def ok(self) -> bool:
-        return self.error is None and not self.aborted
+        return self.error is None and not self.aborted and self.stop_reason is None

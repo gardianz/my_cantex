@@ -310,12 +310,14 @@ Catatan:
   - selama `CC` masih cukup, bot bergantian `CC -> USDCx` lalu `CC -> CBTC`
   - saat `CC` tidak cukup untuk swap keluar, bot masuk fase recycle: `USDCx -> CBTC (50%)`, `CBTC -> USDCx (50%)`, `CBTC -> CC (max)`, `USDCx -> CC (max)`
 - Strategi `4` memakai mode reserve:
-  - bot swap `CC -> USDCx` memakai saldo maksimum sambil menyisakan `reserve_fee`
-  - setelah itu bot bolak-balik `USDCx -> CBTC` dan `CBTC -> USDCx` dengan `amount max`
+  - bot mencoba fase recycle dulu: `USDCx -> CBTC` atau `CBTC -> USDCx` dengan `amount max`
+  - jika balance `USDCx` / `CBTC` belum cukup untuk minimum ticket protocol, bot fallback ke `CC -> USDCx` memakai `amounts.CC` sambil tetap menjaga `reserve_fee`
+  - jika balance `USDCx` / `CBTC` sudah cukup untuk bolak-balik, fase awal `CC -> USDCx` akan di-skip
   - jika `CC <= reserve_kritis`, bot masuk fase recovery dan mengosongkan `USDCx` serta `CBTC` kembali ke `CC`
-  - setelah saldo token luar habis, flow kembali ke langkah `CC -> USDCx`
+  - setelah saldo token luar habis, flow kembali ke fase recycle lalu fallback spend jika perlu
 - Langkah strategi hanya maju jika swap pada langkah saat ini benar-benar sukses
 - Constraint sementara seperti fee tinggi, minimum ticket protocol, atau source token belum cukup tidak mengurangi `rounds`
+- Jika account tertahan lebih dari `5x` berturut-turut karena minimum ticket / source balance tidak cukup, bot menghentikan account itu dengan status `saldo kurang`
 - Alias lama `strategy = "7"` masih diterima dan dipetakan ke strategi `3` agar config lama tetap jalan
 
 Contoh:
@@ -323,7 +325,7 @@ Contoh:
 - `strategy = "1"` akan terus mengulang flow `refill luar strategi -> CC -> USDCx -> USDCx -> CC`
 - `strategy = "2"` akan terus mengulang flow `refill luar strategi -> CC -> CBTC -> CBTC -> CC`
 - `strategy = "3"` akan terus memakai round robin dinamis antara fase spend dan fase recycle sampai target `rounds` sukses terpenuhi
-- `strategy = "4"` akan mengulang flow `CC -> USDCx (sisakan reserve_fee) -> USDCx <-> CBTC (max) -> recovery ke CC saat reserve_kritis tersentuh`
+- `strategy = "4"` akan mengulang flow `coba USDCx <-> CBTC dulu -> jika belum cukup maka CC -> USDCx sesuai amounts.CC -> recycle max -> recovery ke CC saat reserve_kritis tersentuh`
 
 Contoh config untuk strategi `4`:
 
@@ -342,7 +344,8 @@ reserve_kritis = "1"
 Catatan penting:
 
 - Strategi `1`, `2`, dan `3` memakai `amounts`
-- Strategi `4` tidak memakai `amounts`; strategi ini memakai saldo maksimum berdasarkan `reserve_fee` dan `reserve_kritis`
+- Strategi `4` memakai `amounts.CC` untuk fase `CC -> USDCx`
+- Strategi `4` tetap memakai `amount max` untuk fase recycle `USDCx <-> CBTC`
 
 Contoh nilai tetap:
 
@@ -470,21 +473,16 @@ Jika `telegram_enabled = true`, bot membuat 1 pesan Telegram gabungan untuk semu
 Isi pesan gabungan per account meliputi:
 
 - status account
-- balance `CC`, `USDCX`, `CBTC`
-- statistik 24h
-  - `Tx [ok|fail]`
-  - `Free swap`
-  - `Swap`
-  - `Volume`
-  - `Fee Spent`
-- rewards
-  - `Kemarin`
-  - `Minggu ini`
-- statistik sejak bot start
-  - `Tx [ok|fail]`
-  - `Swap`
-  - `Volume`
-  - `Fee Spent`
+- progress `R/current`
+- balance `CC`
+- plan aktif
+- estimasi `fee route`
+- metrik `24h`
+- reward `yesterday`
+- reward `this week`
+- gas fee hari ini
+- progress `free swap`
+- ringkasan update terbaru tanpa mengirim dashboard terminal mentah
 
 Contoh config:
 
@@ -501,6 +499,7 @@ Catatan:
 
 - Saat startup, monitor Telegram tidak lagi mengirim 1 pesan per akun
 - Bot akan mempertahankan 1 pesan gabungan dan mengeditnya secara berkala
+- Format Telegram dibuat ringkas untuk mobile, jadi dashboard tabel tetap hanya untuk terminal lokal
 
 ## Output dan Ringkasan
 

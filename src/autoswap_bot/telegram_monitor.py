@@ -616,6 +616,8 @@ class TelegramMonitor:
             return "OK"
         if card.phase == "FINISHED":
             return "FINISHED"
+        if card.phase == "STOPPED_INSUFFICIENT_BALANCE":
+            return "SALDO"
         if card.phase.startswith("FAILED"):
             return "FAILED"
         if card.phase.startswith("STOPPED"):
@@ -830,8 +832,6 @@ class TelegramMonitor:
         yesterday_total = self._aggregate_rebate_total(cards, "yesterday")
         this_week_total = self._aggregate_rebate_total(cards, "this_week")
         paid_fee_total = self._aggregate_session_total_fee(cards)
-        dashboard_table = self._render_combined_dashboard_table(cards)
-        recent_logs = self._render_combined_logs()
         edited_at = datetime.now(timezone.utc).strftime("%H.%M.%S")
 
         sections = [
@@ -849,13 +849,17 @@ class TelegramMonitor:
                 f"💸 Fee paid total (run, excl free): {self._format_amount_map_display(paid_fee_total)}"
             ),
             "",
-            "<b>📊 Dashboard</b>",
-            f"<pre>{html.escape(dashboard_table)}</pre>",
-            "",
-            "<b>📝 Recent Logs</b>",
-            f"<pre>{html.escape(recent_logs)}</pre>",
-            f"<i>Edited {html.escape(edited_at)} UTC</i>",
+            "<b>📱 Ringkasan Akun</b>",
         ]
+        for card in cards:
+            sections.extend(self._render_combined_account_section(card))
+        sections.extend(
+            [
+                "<b>📝 Update Terakhir</b>",
+                *self._render_combined_updates(),
+                f"<i>Edited {html.escape(edited_at)} UTC</i>",
+            ]
+        )
         return "\n".join(sections)
 
     def _render_combined_dashboard_table(self, cards: list[TelegramCardState]) -> str:
@@ -866,54 +870,66 @@ class TelegramMonitor:
         strong_border = "+" + ("=" * row_width) + "+"
         return "\n".join([strong_border, *table_lines, border])
 
+    def _combined_plan(self, card: TelegramCardState) -> str:
+        strategy = self._build_strategy_line(card).split(":", 1)[-1].strip()
+        route = (
+            self._route_label_ascii(card.current_route_label)
+            if card.current_route_label
+            else (
+                self._short_pair_ascii(card.current_pair_key)
+                if card.current_pair_key
+                else self._strategy_ascii(card.strategy_label)
+            )
+        )
+        if card.phase == "WAITING_FEE" and card.next_wait_seconds is not None:
+            return f"S{strategy} {route} | fee {int(max(card.next_wait_seconds, 0))}s"
+        if card.phase == "WAITING" and card.next_wait_seconds is not None:
+            return f"S{strategy} {route} | cd {int(max(card.next_wait_seconds, 0))}s"
+        if card.phase == "WAITING_NEXT_DAY" and card.next_wait_seconds is not None:
+            return f"S{strategy} quota done | {int(max(card.next_wait_seconds, 0))}s"
+        return f"S{strategy} {route}"
+
     def _render_combined_account_section(self, card: TelegramCardState) -> list[str]:
         summary = card.activity_summary
         yesterday_rebate = self._rebate_amount(summary.rebates.get("yesterday")) if summary else "-"
         this_week_rebate = self._rebate_amount(summary.rebates.get("this_week")) if summary else "-"
         daily_fee_spent = self._format_amount_map_display(self._current_day_network_fee(card))
-        lifetime_fee_spent = self._format_amount_map_display(
-            self._current_lifetime_network_fee(card)
-        )
-        daily_swap_total = self._current_day_swap_total(card)
-        lifetime_swap_total = card.lifetime_swap_base + card.swap_transactions
-        daily_ok_tx = self._current_day_ok_tx_total(card)
-        daily_fail_tx = self._current_day_fail_tx_total(card)
-        lifetime_ok_tx = self._lifetime_ok_tx_total(card)
-        lifetime_fail_tx = self._lifetime_fail_tx_total(card)
+        activity_24h = self._dashboard_24h_activity(summary)
+        progress = self._dashboard_progress(card)
+        plan = self._combined_plan(card)
+        fee_route = self._dashboard_route_fee(card)
+        cc_balance = self._fmt_balance(card.balances.get("CC", Decimal("0")), 4)
         title = (
             f"{self._telegram_status_emoji(card)} {self._display_account_name(card.account_name)} "
             f"[ {self._telegram_status_text(card)} ]"
         )
         return [
             f"<b>{html.escape(title)}</b>",
+            html.escape(f"{progress} | CC {cc_balance} | {plan}"),
+            html.escape(
+                " | ".join(
+                    [
+                        f"Fee route {fee_route}",
+                        f"24h {activity_24h}",
+                        f"Y {yesterday_rebate}",
+                        f"W {this_week_rebate}",
+                        f"Gas {daily_fee_spent}",
+                        f"Free {card.daily_free_fee_used}/{card.daily_free_fee_limit}",
+                    ]
+                )
+            ),
             "",
-            "<b>- Balance</b>",
-            html.escape(f"CC = {self._fmt_balance(card.balances.get('CC', Decimal('0')), 2)} CC"),
-            html.escape(f"USDCX = {self._fmt_balance(card.balances.get('USDCx', Decimal('0')), 4)} USDCX"),
-            html.escape(f"CBTC = {self._fmt_balance(card.balances.get('CBTC', Decimal('0')), 8)} CBTC"),
-            "",
-            "<b>- 24h</b>",
-            html.escape(f"Tx = [ ok: {daily_ok_tx} | fail: {daily_fail_tx} ]"),
-            html.escape(f"Free swap = {card.daily_free_fee_used}/{card.daily_free_fee_limit}"),
-            html.escape(f"Swap = {daily_swap_total}"),
-            html.escape(f"Volume = {self._format_24h_volume(summary)}"),
-            html.escape(f"Fee Spent = {daily_fee_spent}"),
-            "",
-            "<b>- Rewards</b>",
-            html.escape(f"Kemarin = {yesterday_rebate}"),
-            html.escape(f"Minggu ini = {this_week_rebate}"),
-            "",
-            "<b>- Stat From Bot Start</b>",
-            html.escape(f"Tx = [ ok: {lifetime_ok_tx} | fail: {lifetime_fail_tx} ]"),
-            html.escape(f"Swap = {lifetime_swap_total}"),
-            html.escape(f"Volume = {self._format_bot_start_volume(card)}"),
-            html.escape(f"Fee Spent = {lifetime_fee_spent}"),
         ]
 
     def _render_combined_logs(self) -> str:
         if not self._terminal_logs:
             return "-"
         return "\n".join(list(self._terminal_logs)[-8:])
+
+    def _render_combined_updates(self) -> list[str]:
+        if not self._terminal_logs:
+            return ["-"]
+        return [html.escape(f"• {entry}") for entry in list(self._terminal_logs)[-5:]]
 
     def _combined_status(self, card: TelegramCardState) -> str:
         mapping = {
@@ -946,6 +962,8 @@ class TelegramMonitor:
             "COMPLETED": "DONE",
             "FINISHED": "FINISHED",
         }
+        if card.phase == "STOPPED_INSUFFICIENT_BALANCE":
+            return "SALDO KURANG"
         if card.phase.startswith("FAILED"):
             return "FAILED"
         if card.phase.startswith("STOPPED"):
@@ -1265,7 +1283,7 @@ class TelegramMonitor:
             "STOPPED_MANUAL": "⛔ Manual Stop",
         }
         stop_mapping = {
-            "STOPPED_INSUFFICIENT_BALANCE": "⛔ Low Balance",
+            "STOPPED_INSUFFICIENT_BALANCE": "⛔ Saldo Kurang",
             "STOPPED_LOW_BALANCE_MODE_I": "⛔ Stop on Low Balance",
             "STOPPED_ROUND_AFFORDABILITY_CHECK_FAILED": "⛔ Round Not Affordable",
             "STOPPED_MIN_TICKET_SIZE": "⛔ Below Min Ticket",
