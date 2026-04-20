@@ -114,6 +114,7 @@ class BotRuntimeStateStore:
         *,
         strategy_name: str,
         requested_rounds: int,
+        prefer_requested_rounds: bool = False,
         now_utc: datetime | None = None,
     ) -> RoundSessionProgress:
         self._load()
@@ -121,29 +122,35 @@ class BotRuntimeStateStore:
         state = self._normalized_state(account_name, normalized_now, persist=False)
         stored_requested = max(int(state.active_requested_rounds), 0)
         stored_completed = min(max(int(state.active_completed_rounds), 0), stored_requested)
+        normalized_requested = max(int(requested_rounds), 1)
         if (
             state.active_strategy_name == strategy_name
             and stored_requested > 0
             and stored_completed < stored_requested
         ):
-            should_save = (
-                stored_completed != state.active_completed_rounds
-                or stored_requested != state.active_requested_rounds
+            effective_requested = (
+                normalized_requested
+                if prefer_requested_rounds and normalized_requested != stored_requested
+                else stored_requested
             )
-            state.active_requested_rounds = stored_requested
-            state.active_completed_rounds = stored_completed
+            effective_completed = min(stored_completed, effective_requested)
+            should_save = (
+                effective_completed != state.active_completed_rounds
+                or effective_requested != state.active_requested_rounds
+            )
+            state.active_requested_rounds = effective_requested
+            state.active_completed_rounds = effective_completed
             state.active_updated_at_utc = normalized_now.isoformat()
             self._accounts[account_name] = state
             if should_save:
                 self._save()
             return RoundSessionProgress(
                 strategy_name=strategy_name,
-                requested_rounds=stored_requested,
-                completed_rounds=stored_completed,
-                resumed=True,
+                requested_rounds=effective_requested,
+                completed_rounds=effective_completed,
+                resumed=effective_completed > 0,
             )
 
-        normalized_requested = max(int(requested_rounds), 1)
         state.active_strategy_name = strategy_name
         state.active_requested_rounds = normalized_requested
         state.active_completed_rounds = 0

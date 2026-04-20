@@ -158,6 +158,9 @@ class AutoswapBot:
             account.name,
             strategy_name=prepared_run.strategy_name,
             requested_rounds=prepared_run.rounds,
+            prefer_requested_rounds=(
+                account.rounds_range.min_value == account.rounds_range.max_value
+            ),
         )
         prepared_run = PreparedAccountRun(
             strategy_name=prepared_run.strategy_name,
@@ -213,6 +216,18 @@ class AutoswapBot:
                 )
                 result.completed_rounds = synced_completed_rounds
                 result.swap_transactions = synced_completed_rounds
+
+                if result.completed_rounds >= prepared_run.rounds:
+                    logger.info(
+                        "Target round startup sudah tercapai | progress=%s/%s",
+                        result.completed_rounds,
+                        prepared_run.rounds,
+                    )
+                    if self.config.runtime.full_24h_auto_restart:
+                        await self._wait_until_next_utc_day_after_quota(
+                            logger=logger,
+                            monitor_card=monitor_card,
+                        )
 
                 if account.auto_create_intent_account:
                     created = await sdk.ensure_intent_trading_account()
