@@ -36,20 +36,29 @@ class TelegramCardState:
     total_rounds: int
     pair_targets: dict[str, int]
     current_utc_date: str = ""
+    current_utc_week: str = ""
     day_index: int = 1
     daily_swap_base: int = 0
     daily_ok_tx_base: int = 0
     daily_fail_tx_base: int = 0
     daily_network_fee_base: dict[str, Decimal] = field(default_factory=dict)
+    daily_swap_fee_base: dict[str, Decimal] = field(default_factory=dict)
+    weekly_network_fee_base: dict[str, Decimal] = field(default_factory=dict)
+    weekly_swap_fee_base: dict[str, Decimal] = field(default_factory=dict)
     day_session_swap_offset: int = 0
     day_session_ok_tx_offset: int = 0
     day_session_fail_tx_offset: int = 0
     day_session_network_fee_offset: dict[str, Decimal] = field(default_factory=dict)
     day_session_free_network_fee_offset: dict[str, Decimal] = field(default_factory=dict)
+    day_session_swap_fee_offset: dict[str, Decimal] = field(default_factory=dict)
+    week_session_network_fee_offset: dict[str, Decimal] = field(default_factory=dict)
+    week_session_free_network_fee_offset: dict[str, Decimal] = field(default_factory=dict)
+    week_session_swap_fee_offset: dict[str, Decimal] = field(default_factory=dict)
     lifetime_swap_base: int = 0
     lifetime_ok_tx_base: int = 0
     lifetime_fail_tx_base: int = 0
     lifetime_network_fee_base: dict[str, Decimal] = field(default_factory=dict)
+    lifetime_swap_fee_base: dict[str, Decimal] = field(default_factory=dict)
     current_pair_key: str | None = None
     progress_completed_base: int = 0
     current_round_number: int = 0
@@ -83,15 +92,20 @@ class TelegramCardState:
 @dataclass
 class TelegramAccountTotals:
     current_utc_date: str = ""
+    current_utc_week: str = ""
     day_index: int = 1
     daily_swaps: int = 0
     daily_ok_tx: int = 0
     daily_fail_tx: int = 0
     daily_network_fee: dict[str, Decimal] = field(default_factory=dict)
+    daily_swap_fee: dict[str, Decimal] = field(default_factory=dict)
+    weekly_network_fee: dict[str, Decimal] = field(default_factory=dict)
+    weekly_swap_fee: dict[str, Decimal] = field(default_factory=dict)
     lifetime_swaps: int = 0
     lifetime_ok_tx: int = 0
     lifetime_fail_tx: int = 0
     lifetime_network_fee: dict[str, Decimal] = field(default_factory=dict)
+    lifetime_swap_fee: dict[str, Decimal] = field(default_factory=dict)
 
 
 class TelegramRateLimitError(RuntimeError):
@@ -162,15 +176,20 @@ class TelegramMonitor:
             total_rounds=prepared_run.rounds,
             pair_targets={},
             current_utc_date=persisted.current_utc_date,
+            current_utc_week=persisted.current_utc_week,
             day_index=persisted.day_index,
             daily_swap_base=persisted.daily_swaps,
             daily_ok_tx_base=persisted.daily_ok_tx,
             daily_fail_tx_base=persisted.daily_fail_tx,
             daily_network_fee_base=dict(persisted.daily_network_fee),
+            daily_swap_fee_base=dict(persisted.daily_swap_fee),
+            weekly_network_fee_base=dict(persisted.weekly_network_fee),
+            weekly_swap_fee_base=dict(persisted.weekly_swap_fee),
             lifetime_swap_base=persisted.lifetime_swaps,
             lifetime_ok_tx_base=persisted.lifetime_ok_tx,
             lifetime_fail_tx_base=persisted.lifetime_fail_tx,
             lifetime_network_fee_base=dict(persisted.lifetime_network_fee),
+            lifetime_swap_fee_base=dict(persisted.lifetime_swap_fee),
             balances={symbol: Decimal("0") for symbol in SYMBOL_SHORT},
             latest_logs=deque(maxlen=self.runtime.telegram_latest_logs_limit),
         )
@@ -572,7 +591,8 @@ class TelegramMonitor:
         local_now = datetime.now().astimezone()
         yesterday_total = self._aggregate_rebate_total(cards, "yesterday")
         this_week_total = self._aggregate_rebate_total(cards, "this_week")
-        paid_fee_total = self._aggregate_session_total_fee(cards)
+        paid_fee_today = self._aggregate_current_day_total_fee(cards)
+        paid_fee_week = self._aggregate_current_week_total_fee(cards)
         return [
             self._padded_line(
                 (
@@ -596,7 +616,11 @@ class TelegramMonitor:
                 row_width,
             ),
             self._padded_line(
-                f"Fee paid (run, excl free): {self._format_amount_map_display(paid_fee_total)}",
+                (
+                    "Fee paid (today | week, excl free): "
+                    f"{self._format_amount_map_display(paid_fee_today)} | "
+                    f"{self._format_amount_map_display(paid_fee_week)}"
+                ),
                 row_width,
             ),
             self._padded_line(
@@ -851,7 +875,8 @@ class TelegramMonitor:
         active_accounts = len(cards) - failed_accounts - stopped_accounts
         yesterday_total = self._aggregate_rebate_total(cards, "yesterday")
         this_week_total = self._aggregate_rebate_total(cards, "this_week")
-        paid_fee_total = self._aggregate_session_total_fee(cards)
+        paid_fee_today = self._aggregate_current_day_total_fee(cards)
+        paid_fee_week = self._aggregate_current_week_total_fee(cards)
         edited_at = datetime.now(timezone.utc).strftime("%H.%M.%S")
 
         sections = [
@@ -866,7 +891,9 @@ class TelegramMonitor:
             html.escape(f"🎁 Reward yesterday total: {self._format_cc_total(yesterday_total)}"),
             html.escape(f"🏆 Reward this week total: {self._format_cc_total(this_week_total)}"),
             html.escape(
-                f"💸 Fee paid total (run, excl free): {self._format_amount_map_display(paid_fee_total)}"
+                "💸 Fee paid total (today | week, excl free): "
+                f"{self._format_amount_map_display(paid_fee_today)} | "
+                f"{self._format_amount_map_display(paid_fee_week)}"
             ),
             "",
             "<b>📱 Ringkasan Akun</b>",
@@ -1064,11 +1091,15 @@ class TelegramMonitor:
         )
 
     def _build_fee_line(self, card: TelegramCardState) -> str:
-        paid_network_fee = self._session_paid_network_fee(card)
-        total_fee = self._merge_amount_maps(paid_network_fee, card.total_swap_fee)
+        today_fee = self._current_day_total_fee(card)
+        week_fee = self._current_week_total_fee(card)
+        total_fee = self._merge_amount_maps(
+            self._current_lifetime_network_fee(card),
+            self._current_lifetime_swap_fee(card),
+        )
         return (
-            f"Fees: Net {self._format_amount_map(paid_network_fee)} | "
-            f"Swap {self._format_amount_map(card.total_swap_fee)} | "
+            f"Fees: Today {self._format_amount_map(today_fee)} | "
+            f"Week {self._format_amount_map(week_fee)} | "
             f"Total {self._format_amount_map(total_fee)}"
         )
 
@@ -1387,16 +1418,54 @@ class TelegramMonitor:
             self._session_paid_network_fee(card),
         )
 
+    def _current_day_swap_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
+        session_today_swap_fee = self._subtract_amount_maps(
+            card.total_swap_fee,
+            card.day_session_swap_fee_offset,
+        )
+        return self._merge_amount_maps(card.daily_swap_fee_base, session_today_swap_fee)
+
+    def _current_lifetime_swap_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
+        return self._merge_amount_maps(
+            card.lifetime_swap_fee_base,
+            card.total_swap_fee,
+        )
+
+    def _current_week_swap_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
+        session_week_swap_fee = self._subtract_amount_maps(
+            card.total_swap_fee,
+            card.week_session_swap_fee_offset,
+        )
+        return self._merge_amount_maps(card.weekly_swap_fee_base, session_week_swap_fee)
+
     def _session_total_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
         return self._merge_amount_maps(
             self._session_paid_network_fee(card),
             card.total_swap_fee,
         )
 
-    def _aggregate_session_total_fee(self, cards: list[TelegramCardState]) -> dict[str, Decimal]:
+    def _current_day_total_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
+        return self._merge_amount_maps(
+            self._current_day_network_fee(card),
+            self._current_day_swap_fee(card),
+        )
+
+    def _current_week_total_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
+        return self._merge_amount_maps(
+            self._current_week_network_fee(card),
+            self._current_week_swap_fee(card),
+        )
+
+    def _aggregate_current_day_total_fee(self, cards: list[TelegramCardState]) -> dict[str, Decimal]:
         merged: dict[str, Decimal] = {}
         for card in cards:
-            merged = self._merge_amount_maps(merged, self._session_total_fee(card))
+            merged = self._merge_amount_maps(merged, self._current_day_total_fee(card))
+        return merged
+
+    def _aggregate_current_week_total_fee(self, cards: list[TelegramCardState]) -> dict[str, Decimal]:
+        merged: dict[str, Decimal] = {}
+        for card in cards:
+            merged = self._merge_amount_maps(merged, self._current_week_total_fee(card))
         return merged
 
     def _progress_completed_total(self, card: TelegramCardState) -> int:
@@ -1432,8 +1501,28 @@ class TelegramMonitor:
         )
         return self._merge_amount_maps(card.daily_network_fee_base, session_today_paid_fee)
 
+    def _current_week_network_fee(self, card: TelegramCardState) -> dict[str, Decimal]:
+        session_week_fee = self._subtract_amount_maps(
+            card.total_network_fee,
+            card.week_session_network_fee_offset,
+        )
+        session_week_free_fee = self._subtract_amount_maps(
+            card.free_network_fee_credit,
+            card.week_session_free_network_fee_offset,
+        )
+        session_week_paid_fee = self._subtract_amount_maps(
+            session_week_fee,
+            session_week_free_fee,
+        )
+        return self._merge_amount_maps(card.weekly_network_fee_base, session_week_paid_fee)
+
     def _utc_today(self) -> date:
         return datetime.now(timezone.utc).date()
+
+    def _utc_week_key(self, day_value: date | None = None) -> str:
+        target_day = day_value or self._utc_today()
+        iso_year, iso_week, _ = target_day.isocalendar()
+        return f"{iso_year}-W{iso_week:02d}"
 
     def _load_state(self) -> None:
         if self._state_loaded:
@@ -1448,17 +1537,45 @@ class TelegramMonitor:
             return
         accounts = raw.get("accounts", {})
         for account_name, payload in accounts.items():
+            current_utc_date = str(payload.get("current_utc_date", ""))
+            current_utc_week = str(payload.get("current_utc_week", ""))
+            daily_network_fee = self._deserialize_amount_map(payload.get("daily_network_fee"))
+            daily_swap_fee = self._deserialize_amount_map(payload.get("daily_swap_fee"))
+            weekly_network_fee = self._deserialize_amount_map(payload.get("weekly_network_fee"))
+            weekly_swap_fee = self._deserialize_amount_map(payload.get("weekly_swap_fee"))
+            if not current_utc_week and current_utc_date:
+                try:
+                    current_utc_week = self._utc_week_key(date.fromisoformat(current_utc_date))
+                except ValueError:
+                    current_utc_week = ""
+            if not weekly_network_fee and current_utc_date:
+                try:
+                    if self._utc_week_key(date.fromisoformat(current_utc_date)) == self._utc_week_key():
+                        weekly_network_fee = dict(daily_network_fee)
+                except ValueError:
+                    pass
+            if not weekly_swap_fee and current_utc_date:
+                try:
+                    if self._utc_week_key(date.fromisoformat(current_utc_date)) == self._utc_week_key():
+                        weekly_swap_fee = dict(daily_swap_fee)
+                except ValueError:
+                    pass
             self._account_totals[account_name] = TelegramAccountTotals(
-                current_utc_date=str(payload.get("current_utc_date", "")),
+                current_utc_date=current_utc_date,
+                current_utc_week=current_utc_week,
                 day_index=max(int(payload.get("day_index", 1)), 1),
                 daily_swaps=max(int(payload.get("daily_swaps", 0)), 0),
                 daily_ok_tx=max(int(payload.get("daily_ok_tx", 0)), 0),
                 daily_fail_tx=max(int(payload.get("daily_fail_tx", 0)), 0),
-                daily_network_fee=self._deserialize_amount_map(payload.get("daily_network_fee")),
+                daily_network_fee=daily_network_fee,
+                daily_swap_fee=daily_swap_fee,
+                weekly_network_fee=weekly_network_fee,
+                weekly_swap_fee=weekly_swap_fee,
                 lifetime_swaps=max(int(payload.get("lifetime_swaps", 0)), 0),
                 lifetime_ok_tx=max(int(payload.get("lifetime_ok_tx", 0)), 0),
                 lifetime_fail_tx=max(int(payload.get("lifetime_fail_tx", 0)), 0),
                 lifetime_network_fee=self._deserialize_amount_map(payload.get("lifetime_network_fee")),
+                lifetime_swap_fee=self._deserialize_amount_map(payload.get("lifetime_swap_fee")),
             )
         self._normalize_all_accounts()
 
@@ -1478,19 +1595,25 @@ class TelegramMonitor:
     def _normalized_totals(self, totals: TelegramAccountTotals) -> TelegramAccountTotals:
         today = self._utc_today()
         today_str = today.isoformat()
+        today_week = self._utc_week_key(today)
         if not totals.current_utc_date:
             totals.current_utc_date = today_str
+            totals.current_utc_week = today_week
             totals.day_index = max(totals.day_index, 1)
             return totals
         try:
             recorded_date = date.fromisoformat(totals.current_utc_date)
         except ValueError:
             totals.current_utc_date = today_str
+            totals.current_utc_week = today_week
             totals.day_index = max(totals.day_index, 1)
             totals.daily_swaps = 0
             totals.daily_ok_tx = 0
             totals.daily_fail_tx = 0
             totals.daily_network_fee = {}
+            totals.daily_swap_fee = {}
+            totals.weekly_network_fee = {}
+            totals.weekly_swap_fee = {}
             return totals
         day_gap = (today - recorded_date).days
         if day_gap > 0:
@@ -1500,66 +1623,95 @@ class TelegramMonitor:
             totals.daily_ok_tx = 0
             totals.daily_fail_tx = 0
             totals.daily_network_fee = {}
+            totals.daily_swap_fee = {}
         elif day_gap < 0:
             totals.current_utc_date = today_str
+        if totals.current_utc_week != today_week:
+            totals.current_utc_week = today_week
+            totals.weekly_network_fee = {}
+            totals.weekly_swap_fee = {}
         return totals
 
     def _rollover_card_if_needed(self, card: TelegramCardState) -> None:
         today_str = self._utc_today().isoformat()
+        today_week = self._utc_week_key()
         if not card.current_utc_date:
             card.current_utc_date = today_str
+            card.current_utc_week = today_week
             self._persist_card_state(card)
             return
-        if card.current_utc_date == today_str:
-            return
-        try:
-            recorded_date = date.fromisoformat(card.current_utc_date)
-        except ValueError:
-            recorded_date = self._utc_today()
-        day_gap = max((self._utc_today() - recorded_date).days, 0)
-        card.current_utc_date = today_str
-        card.day_index = max(card.day_index + max(day_gap, 1), 1)
-        card.daily_swap_base = 0
-        card.daily_ok_tx_base = 0
-        card.daily_fail_tx_base = 0
-        card.daily_network_fee_base = {}
-        card.day_session_swap_offset = card.swap_transactions
-        card.day_session_ok_tx_offset = card.tx_ok_count
-        card.day_session_fail_tx_offset = card.tx_fail_count
-        card.day_session_network_fee_offset = dict(card.total_network_fee)
-        card.day_session_free_network_fee_offset = dict(card.free_network_fee_credit)
-        self._persist_card_state(card)
+        changed = False
+        if card.current_utc_date != today_str:
+            try:
+                recorded_date = date.fromisoformat(card.current_utc_date)
+            except ValueError:
+                recorded_date = self._utc_today()
+            day_gap = max((self._utc_today() - recorded_date).days, 0)
+            card.current_utc_date = today_str
+            card.day_index = max(card.day_index + max(day_gap, 1), 1)
+            card.daily_swap_base = 0
+            card.daily_ok_tx_base = 0
+            card.daily_fail_tx_base = 0
+            card.daily_network_fee_base = {}
+            card.daily_swap_fee_base = {}
+            card.day_session_swap_offset = card.swap_transactions
+            card.day_session_ok_tx_offset = card.tx_ok_count
+            card.day_session_fail_tx_offset = card.tx_fail_count
+            card.day_session_network_fee_offset = dict(card.total_network_fee)
+            card.day_session_free_network_fee_offset = dict(card.free_network_fee_credit)
+            card.day_session_swap_fee_offset = dict(card.total_swap_fee)
+            changed = True
+        if card.current_utc_week != today_week:
+            card.current_utc_week = today_week
+            card.weekly_network_fee_base = {}
+            card.weekly_swap_fee_base = {}
+            card.week_session_network_fee_offset = dict(card.total_network_fee)
+            card.week_session_free_network_fee_offset = dict(card.free_network_fee_credit)
+            card.week_session_swap_fee_offset = dict(card.total_swap_fee)
+            changed = True
+        if changed:
+            self._persist_card_state(card)
 
     def _persist_card_state(self, card: TelegramCardState) -> None:
         totals = self._get_account_totals(card.account_name)
         totals.current_utc_date = card.current_utc_date or self._utc_today().isoformat()
+        totals.current_utc_week = card.current_utc_week or self._utc_week_key()
         totals.day_index = max(card.day_index, 1)
         totals.daily_swaps = self._current_day_swap_total(card)
         totals.daily_ok_tx = self._current_day_ok_tx_total(card)
         totals.daily_fail_tx = self._current_day_fail_tx_total(card)
         totals.daily_network_fee = self._current_day_network_fee(card)
+        totals.daily_swap_fee = self._current_day_swap_fee(card)
+        totals.weekly_network_fee = self._current_week_network_fee(card)
+        totals.weekly_swap_fee = self._current_week_swap_fee(card)
         totals.lifetime_swaps = card.lifetime_swap_base + card.swap_transactions
         totals.lifetime_ok_tx = self._lifetime_ok_tx_total(card)
         totals.lifetime_fail_tx = self._lifetime_fail_tx_total(card)
         totals.lifetime_network_fee = self._current_lifetime_network_fee(card)
+        totals.lifetime_swap_fee = self._current_lifetime_swap_fee(card)
         self._account_totals[card.account_name] = totals
         self._save_state()
 
     def _save_state(self) -> None:
         payload = {
-            "version": 1,
+            "version": 3,
             "accounts": {
                 account_name: {
                     "current_utc_date": totals.current_utc_date,
+                    "current_utc_week": totals.current_utc_week,
                     "day_index": totals.day_index,
                     "daily_swaps": totals.daily_swaps,
                     "daily_ok_tx": totals.daily_ok_tx,
                     "daily_fail_tx": totals.daily_fail_tx,
                     "daily_network_fee": self._serialize_amount_map(totals.daily_network_fee),
+                    "daily_swap_fee": self._serialize_amount_map(totals.daily_swap_fee),
+                    "weekly_network_fee": self._serialize_amount_map(totals.weekly_network_fee),
+                    "weekly_swap_fee": self._serialize_amount_map(totals.weekly_swap_fee),
                     "lifetime_swaps": totals.lifetime_swaps,
                     "lifetime_ok_tx": totals.lifetime_ok_tx,
                     "lifetime_fail_tx": totals.lifetime_fail_tx,
                     "lifetime_network_fee": self._serialize_amount_map(totals.lifetime_network_fee),
+                    "lifetime_swap_fee": self._serialize_amount_map(totals.lifetime_swap_fee),
                 }
                 for account_name, totals in sorted(self._account_totals.items())
             },
