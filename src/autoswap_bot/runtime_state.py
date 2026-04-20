@@ -123,11 +123,7 @@ class BotRuntimeStateStore:
         stored_requested = max(int(state.active_requested_rounds), 0)
         stored_completed = min(max(int(state.active_completed_rounds), 0), stored_requested)
         normalized_requested = max(int(requested_rounds), 1)
-        if (
-            state.active_strategy_name == strategy_name
-            and stored_requested > 0
-            and stored_completed < stored_requested
-        ):
+        if state.active_strategy_name == strategy_name and stored_requested > 0:
             effective_requested = (
                 normalized_requested
                 if prefer_requested_rounds and normalized_requested != stored_requested

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import sys
 import time
 from collections import defaultdict
@@ -184,12 +185,6 @@ class AutoswapBot:
         try:
             async with sdk:
                 await self.monitor.attach_card(monitor_card)
-                if result.completed_rounds > 0:
-                    await self.monitor.sync_round_progress(
-                        monitor_card,
-                        completed_rounds=result.completed_rounds,
-                        force=True,
-                    )
                 logger.info("Autentikasi dimulai | sesi=%s", session_number)
                 await self.monitor.log_event(
                     monitor_card,
@@ -198,6 +193,28 @@ class AutoswapBot:
                 )
                 await sdk.authenticate(force=True)
                 logger.info("Autentikasi sukses | sesi=%s", session_number)
+                info = await sdk.get_account_info()
+                self._log_balances(logger, info, "Balance awal")
+                await self.monitor.update_balances(
+                    monitor_card,
+                    self._balances_by_symbol(info),
+                    force=True,
+                )
+                baseline_activity = await self._fetch_activity_summary(sdk, logger)
+                result.activity_summary = baseline_activity
+                await self.monitor.update_activity(
+                    monitor_card,
+                    baseline_activity,
+                    force=True,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"🗓️ Ready for {prepared_run.rounds} swap rounds",
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"ðŸ§­ Startup mode: {self._startup_mode_label()}",
+                )
                 await self._sync_daily_free_fee_state_from_history(
                     sdk=sdk,
                     account_name=account.name,
@@ -243,7 +260,6 @@ class AutoswapBot:
                     raise RuntimeError(intent_mismatch)
 
                 admin = await sdk.get_account_admin()
-                info = await sdk.get_account_info()
                 instruments_by_symbol = self._resolve_instruments(admin.instruments, info)
                 router = RouteOptimizer(
                     sdk,
@@ -395,7 +411,6 @@ class AutoswapBot:
                             phase=f"STOPPED_{result.stop_reason}",
                         )
                     else:
-                        self.runtime_state.clear_round_session(account.name)
                         await self.monitor.log_event(
                             monitor_card,
                             "🏁 Session completed",
@@ -876,6 +891,24 @@ class AutoswapBot:
                 skipped=True,
             )
 
+        if self._strategy_4_has_cc_topup_capacity(account=account, monitor_card=monitor_card):
+            self._reset_balance_block_counter(strategy_state)
+            logger.info(
+                "Saldo akun %s masih cukup untuk top-up CC->USDCx, tidak dihentikan sebagai saldo kurang",
+                account.name,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                f"ℹ️ Round {round_number} pending: CC masih cukup untuk top-up, lanjut retry",
+                force=True,
+            )
+            return RoundExecutionResult(
+                completed=False,
+                tx_count=tx_count,
+                stop_reason=stop_reason,
+                skipped=True,
+            )
+
         strategy_state.consecutive_balance_blocked_rounds += 1
         blocked_rounds = strategy_state.consecutive_balance_blocked_rounds
         if blocked_rounds <= MAX_CONSECUTIVE_BALANCE_BLOCKED_ROUNDS:
@@ -905,6 +938,24 @@ class AutoswapBot:
             stop_reason="INSUFFICIENT_BALANCE",
             skipped=False,
         )
+
+    def _strategy_4_has_cc_topup_capacity(
+        self,
+        *,
+        account: AccountConfig,
+        monitor_card: TelegramCardState | None,
+    ) -> bool:
+        if account.strategy().key != "strategy_4_reserve" or monitor_card is None:
+            return False
+        balances = monitor_card.balances
+        cc_balance = balances.get(CC_SYMBOL, Decimal("0"))
+        reserve_fee = self._strategy_4_reserve_fee(account)
+        spendable_cc = self._spendable_amount(CC_SYMBOL, cc_balance, reserve_fee)
+        required_cc = max(
+            account.amount_range_for_symbol(CC_SYMBOL).min_value,
+            MIN_TICKET_SIZE_CC,
+        )
+        return spendable_cc >= required_cc
 
     async def _execute_round(
         self,
@@ -3374,7 +3425,11 @@ class AutoswapBot:
             )
             return synced_completed_rounds
 
-        synced_completed_rounds = min(max(history_today_count, 0), prepared_run.rounds)
+        history_completed_rounds = min(max(history_today_count, 0), prepared_run.rounds)
+        synced_completed_rounds = max(
+            min(max(int(fallback_completed_rounds), 0), prepared_run.rounds),
+            history_completed_rounds,
+        )
         self.runtime_state.update_round_session_progress(
             account.name,
             strategy_name=prepared_run.strategy_name,
@@ -3388,9 +3443,10 @@ class AutoswapBot:
         )
         if force_log or synced_completed_rounds != fallback_completed_rounds:
             logger.info(
-                "Round sync | source=%s | history_swap_hari_ini=%s | progress=%s/%s",
+                "Round sync | source=%s | history_swap_hari_ini=%s | fallback=%s | progress=%s/%s",
                 source_path or "-",
                 history_today_count,
+                fallback_completed_rounds,
                 synced_completed_rounds,
                 prepared_run.rounds,
             )
@@ -3398,6 +3454,12 @@ class AutoswapBot:
                 monitor_card,
                 f"🔁 Round sync from history: {synced_completed_rounds}/{prepared_run.rounds}",
                 force=force_log,
+            )
+        if history_completed_rounds < fallback_completed_rounds:
+            logger.info(
+                "Round sync menjaga progress lokal | history=%s < local=%s",
+                history_completed_rounds,
+                fallback_completed_rounds,
             )
         return synced_completed_rounds
 
