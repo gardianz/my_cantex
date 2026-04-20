@@ -46,6 +46,21 @@ class ExtendedCantexSDK(CantexSDK):
                 continue
         return None, None
 
+    async def get_funding_history_payload(self) -> tuple[str | None, Any | None]:
+        candidates = (
+            "/v1/history/funding",
+        )
+        for path in candidates:
+            try:
+                return path, await self._request("GET", path)  # type: ignore[attr-defined]
+            except CantexAPIError as exc:
+                if exc.status in {404, 405}:
+                    continue
+                raise
+            except json.JSONDecodeError:
+                continue
+        return None, None
+
     async def get_account_admin_payload(self) -> dict[str, Any]:
         return await self._request("GET", "/v1/account/admin")  # type: ignore[attr-defined]
 

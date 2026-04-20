@@ -75,6 +75,7 @@ class AccountPlan:
 class ActivitySummary:
     source_path: str | None = None
     history_source_path: str | None = None
+    funding_source_path: str | None = None
     swaps_24h: str | None = None
     volume_24h: str | None = None
     volume_24h_usd: str | None = None
@@ -88,6 +89,9 @@ class ActivitySummary:
     tx_count: str | None = None
     rank: str | None = None
     volume_usd: str | None = None
+    distributed_reward: str | None = None
+    distributed_update_id: str | None = None
+    distributed_timestamp: str | None = None
     rebates: dict[str, str] = field(default_factory=dict)
     recent_items: tuple[str, ...] = ()
     raw_preview: str | None = None

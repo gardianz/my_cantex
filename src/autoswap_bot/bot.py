@@ -3481,6 +3481,12 @@ class AutoswapBot:
         return None
 
     def _extract_trading_history_items(self, payload: Any) -> list[dict[str, Any]]:
+        return self._extract_timestamped_history_items(payload)
+
+    def _extract_funding_history_items(self, payload: Any) -> list[dict[str, Any]]:
+        return self._extract_timestamped_history_items(payload)
+
+    def _extract_timestamped_history_items(self, payload: Any) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
 
         def visit(node: Any) -> None:
@@ -3504,6 +3510,97 @@ class AutoswapBot:
 
         visit(payload)
         return items
+
+    def _extract_distributed_reward_from_funding_history(
+        self,
+        payload: Any,
+    ) -> tuple[str | None, str | None, str | None]:
+        if payload is None:
+            return None, None, None
+
+        matched_item: dict[str, Any] | None = None
+        matched_timestamp: datetime | None = None
+        for item in self._extract_funding_history_items(payload):
+            if not self._is_distributed_reward_funding_item(item):
+                continue
+            item_timestamp = self._extract_item_timestamp(item)
+            if matched_item is None:
+                matched_item = item
+                matched_timestamp = item_timestamp
+                continue
+            if item_timestamp is not None and (
+                matched_timestamp is None or item_timestamp > matched_timestamp
+            ):
+                matched_item = item
+                matched_timestamp = item_timestamp
+
+        if matched_item is None:
+            return None, None, None
+
+        distributed_amount = self._extract_funding_amount_text(matched_item)
+        distributed_update_id = self._extract_history_identity(
+            matched_item,
+            keys=("update_id", "updateId", "updateID", "id", "transaction_id", "transactionId"),
+        )
+        distributed_timestamp = (
+            matched_timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+            if matched_timestamp is not None
+            else None
+        )
+        return distributed_amount, distributed_update_id, distributed_timestamp
+
+    def _is_distributed_reward_funding_item(self, item: dict[str, Any]) -> bool:
+        if self._is_failed_history_item(item):
+            return False
+
+        type_text = str(
+            self._find_value(item, {"type", "transaction_type", "kind"}) or ""
+        ).strip().lower()
+        if type_text and "deposit" not in type_text:
+            return False
+
+        status_text = str(
+            self._find_value(item, {"status", "state", "result"}) or ""
+        ).strip().lower()
+        if status_text and not any(
+            token in status_text for token in ("complete", "completed", "confirm", "success", "paid")
+        ):
+            return False
+
+        counterparty_text = str(
+            self._find_value(item, {"counterparty", "sender", "from", "source"}) or ""
+        ).strip().lower()
+        message_text = str(
+            self._find_value(item, {"message", "memo", "description", "note"}) or ""
+        ).strip().lower()
+        return (
+            "cantex-rewards" in counterparty_text
+            or "cantex app rebate" in message_text
+        )
+
+    def _extract_funding_amount_text(self, item: dict[str, Any]) -> str | None:
+        raw_amount = self._find_value(
+            item,
+            {"amount", "display_amount", "cc_amount", "amount_cc", "quantity"},
+        )
+        if raw_amount in {None, ""}:
+            return None
+        parsed_amount = self._parse_decimal_like(raw_amount)
+        if parsed_amount is None:
+            return self._stringify_optional(raw_amount)
+        return f"{self._compact_decimal_text(abs(parsed_amount), places=4)} CC"
+
+    def _extract_history_identity(
+        self,
+        item: dict[str, Any],
+        *,
+        keys: tuple[str, ...],
+    ) -> str | None:
+        for key in keys:
+            raw_value = self._find_value(item, {key})
+            if raw_value not in {None, ""}:
+                return str(raw_value).strip()
+        return None
 
     def _extract_item_timestamp(self, item: dict[str, Any]) -> datetime | None:
         for key in (
@@ -3547,6 +3644,17 @@ class AutoswapBot:
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
+
+    def _parse_decimal_like(self, value: Any) -> Decimal | None:
+        if value in {None, ""}:
+            return None
+        cleaned = re.sub(r"[^0-9eE+.\-]+", "", str(value))
+        if cleaned in {"", "-", ".", "-."}:
+            return None
+        try:
+            return Decimal(cleaned)
+        except Exception:
+            return None
 
     def _is_failed_history_item(self, item: dict[str, Any]) -> bool:
         status_parts = [
@@ -3674,6 +3782,8 @@ class AutoswapBot:
         activity_payload: Any | None = None
         history_source_path: str | None = None
         history_payload: Any | None = None
+        funding_source_path: str | None = None
+        funding_payload: Any | None = None
 
         try:
             activity_source_path, activity_payload = await sdk.get_activity_payload()
@@ -3683,8 +3793,12 @@ class AutoswapBot:
             history_source_path, history_payload = await sdk.get_trading_history_payload()
         except Exception as exc:
             logger.warning("Gagal mengambil trading history: %s", exc)
+        try:
+            funding_source_path, funding_payload = await sdk.get_funding_history_payload()
+        except Exception as exc:
+            logger.warning("Gagal mengambil funding history: %s", exc)
 
-        if activity_payload is None and history_payload is None:
+        if activity_payload is None and history_payload is None and funding_payload is None:
             logger.info("Activity user tidak tersedia dari endpoint yang dicoba")
             return None
 
@@ -3693,6 +3807,8 @@ class AutoswapBot:
             payload=activity_payload,
             history_source_path=history_source_path,
             history_payload=history_payload,
+            funding_source_path=funding_source_path,
+            funding_payload=funding_payload,
         )
         self._log_activity_summary(logger, summary)
         return summary
@@ -3704,6 +3820,8 @@ class AutoswapBot:
         payload: Any | None,
         history_source_path: str | None,
         history_payload: Any | None,
+        funding_source_path: str | None,
+        funding_payload: Any | None,
     ) -> ActivitySummary:
         if (
             isinstance(payload, dict)
@@ -3715,9 +3833,13 @@ class AutoswapBot:
                 payload=payload,
                 history_source_path=history_source_path,
                 history_payload=history_payload,
+                funding_source_path=funding_source_path,
+                funding_payload=funding_payload,
             )
 
         effective_payload = payload if payload is not None else history_payload
+        if effective_payload is None:
+            effective_payload = funding_payload
         if effective_payload is None:
             return ActivitySummary()
 
@@ -3740,10 +3862,14 @@ class AutoswapBot:
                 rebates[str(label)] = self._stringify_value(value)
 
         recent_items = self._extract_recent_items(history_payload if history_payload is not None else effective_payload)
+        distributed_reward, distributed_update_id, distributed_timestamp = (
+            self._extract_distributed_reward_from_funding_history(funding_payload)
+        )
         raw_preview = json.dumps(effective_payload, default=str)[:400]
         return ActivitySummary(
             source_path=source_path,
             history_source_path=history_source_path,
+            funding_source_path=funding_source_path,
             swaps_7d=self._stringify_optional(swaps_7d),
             volume_7d=self._stringify_optional(volume_7d),
             total_swaps=self._stringify_optional(total_swaps),
@@ -3752,6 +3878,9 @@ class AutoswapBot:
             tx_count=self._stringify_optional(tx_count),
             rank=self._stringify_optional(rank),
             volume_usd=self._stringify_optional(volume_usd),
+            distributed_reward=distributed_reward,
+            distributed_update_id=distributed_update_id,
+            distributed_timestamp=distributed_timestamp,
             rebates=rebates,
             recent_items=tuple(recent_items[: self.config.runtime.activity_items_limit]),
             raw_preview=raw_preview,
@@ -3764,6 +3893,8 @@ class AutoswapBot:
         payload: dict[str, Any],
         history_source_path: str | None,
         history_payload: Any | None,
+        funding_source_path: str | None,
+        funding_payload: Any | None,
     ) -> ActivitySummary:
         stats = payload.get("stats") or {}
         rebates_payload = payload.get("rebates") or {}
@@ -3783,18 +3914,24 @@ class AutoswapBot:
 
         recent_items = self._extract_recent_trading_items(history_payload)
         history_preview = self._extract_trading_history_items(history_payload)[:2] if history_payload is not None else []
+        funding_preview = self._extract_funding_history_items(funding_payload)[:2] if funding_payload is not None else []
         raw_preview = json.dumps(
             {
                 "reward_activity": payload,
                 "history_trading": history_preview,
+                "history_funding": funding_preview,
             },
             default=str,
         )[:400]
         this_week_rebate = rebates_payload.get("this_week") if isinstance(rebates_payload, dict) else None
+        distributed_reward, distributed_update_id, distributed_timestamp = (
+            self._extract_distributed_reward_from_funding_history(funding_payload)
+        )
 
         return ActivitySummary(
             source_path=source_path,
             history_source_path=history_source_path,
+            funding_source_path=funding_source_path,
             swaps_24h=self._stringify_optional(stats.get("count_24h")),
             volume_24h=self._stringify_optional(stats.get("cc_volume_24h")),
             volume_24h_usd=self._stringify_optional(
@@ -3810,6 +3947,9 @@ class AutoswapBot:
             total_volume=self._stringify_optional(stats.get("cc_volume_alltime")),
             reward_total=self._extract_rebate_cc_amount(this_week_rebate),
             tx_count=self._stringify_optional(stats.get("count_alltime")),
+            distributed_reward=distributed_reward,
+            distributed_update_id=distributed_update_id,
+            distributed_timestamp=distributed_timestamp,
             rebates=rebates,
             recent_items=tuple(recent_items[: self.config.runtime.activity_items_limit]),
             raw_preview=raw_preview,
@@ -3971,8 +4111,17 @@ class AutoswapBot:
         )
         if summary.history_source_path:
             logger.info("Trading history | source=%s", summary.history_source_path)
+        if summary.funding_source_path:
+            logger.info("Funding history | source=%s", summary.funding_source_path)
         if summary.rebates:
             logger.info("Activity rebates | %s", self._format_text_map(summary.rebates))
+        if summary.distributed_reward is not None:
+            logger.info(
+                "Distributed reward | amount=%s | update_id=%s | timestamp=%s",
+                summary.distributed_reward,
+                summary.distributed_update_id or "-",
+                summary.distributed_timestamp or "-",
+            )
         for item in summary.recent_items:
             logger.info("Trading recent | %s", item)
 

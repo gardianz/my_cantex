@@ -545,17 +545,17 @@ class TelegramMonitor:
         self._terminal_last_render_monotonic = now
 
     def _dashboard_col_widths(self) -> tuple[int, ...]:
-        return (12, 9, 10, 10, 12, 12, 24, 22, 64)
+        return (12, 9, 10, 10, 12, 12, 24, 22, 12, 64)
 
     def _dashboard_table_lines(self, cards: list[TelegramCardState]) -> tuple[tuple[int, ...], list[str]]:
         col_widths = self._dashboard_col_widths()
         lines = [
             self._table_row(
-                ("Akun", "Status", "CC", "USDCx", "CBTC", "Progress", "Plan", "Fee Route", "Metrics"),
+                ("Akun", "Status", "CC", "USDCx", "CBTC", "Progress", "Plan", "Fee Route", "Distributed", "Metrics"),
                 col_widths,
             ),
             self._table_row(
-                ("", "", "", "", "", "", "", "", self._dashboard_metrics_header()),
+                ("", "", "", "", "", "", "", "", "", self._dashboard_metrics_header()),
                 col_widths,
             ),
             self._table_row(
@@ -575,6 +575,7 @@ class TelegramMonitor:
                         self._dashboard_progress(card),
                         self._dashboard_plan(card),
                         self._dashboard_route_fee(card),
+                        self._dashboard_distributed(card),
                         self._dashboard_metrics(card),
                     ),
                     col_widths,
@@ -591,6 +592,7 @@ class TelegramMonitor:
         local_now = datetime.now().astimezone()
         yesterday_total = self._aggregate_rebate_total(cards, "yesterday")
         this_week_total = self._aggregate_rebate_total(cards, "this_week")
+        distributed_total = self._aggregate_distributed_total(cards)
         paid_fee_today = self._aggregate_current_day_total_fee(cards)
         paid_fee_week = self._aggregate_current_week_total_fee(cards)
         return [
@@ -613,6 +615,10 @@ class TelegramMonitor:
                     f"Rewards | yesterday: {self._format_cc_total(yesterday_total)} | "
                     f"this week: {self._format_cc_total(this_week_total)}"
                 ),
+                row_width,
+            ),
+            self._padded_line(
+                f"Reward distributed total: {self._format_cc_total(distributed_total)}",
                 row_width,
             ),
             self._padded_line(
@@ -705,6 +711,12 @@ class TelegramMonitor:
         if network_fee == "-":
             return f"S {swap_fee}"
         return f"N {network_fee} / S {swap_fee}"
+
+    def _dashboard_distributed(self, card: TelegramCardState) -> str:
+        summary = card.activity_summary
+        if summary is None:
+            return "-"
+        return self._distributed_amount_compact(summary.distributed_reward)
 
     def _dashboard_metrics(self, card: TelegramCardState) -> str:
         summary = card.activity_summary
@@ -875,6 +887,7 @@ class TelegramMonitor:
         active_accounts = len(cards) - failed_accounts - stopped_accounts
         yesterday_total = self._aggregate_rebate_total(cards, "yesterday")
         this_week_total = self._aggregate_rebate_total(cards, "this_week")
+        distributed_total = self._aggregate_distributed_total(cards)
         paid_fee_today = self._aggregate_current_day_total_fee(cards)
         paid_fee_week = self._aggregate_current_week_total_fee(cards)
         edited_at = datetime.now(timezone.utc).strftime("%H.%M.%S")
@@ -890,6 +903,7 @@ class TelegramMonitor:
             ),
             html.escape(f"🎁 Reward yesterday total: {self._format_cc_total(yesterday_total)}"),
             html.escape(f"🏆 Reward this week total: {self._format_cc_total(this_week_total)}"),
+            html.escape(f"💰 Reward distributed total: {self._format_cc_total(distributed_total)}"),
             html.escape(
                 "💸 Fee paid total (today | week, excl free): "
                 f"{self._format_amount_map_display(paid_fee_today)} | "
@@ -940,6 +954,7 @@ class TelegramMonitor:
         summary = card.activity_summary
         yesterday_rebate = self._rebate_amount(summary.rebates.get("yesterday")) if summary else "-"
         this_week_rebate = self._rebate_amount(summary.rebates.get("this_week")) if summary else "-"
+        distributed_rebate = self._distributed_amount(summary.distributed_reward) if summary else "-"
         daily_fee_spent = self._format_amount_map_display(self._current_day_network_fee(card))
         activity_24h = self._dashboard_24h_activity(summary)
         progress = self._dashboard_progress(card)
@@ -963,6 +978,7 @@ class TelegramMonitor:
                         f"24h {activity_24h}",
                         f"Y {yesterday_rebate}",
                         f"W {this_week_rebate}",
+                        f"Dist {distributed_rebate}",
                         f"Gas {daily_fee_spent}",
                         f"Free {card.daily_free_fee_used}/{card.daily_free_fee_limit}",
                     ]
@@ -1135,13 +1151,17 @@ class TelegramMonitor:
 
     def _build_rebates_line(self, card: TelegramCardState) -> str:
         summary = card.activity_summary
+        distributed = self._distributed_amount(
+            summary.distributed_reward if summary is not None else None
+        )
         if summary is None or not summary.rebates:
-            return "💸 CC Rebates: Yesterday - | This Week - | Last Week -"
+            return f"💸 CC Rebates: Yesterday - | This Week - | Last Week - | Distributed {distributed}"
         return (
             "💸 CC Rebates: "
             f"Yesterday {self._rebate_amount(summary.rebates.get('yesterday'))} | "
             f"This Week {self._rebate_amount(summary.rebates.get('this_week'))} | "
-            f"Last Week {self._rebate_amount(summary.rebates.get('last_week'))}"
+            f"Last Week {self._rebate_amount(summary.rebates.get('last_week'))} | "
+            f"Distributed {distributed}"
         )
 
     def _timestamped_log(self, message: str) -> str:
@@ -1295,6 +1315,15 @@ class TelegramMonitor:
             return rendered
         return rendered.removesuffix(" CC")
 
+    def _distributed_amount(self, value: str | None) -> str:
+        return self._rebate_amount(value)
+
+    def _distributed_amount_compact(self, value: str | None) -> str:
+        rendered = self._distributed_amount(value)
+        if rendered == "-":
+            return rendered
+        return rendered.removesuffix(" CC")
+
     def _aggregate_rebate_total(self, cards: list[TelegramCardState], rebate_key: str) -> Decimal | None:
         total = Decimal("0")
         found = False
@@ -1304,6 +1333,21 @@ class TelegramMonitor:
                 continue
             rebate_value = self._rebate_amount(summary.rebates.get(rebate_key))
             decimal_value = self._to_decimal_like(rebate_value)
+            if decimal_value is None:
+                continue
+            total += decimal_value
+            found = True
+        return total if found else None
+
+    def _aggregate_distributed_total(self, cards: list[TelegramCardState]) -> Decimal | None:
+        total = Decimal("0")
+        found = False
+        for card in cards:
+            summary = card.activity_summary
+            if summary is None:
+                continue
+            distributed_value = self._distributed_amount(summary.distributed_reward)
+            decimal_value = self._to_decimal_like(distributed_value)
             if decimal_value is None:
                 continue
             total += decimal_value
