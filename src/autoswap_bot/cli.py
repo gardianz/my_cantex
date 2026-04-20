@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 
 from .bot import AutoswapBot, configure_logging, summarize_results
+from .estimator import render_required_cc_report
 from .config import load_config
 from .env_loader import load_dotenv_file
 
@@ -17,6 +18,7 @@ STARTUP_MODE_CHOICES = {
     "2": "free_then_swap",
     "3": "swap_only",
     "4": "planned_fee",
+    "5": "estimate_cc",
 }
 
 
@@ -36,9 +38,10 @@ def _prompt_startup_mode() -> str:
     )
     print("3. Mode swap sesuai batas swap dan fee swap yang ditentukan", flush=True)
     print("4. Mode swap sesuai jam plan dan batas fee yang ditentukan", flush=True)
+    print("5. Mode hitung estimasi kebutuhan CC dari config saat ini", flush=True)
 
     while True:
-        print("Masukkan pilihan (1/2/3/4): ", end="", flush=True)
+        print("Masukkan pilihan (1/2/3/4/5): ", end="", flush=True)
         try:
             answer = input().strip()
         except EOFError:
@@ -110,6 +113,9 @@ async def _run(config_path: str, interrupt_controller: InterruptController) -> i
     load_dotenv_file(repo_root / ".env")
     config = load_config(config_path)
     startup_mode = _prompt_startup_mode()
+    if startup_mode == "estimate_cc":
+        print(render_required_cc_report(config), flush=True)
+        return 0
     configure_logging(
         config.runtime.log_level,
         use_utc=True,

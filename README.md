@@ -386,12 +386,13 @@ Catatan:
 
 Bot sekarang selalu berjalan dalam mode 24 jam.
 
-Saat bot dijalankan, akan muncul 4 pilihan mode startup:
+Saat bot dijalankan, akan muncul 5 pilihan mode startup:
 
 1. `Mode hanya ambil free swap`
 2. `Mode ambil free swap lalu lanjut swap sesuai batas swap dan fee swap yang ditentukan`
 3. `Mode swap sesuai batas swap dan fee swap yang ditentukan`
 4. `Mode swap sesuai jam plan dan batas fee yang ditentukan`
+5. `Mode hitung estimasi kebutuhan CC dari config saat ini`
 
 Arti mode:
 
@@ -408,6 +409,13 @@ Arti mode:
 - Mode `4`
   - Bot memakai plan jadwal random dalam window harian UTC
   - Fee cap tetap berlaku
+- Mode `5`
+  - Bot tidak menjalankan swap
+  - Bot hanya menghitung estimasi kebutuhan `CC` per account dari config aktif
+  - Dasar hitung utamanya: `rounds.max`, `reserve_fee`, `reserve_kritis`, `amounts.CC.max`, `strategy`, dan `max_network_fee_cc_per_execution`
+  - Estimasi memakai angka konservatif
+  - Benefit `free swap` harian tidak dikurangkan
+  - Trading history yang saat ini dipakai bot belum memberi breakdown fee terpisah per trade, jadi mode ini tidak memakai fee real dari history sebagai sumber utama
 
 Perilaku umum mode 24 jam:
 

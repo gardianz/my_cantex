@@ -109,6 +109,7 @@ class AccountResult:
     used_swap_fee_by_symbol: dict[str, Decimal] = field(default_factory=dict)
     final_balances: dict[str, Decimal] = field(default_factory=dict)
     activity_summary: ActivitySummary | None = None
+    retry_after_seconds: float | None = None
 
     @property
     def ok(self) -> bool:

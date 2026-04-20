@@ -123,6 +123,14 @@ class AutoswapBot:
                 logger=logger,
                 session_number=session_number,
             )
+            if last_result.retry_after_seconds is not None:
+                logger.info(
+                    "Sesi %s retry dalam %.0f detik",
+                    session_number,
+                    last_result.retry_after_seconds,
+                )
+                await self._sleep_or_stop(last_result.retry_after_seconds)
+                continue
             if (
                 not self.config.runtime.full_24h_mode
                 or not self.config.runtime.full_24h_auto_restart
@@ -391,6 +399,15 @@ class AutoswapBot:
             )
             await self.monitor.finalize(monitor_card, phase="STOPPED_MANUAL")
         except (CantexAuthError, CantexAPIError, CantexTimeoutError) as exc:
+            if self._is_retryable_session_error(exc):
+                await self._mark_retryable_session_error(
+                    result=result,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    exc=exc,
+                    session_number=session_number,
+                )
+                return result
             result.error = str(exc)
             logger.error("Eksekusi gagal: %s", exc)
             await self.monitor.log_event(
@@ -400,6 +417,15 @@ class AutoswapBot:
             )
             await self.monitor.finalize(monitor_card, phase="FAILED")
         except Exception as exc:  # pragma: no cover - runtime guard
+            if self._is_retryable_session_error(exc):
+                await self._mark_retryable_session_error(
+                    result=result,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    exc=exc,
+                    session_number=session_number,
+                )
+                return result
             result.error = str(exc)
             logger.exception("Error tak terduga: %s", exc)
             await self.monitor.log_event(
@@ -1384,13 +1410,19 @@ class AutoswapBot:
         sell_symbol = "-"
         buy_symbol = "-"
         pair_key = "-"
+        balances: dict[str, Decimal] = {symbol: Decimal("0") for symbol in TRACKED_SYMBOLS}
+        balances_before_round: dict[str, Decimal] = {}
         selected_action: StrategyAction | None = None
         daily_free_fee_status: DailyFreeFeeStatus | None = None
         daily_free_fee_consumed = False
+        round_network_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
+        round_swap_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
+        round_free_network_fee_credit: defaultdict[str, Decimal] = defaultdict(Decimal)
 
         try:
             info = await sdk.get_account_info()
             balances = self._balances_by_symbol(info)
+            balances_before_round = dict(balances)
             await self.monitor.update_balances(monitor_card, balances)
             action_candidates, pending_reason = self._strategy_action_candidates(
                 account=account,
@@ -1684,6 +1716,7 @@ class AutoswapBot:
             if daily_free_fee_status is not None and not daily_free_fee_consumed:
                 updated_free_fee_status = self._consume_daily_free_fee_swap(account.name)
                 daily_free_fee_consumed = True
+                round_free_network_fee_credit[hop.network_fee_symbol] += hop.network_fee_amount
                 await self.monitor.update_free_fee_status(
                     monitor_card,
                     used=updated_free_fee_status.used,
@@ -1702,6 +1735,8 @@ class AutoswapBot:
                     f"🎁 Free fee swap used {updated_free_fee_status.used}/3 for {updated_free_fee_status.utc_date} UTC",
                     force=True,
                 )
+            round_network_fee[hop.network_fee_symbol] += hop.network_fee_amount
+            round_swap_fee[hop.fee_symbol] += hop.admin_fee_amount + hop.liquidity_fee_amount
             used_network_fee[hop.network_fee_symbol] += hop.network_fee_amount
             used_swap_fee[hop.fee_symbol] += hop.admin_fee_amount + hop.liquidity_fee_amount
             await self.monitor.update_fee_totals(
@@ -1991,6 +2026,61 @@ class AutoswapBot:
             or "http 502" in message
             or "http 503" in message
             or "http 504" in message
+        )
+
+    def _is_retryable_session_error(self, exc: Exception) -> bool:
+        if isinstance(exc, (CantexAPIError, CantexTimeoutError)):
+            return True
+        if isinstance(exc, CantexAuthError):
+            return False
+        message = str(exc).lower()
+        return (
+            self._is_retryable_route_error(exc)
+            or "timeout" in message
+            or "timed out" in message
+            or "temporarily unavailable" in message
+            or "connection reset" in message
+            or "connection aborted" in message
+            or "connection refused" in message
+            or "service unavailable" in message
+            or "try again later" in message
+        )
+
+    def _session_retry_delay_seconds(self, session_number: int) -> float:
+        base_delay = max(self.config.runtime.retry_base_delay, 5.0)
+        multiplier = min(max(session_number, 1), 6)
+        return min(base_delay * multiplier, 120.0)
+
+    async def _mark_retryable_session_error(
+        self,
+        *,
+        result: AccountResult,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        exc: Exception,
+        session_number: int,
+    ) -> None:
+        wait_seconds = self._session_retry_delay_seconds(session_number)
+        result.error = None
+        result.stop_reason = None
+        result.retry_after_seconds = wait_seconds
+        logger.warning(
+            "Sesi %s gagal sementara, retry dalam %.0f detik: %s",
+            session_number,
+            wait_seconds,
+            exc,
+        )
+        await self.monitor.update_status(
+            monitor_card,
+            phase="WAITING",
+            next_wait_seconds=wait_seconds,
+            clear_route=True,
+            force=True,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            f"⏳ Session transient error: {exc} | retry in {int(wait_seconds)}s",
+            force=True,
         )
 
     def _recovery_source_order(self, target_symbol: str) -> tuple[str, ...]:

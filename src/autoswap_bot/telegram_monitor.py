@@ -526,17 +526,17 @@ class TelegramMonitor:
         self._terminal_last_render_monotonic = now
 
     def _dashboard_col_widths(self) -> tuple[int, ...]:
-        return (12, 9, 10, 12, 24, 22, 64)
+        return (12, 9, 10, 10, 12, 12, 24, 22, 64)
 
     def _dashboard_table_lines(self, cards: list[TelegramCardState]) -> tuple[tuple[int, ...], list[str]]:
         col_widths = self._dashboard_col_widths()
         lines = [
             self._table_row(
-                ("Akun", "Status", "CC", "Progress", "Plan", "Fee Route", "Metrics"),
+                ("Akun", "Status", "CC", "USDCx", "CBTC", "Progress", "Plan", "Fee Route", "Metrics"),
                 col_widths,
             ),
             self._table_row(
-                ("", "", "", "", "", "", self._dashboard_metrics_header()),
+                ("", "", "", "", "", "", "", "", self._dashboard_metrics_header()),
                 col_widths,
             ),
             self._table_row(
@@ -551,6 +551,8 @@ class TelegramMonitor:
                         card.account_name,
                         self._dashboard_status(card),
                         self._fmt_balance(card.balances.get("CC", Decimal("0")), 4),
+                        self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 4),
+                        self._fmt_balance(card.balances.get("CBTC", Decimal("0")), 8),
                         self._dashboard_progress(card),
                         self._dashboard_plan(card),
                         self._dashboard_route_fee(card),
@@ -917,13 +919,16 @@ class TelegramMonitor:
         plan = self._combined_plan(card)
         fee_route = self._dashboard_route_fee(card)
         cc_balance = self._fmt_balance(card.balances.get("CC", Decimal("0")), 4)
+        usdcx_balance = self._fmt_balance(card.balances.get("USDCx", Decimal("0")), 4)
+        cbtc_balance = self._fmt_balance(card.balances.get("CBTC", Decimal("0")), 8)
         title = (
             f"{self._telegram_status_emoji(card)} {self._display_account_name(card.account_name)} "
             f"[ {self._telegram_status_text(card)} ]"
         )
         return [
             f"<b>{html.escape(title)}</b>",
-            html.escape(f"{progress} | CC {cc_balance} | {plan}"),
+            html.escape(f"{progress} | {plan}"),
+            html.escape(f"Balance | CC {cc_balance} | U {usdcx_balance} | B {cbtc_balance}"),
             html.escape(
                 " | ".join(
                     [
