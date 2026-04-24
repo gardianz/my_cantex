@@ -676,7 +676,8 @@ class TelegramMonitor:
     def _dashboard_progress(self, card: TelegramCardState) -> str:
         completed_total = self._progress_completed_total(card)
         current_round = max(card.current_round_number, completed_total)
-        return f"R{current_round}/{card.total_rounds} ok{completed_total}"
+        ok_total = self._current_day_ok_tx_total(card)
+        return f"R{current_round}/{card.total_rounds} ok{ok_total}"
 
     def _dashboard_plan(self, card: TelegramCardState) -> str:
         strategy = self._build_strategy_line(card).split(":", 1)[-1].strip()
@@ -1604,21 +1605,35 @@ class TelegramMonitor:
                         weekly_swap_fee = dict(daily_swap_fee)
                 except ValueError:
                     pass
+            daily_ok_tx = max(int(payload.get("daily_ok_tx", 0)), 0)
+            lifetime_ok_tx = max(int(payload.get("lifetime_ok_tx", 0)), 0)
+            daily_network_fee = self._sanitize_loaded_network_fee(
+                daily_network_fee,
+                ok_tx_count=daily_ok_tx,
+            )
+            weekly_network_fee = self._sanitize_loaded_network_fee(
+                weekly_network_fee,
+                ok_tx_count=max(daily_ok_tx, lifetime_ok_tx),
+            )
+            lifetime_network_fee = self._sanitize_loaded_network_fee(
+                self._deserialize_amount_map(payload.get("lifetime_network_fee")),
+                ok_tx_count=lifetime_ok_tx,
+            )
             self._account_totals[account_name] = TelegramAccountTotals(
                 current_utc_date=current_utc_date,
                 current_utc_week=current_utc_week,
                 day_index=max(int(payload.get("day_index", 1)), 1),
                 daily_swaps=max(int(payload.get("daily_swaps", 0)), 0),
-                daily_ok_tx=max(int(payload.get("daily_ok_tx", 0)), 0),
+                daily_ok_tx=daily_ok_tx,
                 daily_fail_tx=max(int(payload.get("daily_fail_tx", 0)), 0),
                 daily_network_fee=daily_network_fee,
                 daily_swap_fee=daily_swap_fee,
                 weekly_network_fee=weekly_network_fee,
                 weekly_swap_fee=weekly_swap_fee,
                 lifetime_swaps=max(int(payload.get("lifetime_swaps", 0)), 0),
-                lifetime_ok_tx=max(int(payload.get("lifetime_ok_tx", 0)), 0),
+                lifetime_ok_tx=lifetime_ok_tx,
                 lifetime_fail_tx=max(int(payload.get("lifetime_fail_tx", 0)), 0),
-                lifetime_network_fee=self._deserialize_amount_map(payload.get("lifetime_network_fee")),
+                lifetime_network_fee=lifetime_network_fee,
                 lifetime_swap_fee=self._deserialize_amount_map(payload.get("lifetime_swap_fee")),
             )
         self._normalize_all_accounts()
@@ -1675,6 +1690,26 @@ class TelegramMonitor:
             totals.weekly_network_fee = {}
             totals.weekly_swap_fee = {}
         return totals
+
+    def _sanitize_loaded_network_fee(
+        self,
+        values: dict[str, Decimal],
+        *,
+        ok_tx_count: int,
+    ) -> dict[str, Decimal]:
+        cc_fee = values.get("CC")
+        if cc_fee is None:
+            return values
+        per_tx_limit = Decimal("2")
+        fee_cap = self.runtime.max_network_fee_cc_per_execution
+        if fee_cap is not None:
+            per_tx_limit = max(per_tx_limit, fee_cap * Decimal("5"))
+        plausible_limit = per_tx_limit * Decimal(max(ok_tx_count, 1))
+        if cc_fee <= plausible_limit:
+            return values
+        cleaned = dict(values)
+        cleaned.pop("CC", None)
+        return cleaned
 
     def _rollover_card_if_needed(self, card: TelegramCardState) -> None:
         today_str = self._utc_today().isoformat()

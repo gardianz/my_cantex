@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable
 
 from cantex_sdk import (
     AccountInfo,
@@ -56,6 +56,8 @@ class StrategyRuntimeState:
     recovery_index: int = 0
     reserve_recovery_active: bool = False
     consecutive_balance_blocked_rounds: int = 0
+    strategy_4_topup_pending_recycle: bool = False
+    strategy_4_topup_after_foreign_minimum: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,7 +91,6 @@ class AutoswapBot:
         self.log = logging.getLogger("autoswap_bot")
         self._prompt_lock = asyncio.Lock()
         self._free_fee_swap_lock = asyncio.Lock()
-        self._capped_swap_submit_lock = asyncio.Lock()
         self._rng = random.Random(self.config.runtime.random_seed)
         self.monitor = TelegramMonitor(self.config.runtime)
         self.runtime_state = BotRuntimeStateStore(
@@ -696,6 +697,9 @@ class AutoswapBot:
             for symbol, amount in foreign_available.items()
         )
 
+        if strategy_state.strategy_4_topup_pending_recycle and not has_foreign_balance:
+            return [], "strategy_4 waiting top-up balance settlement"
+
         if strategy_state.reserve_recovery_active and not has_foreign_balance:
             strategy_state.reserve_recovery_active = False
 
@@ -743,6 +747,10 @@ class AutoswapBot:
             if spendable_source <= dust_for_symbol(action.sell_symbol):
                 continue
             recycle_candidates.append(action)
+
+        if has_foreign_balance and not strategy_state.strategy_4_topup_after_foreign_minimum:
+            if recycle_candidates:
+                return recycle_candidates, "strategy_4 recycle phase"
 
         spendable_cc = self._spendable_amount(
             CC_SYMBOL,
@@ -868,6 +876,23 @@ class AutoswapBot:
         if action.pointer_group == "recovery" and action.pointer_next_index is not None:
             strategy_state.recovery_index = action.pointer_next_index
 
+    def _update_strategy_4_topup_guard_after_success(
+        self,
+        *,
+        account: AccountConfig,
+        strategy_state: StrategyRuntimeState,
+        action: StrategyAction,
+    ) -> None:
+        if account.strategy().key != "strategy_4_reserve":
+            return
+        if action.sell_symbol == CC_SYMBOL and action.buy_symbol == "USDCx":
+            strategy_state.strategy_4_topup_pending_recycle = True
+            strategy_state.strategy_4_topup_after_foreign_minimum = False
+            return
+        if action.sell_symbol in {"USDCx", "CBTC"}:
+            strategy_state.strategy_4_topup_pending_recycle = False
+            strategy_state.strategy_4_topup_after_foreign_minimum = False
+
     def _is_balance_blocking_stop_reason(self, stop_reason: str | None) -> bool:
         return stop_reason in {
             "WAIT_SOURCE_BALANCE",
@@ -891,6 +916,7 @@ class AutoswapBot:
     ) -> RoundExecutionResult:
         if not self._is_balance_blocking_stop_reason(stop_reason):
             self._reset_balance_block_counter(strategy_state)
+            strategy_state.strategy_4_topup_after_foreign_minimum = False
             return RoundExecutionResult(
                 completed=False,
                 tx_count=tx_count,
@@ -900,6 +926,7 @@ class AutoswapBot:
 
         if self._strategy_4_has_cc_topup_capacity(account=account, monitor_card=monitor_card):
             self._reset_balance_block_counter(strategy_state)
+            strategy_state.strategy_4_topup_after_foreign_minimum = True
             logger.info(
                 "Saldo akun %s masih cukup untuk top-up CC->USDCx, tidak dihentikan sebagai saldo kurang",
                 account.name,
@@ -1349,12 +1376,16 @@ class AutoswapBot:
                 skipped=True,
             )
 
-        await self.monitor.update_status(
-            monitor_card,
-            pair_key=self._monitor_pair_key(pair_key),
-            round_number=round_number,
-            phase="PROCESSING",
-            route_plan=route,
+        self._schedule_monitor_call(
+            self.monitor.update_status(
+                monitor_card,
+                pair_key=self._monitor_pair_key(pair_key),
+                round_number=round_number,
+                phase="PROCESSING",
+                route_plan=route,
+            ),
+            logger=logger,
+            description="hot-path status update",
         )
         logger.info(
             "Putaran %s | %s -> %s | nominal=%s | route=%s | fee est=%s | network fee est=%s",
@@ -1366,9 +1397,13 @@ class AutoswapBot:
             self._format_amount_map(route.total_admin_and_liquidity_by_symbol),
             self._format_amount_map(route.total_network_fee_by_symbol),
         )
-        await self.monitor.log_event(
-            monitor_card,
-            f"🔄 Round {round_number}/{prepared_run.rounds} {self._monitor_pair_key(pair_key)} ({actual_amount})",
+        self._schedule_monitor_call(
+            self.monitor.log_event(
+                monitor_card,
+                f"🔄 Round {round_number}/{prepared_run.rounds} {self._monitor_pair_key(pair_key)} ({actual_amount})",
+            ),
+            logger=logger,
+            description="hot-path round log",
         )
 
         for hop_index, hop in enumerate(route.hops, start=1):
@@ -1831,12 +1866,16 @@ class AutoswapBot:
                 monitor_card=monitor_card,
             )
 
-        await self.monitor.update_status(
-            monitor_card,
-            pair_key=self._monitor_pair_key(pair_key),
-            round_number=round_number,
-            phase="PROCESSING",
-            route_plan=route,
+        self._schedule_monitor_call(
+            self.monitor.update_status(
+                monitor_card,
+                pair_key=self._monitor_pair_key(pair_key),
+                round_number=round_number,
+                phase="PROCESSING",
+                route_plan=route,
+            ),
+            logger=logger,
+            description="hot-path status update",
         )
         logger.info(
             "Putaran %s | %s -> %s | nominal=%s | route=%s | fee est=%s | network fee est=%s",
@@ -1848,9 +1887,13 @@ class AutoswapBot:
             self._format_amount_map(route.total_admin_and_liquidity_by_symbol),
             self._format_amount_map(route.total_network_fee_by_symbol),
         )
-        await self.monitor.log_event(
-            monitor_card,
-            f"🔄 Round {round_number}/{prepared_run.rounds} {self._monitor_pair_key(pair_key)} ({actual_amount})",
+        self._schedule_monitor_call(
+            self.monitor.log_event(
+                monitor_card,
+                f"🔄 Round {round_number}/{prepared_run.rounds} {self._monitor_pair_key(pair_key)} ({actual_amount})",
+            ),
+            logger=logger,
+            description="hot-path round log",
         )
 
         for hop_index, hop in enumerate(route.hops, start=1):
@@ -1999,6 +2042,11 @@ class AutoswapBot:
         )
         self._reset_balance_block_counter(strategy_state)
         self._advance_strategy_state_after_success(
+            strategy_state=strategy_state,
+            action=selected_action,
+        )
+        self._update_strategy_4_topup_guard_after_success(
+            account=account,
             strategy_state=strategy_state,
             action=selected_action,
         )
@@ -2407,7 +2455,7 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
     ) -> dict[str, Decimal]:
         wait_seconds = max(self.config.runtime.retry_base_delay, 1.0)
-        max_polls = max(3, self.config.runtime.max_retries * 2)
+        max_polls = max(10, self.config.runtime.max_retries * 4)
         last_balances = previous_balances
         for poll_index in range(max_polls):
             self._raise_if_stop_requested()
@@ -2495,12 +2543,33 @@ class AutoswapBot:
             inferred_network_fee = fallback_network_fee or Decimal("0")
         if inferred_network_fee < 0:
             inferred_network_fee = fallback_network_fee or Decimal("0")
+        if not self._observed_network_fee_is_plausible(
+            symbol=hop.network_fee_symbol,
+            amount=inferred_network_fee,
+        ):
+            inferred_network_fee = Decimal("0")
 
         actual_network_fee: dict[str, Decimal] = {}
         if inferred_network_fee > 0:
             actual_network_fee[hop.network_fee_symbol] = inferred_network_fee
 
         return actual_network_fee, actual_swap_fee
+
+    def _observed_network_fee_is_plausible(
+        self,
+        *,
+        symbol: str,
+        amount: Decimal,
+    ) -> bool:
+        if amount <= 0:
+            return True
+        if symbol != CC_SYMBOL:
+            return True
+        fee_cap = self.config.runtime.max_network_fee_cc_per_execution
+        threshold = Decimal("2")
+        if fee_cap is not None:
+            threshold = max(threshold, fee_cap * Decimal("5"))
+        return amount <= threshold
 
     async def _swap_hop_with_retry(
         self,
@@ -2518,7 +2587,6 @@ class AutoswapBot:
     ) -> tuple[dict[str, Any] | None, str | None]:
         confirm_timeout = max(float(hop.estimated_time_seconds) * 3.0, 30.0)
         lock_acquired = False
-        capped_submit_lock_acquired = False
         ws_open_task: asyncio.Task[Any] | None = None
         keep_private_ws = private_ws_holder is not None
         if free_fee_sequential_account_name is not None:
@@ -2539,92 +2607,87 @@ class AutoswapBot:
                         holder=private_ws_holder,
                     )
                 )
-            if fee_cap is not None and not allow_network_fee_cap_bypass:
-                await self._capped_swap_submit_lock.acquire()
-                capped_submit_lock_acquired = True
-
-            try:
-                build_payload = await sdk.build_swap_intent_payload(
-                    sell_amount=hop.sell_amount,
-                    sell_instrument=hop.raw_quote.sell_instrument,
-                    buy_instrument=hop.raw_quote.buy_instrument,
-                )
-                build_network_fee = self._extract_network_fee_from_intent_build(
-                    build_payload,
-                )
-                effective_preflight_fee = (
-                    build_network_fee
-                    if build_network_fee is not None
-                    else (
-                        hop.network_fee_amount
-                        if hop.network_fee_symbol == CC_SYMBOL
-                        else None
-                    )
-                )
-                build_fee_text = (
-                    f"{build_network_fee} CC"
-                    if build_network_fee is not None
-                    else "-"
-                )
-                quote_fee_text = (
-                    f"{hop.network_fee_amount} CC"
+            build_payload = await sdk.build_swap_intent_payload(
+                sell_amount=hop.sell_amount,
+                sell_instrument=hop.raw_quote.sell_instrument,
+                buy_instrument=hop.raw_quote.buy_instrument,
+            )
+            build_network_fee = self._extract_network_fee_from_intent_build(
+                build_payload,
+            )
+            effective_preflight_fee = (
+                build_network_fee
+                if build_network_fee is not None
+                else (
+                    hop.network_fee_amount
                     if hop.network_fee_symbol == CC_SYMBOL
-                    else "-"
+                    else None
                 )
-                logger.info(
-                    "Swap hop %s/%s round %s fee preflight build=%s | fee quote=%s",
-                    hop_index,
-                    hop_total,
-                    round_number,
-                    build_fee_text,
-                    quote_fee_text,
-                )
-                await self.monitor.log_event(
+            )
+            build_fee_text = (
+                f"{build_network_fee} CC"
+                if build_network_fee is not None
+                else "-"
+            )
+            quote_fee_text = (
+                f"{hop.network_fee_amount} CC"
+                if hop.network_fee_symbol == CC_SYMBOL
+                else "-"
+            )
+            logger.info(
+                "Swap hop %s/%s round %s fee preflight build=%s | fee quote=%s",
+                hop_index,
+                hop_total,
+                round_number,
+                build_fee_text,
+                quote_fee_text,
+            )
+            self._schedule_monitor_call(
+                self.monitor.log_event(
                     monitor_card,
                     (
                         f"[preflight] Hop {hop_index}/{hop_total} "
                         f"build fee={build_fee_text} | "
                         f"quote fee={quote_fee_text}"
                     ),
+                ),
+                logger=logger,
+                description="hot-path preflight log",
+            )
+
+            if (
+                fee_cap is not None
+                and not allow_network_fee_cap_bypass
+                and effective_preflight_fee is not None
+                and effective_preflight_fee > fee_cap
+            ):
+                logger.warning(
+                    "Swap hop %s/%s round %s dibatalkan sebelum submit karena fee preflight %s CC > batas %s CC",
+                    hop_index,
+                    hop_total,
+                    round_number,
+                    effective_preflight_fee,
+                    fee_cap,
                 )
+                await self.monitor.log_event(
+                    monitor_card,
+                    (
+                        f"? Hop {hop_index}/{hop_total} skipped: "
+                        f"preflight fee {effective_preflight_fee} CC > limit {fee_cap} CC"
+                    ),
+                    force=True,
+                )
+                return None, "NETWORK_FEE_ABOVE_LIMIT"
 
-                if (
-                    fee_cap is not None
-                    and not allow_network_fee_cap_bypass
-                    and effective_preflight_fee is not None
-                    and effective_preflight_fee > fee_cap
-                ):
-                    logger.warning(
-                        "Swap hop %s/%s round %s dibatalkan sebelum submit karena fee preflight %s CC > batas %s CC",
-                        hop_index,
-                        hop_total,
-                        round_number,
-                        effective_preflight_fee,
-                        fee_cap,
-                    )
-                    await self.monitor.log_event(
-                        monitor_card,
-                        (
-                            f"? Hop {hop_index}/{hop_total} skipped: "
-                            f"preflight fee {effective_preflight_fee} CC > limit {fee_cap} CC"
-                        ),
-                        force=True,
-                    )
-                    return None, "NETWORK_FEE_ABOVE_LIMIT"
+            if ws is None:
+                if ws_open_task is not None:
+                    ws = await ws_open_task
+                    ws_open_task = None
+                else:
+                    ws = await sdk.open_private_ws()
+                    keep_private_ws = False
 
-                if ws is None:
-                    if ws_open_task is not None:
-                        ws = await ws_open_task
-                        ws_open_task = None
-                    else:
-                        ws = await sdk.open_private_ws()
-                        keep_private_ws = False
-
-                submit_response = await sdk.submit_built_intent(build_payload)
-            finally:
-                if capped_submit_lock_acquired:
-                    self._capped_swap_submit_lock.release()
-                    capped_submit_lock_acquired = False
+            submit_response = await sdk.submit_built_intent(build_payload)
 
             try:
                 event = await sdk.wait_for_swap_confirmation(
@@ -2701,8 +2764,6 @@ class AutoswapBot:
                         pass
                 else:
                     ws_open_task.cancel()
-            if capped_submit_lock_acquired:
-                self._capped_swap_submit_lock.release()
             if private_ws_holder is not None and ws is not None and getattr(ws, "closed", False):
                 private_ws_holder["ws"] = None
             if ws is not None and not keep_private_ws:
@@ -3121,6 +3182,27 @@ class AutoswapBot:
             f"swap={self._format_amount_map(swap_fee)} | "
             f"total={self._format_amount_map(total_fee)}"
         )
+
+    def _schedule_monitor_call(
+        self,
+        awaitable: Awaitable[None],
+        *,
+        logger: AccountLoggerAdapter,
+        description: str,
+    ) -> None:
+        task = asyncio.create_task(awaitable)
+
+        def _log_background_failure(done_task: asyncio.Task[None]) -> None:
+            try:
+                done_task.result()
+            except Exception:
+                logger.debug(
+                    "Monitor update background gagal | %s",
+                    description,
+                    exc_info=True,
+                )
+
+        task.add_done_callback(_log_background_failure)
 
     def _merge_amount_maps(
         self,
