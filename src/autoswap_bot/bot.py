@@ -2442,13 +2442,23 @@ class AutoswapBot:
         current_balances: dict[str, Decimal],
         hop: RouteHop,
     ) -> bool:
-        watched_symbols = {hop.sell_symbol, hop.buy_symbol, hop.network_fee_symbol}
-        for symbol in watched_symbols:
-            previous_amount = previous_balances.get(symbol, Decimal("0"))
-            current_amount = current_balances.get(symbol, Decimal("0"))
-            if abs(current_amount - previous_amount) > dust_for_symbol(symbol):
-                return True
-        return False
+        sell_previous = previous_balances.get(hop.sell_symbol, Decimal("0"))
+        sell_current = current_balances.get(hop.sell_symbol, Decimal("0"))
+        sell_observed = sell_current < (sell_previous - dust_for_symbol(hop.sell_symbol))
+
+        buy_previous = previous_balances.get(hop.buy_symbol, Decimal("0"))
+        buy_current = current_balances.get(hop.buy_symbol, Decimal("0"))
+        buy_observed = buy_current > (buy_previous + dust_for_symbol(hop.buy_symbol))
+
+        if not sell_observed or not buy_observed:
+            return False
+
+        if hop.network_fee_symbol in {hop.sell_symbol, hop.buy_symbol}:
+            return True
+
+        fee_previous = previous_balances.get(hop.network_fee_symbol, Decimal("0"))
+        fee_current = current_balances.get(hop.network_fee_symbol, Decimal("0"))
+        return fee_current < (fee_previous - dust_for_symbol(hop.network_fee_symbol))
 
     def _extract_actual_successful_hop_fees(
         self,
@@ -2474,10 +2484,7 @@ class AutoswapBot:
             balances_after.get(hop.network_fee_symbol, Decimal("0"))
             - balances_before.get(hop.network_fee_symbol, Decimal("0"))
         )
-        fallback_network_fee = (
-            self._parse_decimal_like(tx_result.get("build_network_fee_amount"))
-            or hop.network_fee_amount
-        )
+        fallback_network_fee = self._parse_decimal_like(tx_result.get("build_network_fee_amount"))
         expected_delta_without_network_fee = Decimal("0")
         if hop.sell_symbol == hop.network_fee_symbol:
             expected_delta_without_network_fee -= actual_input_amount
@@ -2485,9 +2492,9 @@ class AutoswapBot:
             expected_delta_without_network_fee += actual_output_amount
         inferred_network_fee = -(observed_delta - expected_delta_without_network_fee)
         if inferred_network_fee <= dust_for_symbol(hop.network_fee_symbol):
-            inferred_network_fee = fallback_network_fee
+            inferred_network_fee = fallback_network_fee or Decimal("0")
         if inferred_network_fee < 0:
-            inferred_network_fee = fallback_network_fee
+            inferred_network_fee = fallback_network_fee or Decimal("0")
 
         actual_network_fee: dict[str, Decimal] = {}
         if inferred_network_fee > 0:
