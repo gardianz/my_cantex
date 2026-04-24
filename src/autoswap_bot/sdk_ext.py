@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from decimal import Decimal
 from typing import Any
 
-from cantex_sdk import CantexAPIError, CantexSDK, InstrumentId
+from cantex_sdk import (
+    CantexAPIError,
+    CantexError,
+    CantexSDK,
+    CantexTimeoutError,
+    InstrumentId,
+    SwapExecutedEvent,
+    SwapFailedEvent,
+    SwapPendingEvent,
+)
 
 
 class ExtendedCantexSDK(CantexSDK):
@@ -119,6 +129,78 @@ class ExtendedCantexSDK(CantexSDK):
             buy_instrument=buy_instrument,
             timeout=timeout,
         )
+
+    async def build_swap_intent_payload(
+        self,
+        *,
+        sell_amount: Decimal,
+        sell_instrument: InstrumentId,
+        buy_instrument: InstrumentId,
+    ) -> dict[str, Any]:
+        if getattr(self, "_intent_signer", None) is None:
+            raise RuntimeError("IntentTradingKeySigner required for build_swap_intent_payload")
+        payload = await self._request(  # type: ignore[attr-defined]
+            "POST",
+            "/v1/intent/build/pool/swap",
+            json_data={
+                "sellAmount": str(sell_amount),
+                "sellInstrumentId": sell_instrument.id,
+                "sellInstrumentAdmin": sell_instrument.admin,
+                "buyInstrumentId": buy_instrument.id,
+                "buyInstrumentAdmin": buy_instrument.admin,
+            },
+        )
+        if not isinstance(payload, dict):
+            raise RuntimeError("Intent build response tidak valid")
+        return payload
+
+    async def submit_built_intent(self, build_payload: dict[str, Any]) -> dict[str, Any]:
+        intent_signer = getattr(self, "_intent_signer", None)
+        if intent_signer is None:
+            raise RuntimeError("IntentTradingKeySigner required for submit_built_intent")
+        build_id = build_payload.get("id")
+        intent_payload = build_payload.get("intent") or {}
+        digest = intent_payload.get("digest")
+        if not build_id or not digest:
+            raise RuntimeError("Intent build response tidak memiliki id/digest")
+        signature_hex = intent_signer.sign_digest_hex(str(digest))
+        response = await self._request(  # type: ignore[attr-defined]
+            "POST",
+            "/v1/intent/submit",
+            json_data={
+                "id": build_id,
+                "intentTradingKeySignature": signature_hex,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError("Intent submit response tidak valid")
+        return response
+
+    async def open_private_ws(self) -> Any:
+        return await self._ws_connect("/v1/ws/private", authenticated=True)  # type: ignore[attr-defined]
+
+    async def wait_for_swap_confirmation(
+        self,
+        ws: Any,
+        *,
+        timeout: float,
+    ) -> SwapExecutedEvent:
+        async def _wait_for_confirmation() -> SwapExecutedEvent:
+            async for event in ws:
+                if isinstance(event, SwapPendingEvent):
+                    continue
+                if isinstance(event, SwapExecutedEvent):
+                    return event
+                if isinstance(event, SwapFailedEvent):
+                    raise CantexError(f"Swap failed: {event.error}")
+            raise CantexError("WebSocket closed before swap confirmation")
+
+        try:
+            return await asyncio.wait_for(_wait_for_confirmation(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise CantexTimeoutError(
+                f"Swap confirmation timed out after {timeout}s"
+            ) from None
 
     def _extract_hex_public_key_candidates(self, node: Any) -> set[str]:
         candidates: set[str] = set()
