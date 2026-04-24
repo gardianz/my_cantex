@@ -219,6 +219,22 @@ class TelegramMonitor:
         self._persist_card_state(card)
         await self._refresh_outputs(card, force=force)
 
+    async def sync_daily_ok_tx_from_history(
+        self,
+        card: TelegramCardState | None,
+        *,
+        ok_tx_count: int,
+        force: bool = False,
+    ) -> None:
+        if card is None:
+            return
+        self._rollover_card_if_needed(card)
+        normalized_ok_tx = max(int(ok_tx_count), 0)
+        card.daily_ok_tx_base = max(self._current_day_ok_tx_total(card), normalized_ok_tx)
+        card.day_session_ok_tx_offset = card.tx_ok_count
+        self._persist_card_state(card)
+        await self._refresh_outputs(card, force=force)
+
     async def log_event(
         self,
         card: TelegramCardState | None,

@@ -3973,6 +3973,11 @@ class AutoswapBot:
             )
             return synced_completed_rounds
 
+        await self.monitor.sync_daily_ok_tx_from_history(
+            monitor_card,
+            ok_tx_count=history_today_count,
+            force=force_log,
+        )
         history_completed_rounds = min(max(history_today_count, 0), prepared_run.rounds)
         synced_completed_rounds = max(
             min(max(int(fallback_completed_rounds), 0), prepared_run.rounds),
