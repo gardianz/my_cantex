@@ -67,6 +67,7 @@ class StrategyAction:
     pointer_next_index: int | None = None
     fraction: Decimal | None = None
     cc_reserve_override: Decimal | None = None
+    strict_amount: bool = False
 
 
 @dataclass(frozen=True)
@@ -424,7 +425,7 @@ class AutoswapBot:
             logger.info("Eksekusi dihentikan user")
             await self.monitor.log_event(
                 monitor_card,
-                "⛔ Stopped by user",
+                "? Stopped by user",
                 force=True,
             )
             await self.monitor.finalize(monitor_card, phase="STOPPED_MANUAL")
@@ -764,6 +765,7 @@ class AutoswapBot:
                     buy_symbol="USDCx",
                     amount_mode="config",
                     cc_reserve_override=reserve_fee,
+                    strict_amount=True,
                 )
             )
         if recycle_candidates:
@@ -787,7 +789,7 @@ class AutoswapBot:
         action: StrategyAction,
         balances: dict[str, Decimal],
         router: RouteOptimizer,
-    ) -> tuple[Decimal | None, Decimal | None, str | None]:
+    ) -> tuple[Decimal | None, Decimal | None, Decimal | None, str | None]:
         cc_reserve = self._effective_cc_reserve(account, action.cc_reserve_override)
         available_amount = self._spendable_amount(
             action.sell_symbol,
@@ -795,7 +797,7 @@ class AutoswapBot:
             cc_reserve,
         )
         if available_amount <= dust_for_symbol(action.sell_symbol):
-            return None, None, f"{action.sell_symbol} balance terlalu kecil"
+            return None, None, None, f"{action.sell_symbol} balance terlalu kecil"
 
         if action.amount_mode == "config":
             amount_range = account.amount_range_for_symbol(action.sell_symbol)
@@ -811,7 +813,7 @@ class AutoswapBot:
                     if action.sell_symbol == CC_SYMBOL
                     else f"{action.sell_symbol} balance below user config min ({available_amount} < {amount_range.min_value})"
                 )
-                return None, amount_range.min_value, reason
+                return None, amount_range.min_value, None, reason
             target_amount = self._sample_execution_amount(amount_range, max_allowed_amount)
             actual_amount, min_ticket_reason = await self._normalize_amount_for_min_ticket(
                 router=router,
@@ -820,7 +822,21 @@ class AutoswapBot:
                 desired_amount=target_amount,
                 max_available_amount=max_allowed_amount,
             )
-            return actual_amount, amount_range.min_value, min_ticket_reason
+            if action.strict_amount:
+                if actual_amount is None:
+                    return None, None, target_amount, min_ticket_reason
+                if actual_amount != target_amount:
+                    return (
+                        None,
+                        None,
+                        target_amount,
+                        (
+                            f"exact amount required for {action.sell_symbol}->{action.buy_symbol} "
+                            f"({target_amount}), got {actual_amount}"
+                        ),
+                    )
+                return actual_amount, None, target_amount, min_ticket_reason
+            return actual_amount, amount_range.min_value, None, min_ticket_reason
 
         if action.amount_mode == "max":
             actual_amount, min_ticket_reason = await self._normalize_amount_for_min_ticket(
@@ -830,13 +846,13 @@ class AutoswapBot:
                 desired_amount=available_amount,
                 max_available_amount=available_amount,
             )
-            return actual_amount, None, min_ticket_reason
+            return actual_amount, None, None, min_ticket_reason
 
         if action.amount_mode == "fraction":
             fraction = action.fraction or Decimal("0")
             desired_amount = available_amount * fraction
             if desired_amount <= dust_for_symbol(action.sell_symbol):
-                return None, None, f"{action.sell_symbol} balance terlalu kecil untuk mode {fraction}"
+                return None, None, None, f"{action.sell_symbol} balance terlalu kecil untuk mode {fraction}"
             actual_amount, min_ticket_reason = await self._normalize_amount_for_min_ticket(
                 router=router,
                 sell_symbol=action.sell_symbol,
@@ -844,7 +860,7 @@ class AutoswapBot:
                 desired_amount=desired_amount,
                 max_available_amount=available_amount,
             )
-            return actual_amount, None, min_ticket_reason
+            return actual_amount, None, None, min_ticket_reason
 
         raise ValueError(f"Mode amount tidak didukung: {action.amount_mode}")
 
@@ -1249,6 +1265,7 @@ class AutoswapBot:
                 monitor_card=monitor_card,
                 current_route=route,
                 account_name=account.name,
+                strict_amount=selected_action.strict_amount,
             )
         except (CantexAPIError, CantexTimeoutError) as exc:
             logger.warning(
@@ -1360,6 +1377,7 @@ class AutoswapBot:
         )
 
         for hop_index, hop in enumerate(route.hops, start=1):
+            hop_balances_before = dict(balances)
             tx_result, failure_reason = await self._swap_hop_with_retry(
                 sdk=sdk,
                 hop=hop,
@@ -1370,6 +1388,9 @@ class AutoswapBot:
                 monitor_card=monitor_card,
                 free_fee_sequential_account_name=(
                     account.name if daily_free_fee_status is not None and hop_index == 1 else None
+                ),
+                allow_network_fee_cap_bypass=(
+                    daily_free_fee_status is not None and hop_index == 1
                 ),
             )
             if tx_result is None:
@@ -1389,34 +1410,81 @@ class AutoswapBot:
                 )
 
             tx_count += 1
-            used_network_fee[hop.network_fee_symbol] += hop.network_fee_amount
-            used_swap_fee[hop.fee_symbol] += hop.admin_fee_amount + hop.liquidity_fee_amount
+            settled_balances = await self._wait_for_hop_balance_settlement(
+                sdk=sdk,
+                previous_balances=hop_balances_before,
+                hop=hop,
+                tx_result=tx_result,
+                logger=logger,
+                monitor_card=monitor_card,
+            )
+            actual_network_fee, actual_swap_fee = self._extract_actual_successful_hop_fees(
+                hop=hop,
+                tx_result=tx_result,
+                balances_before=hop_balances_before,
+                balances_after=settled_balances,
+            )
+            balances = settled_balances
+            await self.monitor.update_balances(
+                monitor_card,
+                balances,
+            )
+            if daily_free_fee_status is not None and not daily_free_fee_consumed:
+                updated_free_fee_status = self._consume_daily_free_fee_swap(account.name)
+                daily_free_fee_consumed = True
+                for symbol, amount in actual_network_fee.items():
+                    round_free_network_fee_credit[symbol] += amount
+                await self.monitor.update_free_fee_status(
+                    monitor_card,
+                    used=updated_free_fee_status.used,
+                    limit=3,
+                    network_fee_credit=actual_network_fee,
+                    force=True,
+                )
+                logger.info(
+                    "Free fee swap harian terpakai | %s | %s/3 | tanggal UTC=%s",
+                    account.name,
+                    updated_free_fee_status.used,
+                    updated_free_fee_status.utc_date,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"🎁 Free fee swap used {updated_free_fee_status.used}/3 for {updated_free_fee_status.utc_date} UTC",
+                    force=True,
+                )
+            for symbol, amount in actual_network_fee.items():
+                round_network_fee[symbol] += amount
+                used_network_fee[symbol] += amount
+            for symbol, amount in actual_swap_fee.items():
+                round_swap_fee[symbol] += amount
+                used_swap_fee[symbol] += amount
             await self.monitor.update_fee_totals(
                 monitor_card,
                 total_network_fee=dict(used_network_fee),
                 total_swap_fee=dict(used_swap_fee),
             )
             tx_identifier = tx_result.get("id") or tx_result.get("transactionId") or tx_result.get("contract_id")
+            actual_output_amount = self._parse_decimal_like(tx_result.get("output_amount")) or hop.returned_amount
             logger.info(
-                "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output est=%s %s",
+                "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output=%s %s",
                 hop_index,
                 len(route.hops),
                 hop.sell_symbol,
                 hop.buy_symbol,
                 tx_identifier or "-",
-                hop.returned_amount,
+                actual_output_amount,
                 hop.buy_symbol,
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"✅ Hop {hop_index}/{len(route.hops)} {hop.sell_symbol}->{hop.buy_symbol} tx={tx_identifier or '-'}",
+                f"? Hop {hop_index}/{len(route.hops)} {hop.sell_symbol}->{hop.buy_symbol} tx={tx_identifier or '-'}",
             )
             await self.monitor.log_event(
                 monitor_card,
                 self._format_fee_log_line(
                     prefix="Fee tx",
-                    network_fee={hop.network_fee_symbol: hop.network_fee_amount},
-                    swap_fee={hop.fee_symbol: hop.admin_fee_amount + hop.liquidity_fee_amount},
+                    network_fee=actual_network_fee,
+                    swap_fee=actual_swap_fee,
                 ),
             )
             await self.monitor.log_event(
@@ -1428,7 +1496,6 @@ class AutoswapBot:
                 ),
             )
             await self._sleep_between_swaps()
-
         latest_info = await sdk.get_account_info()
         latest_balances = self._balances_by_symbol(latest_info)
         await self.monitor.update_balances(
@@ -1513,14 +1580,32 @@ class AutoswapBot:
 
             route: RoutePlan | None = None
             actual_amount: Decimal | None = None
+            user_min_amount: Decimal | None = None
+            exact_required_amount: Decimal | None = None
             last_invalid_reason = pending_reason
             last_invalid_stop_reason = "WAIT_SOURCE_BALANCE"
+            strategy_4_has_foreign_candidates = False
+            strategy_4_topup_unlocked = False
+            strategy_4_topup_blocked = False
 
             for action in action_candidates:
                 sell_symbol = action.sell_symbol
                 buy_symbol = action.buy_symbol
                 pair_key = f"{sell_symbol}->{buy_symbol}"
-                actual_amount, user_min_amount, amount_reason = await self._resolve_strategy_action_amount(
+                if account.strategy().key == "strategy_4_reserve" and action.sell_symbol != CC_SYMBOL:
+                    strategy_4_has_foreign_candidates = True
+                if (
+                    account.strategy().key == "strategy_4_reserve"
+                    and action.sell_symbol == CC_SYMBOL
+                    and strategy_4_has_foreign_candidates
+                    and (not strategy_4_topup_unlocked or strategy_4_topup_blocked)
+                ):
+                    logger.info(
+                        "Putaran %s top-up CC->USDCx ditahan karena recycle foreign balance belum benar-benar mentok",
+                        round_number,
+                    )
+                    continue
+                actual_amount, user_min_amount, exact_required_amount, amount_reason = await self._resolve_strategy_action_amount(
                     account=account,
                     action=action,
                     balances=balances,
@@ -1534,6 +1619,11 @@ class AutoswapBot:
                             if "minimum ticket size" in amount_reason.lower()
                             else "WAIT_SOURCE_BALANCE"
                         )
+                        if account.strategy().key == "strategy_4_reserve" and action.sell_symbol != CC_SYMBOL:
+                            if last_invalid_stop_reason in {"MIN_TICKET_SIZE", "WAIT_SOURCE_BALANCE"}:
+                                strategy_4_topup_unlocked = True
+                            else:
+                                strategy_4_topup_blocked = True
                         logger.info(
                             "Putaran %s kandidat belum valid | %s -> %s | %s",
                             round_number,
@@ -1551,16 +1641,34 @@ class AutoswapBot:
                     proposed_amount=actual_amount,
                     round_number=round_number,
                     cc_reserve=self._effective_cc_reserve(account, action.cc_reserve_override),
+                    strict_amount=action.strict_amount,
                 )
                 if issue is not None:
                     last_invalid_reason = issue.reason
                     last_invalid_stop_reason = "ROUND_AFFORDABILITY_CHECK_FAILED"
+                    if account.strategy().key == "strategy_4_reserve" and action.sell_symbol != CC_SYMBOL:
+                        strategy_4_topup_blocked = True
                     logger.info(
                         "Putaran %s kandidat belum affordable | %s -> %s | %s",
                         round_number,
                         sell_symbol,
                         buy_symbol,
                         issue.reason,
+                    )
+                    continue
+
+                if exact_required_amount is not None and route.hops and route.hops[0].sell_amount != exact_required_amount:
+                    last_invalid_reason = (
+                        f"route adjusted amount differs from exact config "
+                        f"({route.hops[0].sell_amount} != {exact_required_amount})"
+                    )
+                    last_invalid_stop_reason = "USER_CONFIG_MIN_NOT_MET"
+                    logger.info(
+                        "Putaran %s kandidat belum bisa dieksekusi | %s -> %s | %s",
+                        round_number,
+                        sell_symbol,
+                        buy_symbol,
+                        last_invalid_reason,
                     )
                     continue
 
@@ -1750,6 +1858,7 @@ class AutoswapBot:
         )
 
         for hop_index, hop in enumerate(route.hops, start=1):
+            hop_balances_before = dict(balances)
             tx_result, failure_reason = await self._swap_hop_with_retry(
                 sdk=sdk,
                 hop=hop,
@@ -1760,6 +1869,9 @@ class AutoswapBot:
                 monitor_card=monitor_card,
                 free_fee_sequential_account_name=(
                     account.name if daily_free_fee_status is not None and hop_index == 1 else None
+                ),
+                allow_network_fee_cap_bypass=(
+                    daily_free_fee_status is not None and hop_index == 1
                 ),
             )
             if tx_result is None:
@@ -1779,15 +1891,35 @@ class AutoswapBot:
                 )
 
             tx_count += 1
+            settled_balances = await self._wait_for_hop_balance_settlement(
+                sdk=sdk,
+                previous_balances=hop_balances_before,
+                hop=hop,
+                tx_result=tx_result,
+                logger=logger,
+                monitor_card=monitor_card,
+            )
+            actual_network_fee, actual_swap_fee = self._extract_actual_successful_hop_fees(
+                hop=hop,
+                tx_result=tx_result,
+                balances_before=hop_balances_before,
+                balances_after=settled_balances,
+            )
+            balances = settled_balances
+            await self.monitor.update_balances(
+                monitor_card,
+                balances,
+            )
             if daily_free_fee_status is not None and not daily_free_fee_consumed:
                 updated_free_fee_status = self._consume_daily_free_fee_swap(account.name)
                 daily_free_fee_consumed = True
-                round_free_network_fee_credit[hop.network_fee_symbol] += hop.network_fee_amount
+                for symbol, amount in actual_network_fee.items():
+                    round_free_network_fee_credit[symbol] += amount
                 await self.monitor.update_free_fee_status(
                     monitor_card,
                     used=updated_free_fee_status.used,
                     limit=3,
-                    network_fee_credit={hop.network_fee_symbol: hop.network_fee_amount},
+                    network_fee_credit=actual_network_fee,
                     force=True,
                 )
                 logger.info(
@@ -1801,36 +1933,39 @@ class AutoswapBot:
                     f"🎁 Free fee swap used {updated_free_fee_status.used}/3 for {updated_free_fee_status.utc_date} UTC",
                     force=True,
                 )
-            round_network_fee[hop.network_fee_symbol] += hop.network_fee_amount
-            round_swap_fee[hop.fee_symbol] += hop.admin_fee_amount + hop.liquidity_fee_amount
-            used_network_fee[hop.network_fee_symbol] += hop.network_fee_amount
-            used_swap_fee[hop.fee_symbol] += hop.admin_fee_amount + hop.liquidity_fee_amount
+            for symbol, amount in actual_network_fee.items():
+                round_network_fee[symbol] += amount
+                used_network_fee[symbol] += amount
+            for symbol, amount in actual_swap_fee.items():
+                round_swap_fee[symbol] += amount
+                used_swap_fee[symbol] += amount
             await self.monitor.update_fee_totals(
                 monitor_card,
                 total_network_fee=dict(used_network_fee),
                 total_swap_fee=dict(used_swap_fee),
             )
             tx_identifier = tx_result.get("id") or tx_result.get("transactionId") or tx_result.get("contract_id")
+            actual_output_amount = self._parse_decimal_like(tx_result.get("output_amount")) or hop.returned_amount
             logger.info(
-                "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output est=%s %s",
+                "Tx hop %s/%s berhasil | %s -> %s | tx=%s | output=%s %s",
                 hop_index,
                 len(route.hops),
                 hop.sell_symbol,
                 hop.buy_symbol,
                 tx_identifier or "-",
-                hop.returned_amount,
+                actual_output_amount,
                 hop.buy_symbol,
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"✅ Hop {hop_index}/{len(route.hops)} {hop.sell_symbol}->{hop.buy_symbol} tx={tx_identifier or '-'}",
+                f"? Hop {hop_index}/{len(route.hops)} {hop.sell_symbol}->{hop.buy_symbol} tx={tx_identifier or '-'}",
             )
             await self.monitor.log_event(
                 monitor_card,
                 self._format_fee_log_line(
                     prefix="Fee tx",
-                    network_fee={hop.network_fee_symbol: hop.network_fee_amount},
-                    swap_fee={hop.fee_symbol: hop.admin_fee_amount + hop.liquidity_fee_amount},
+                    network_fee=actual_network_fee,
+                    swap_fee=actual_swap_fee,
                 ),
             )
             await self.monitor.log_event(
@@ -1842,7 +1977,6 @@ class AutoswapBot:
                 ),
             )
             await self._sleep_between_swaps()
-
         latest_info = await sdk.get_account_info()
         latest_balances = self._balances_by_symbol(latest_info)
         await self.monitor.update_balances(
@@ -2177,6 +2311,117 @@ class AutoswapBot:
             return Decimal("0")
         return route.final_amount
 
+    async def _quote_current_hop_network_fee(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        hop: RouteHop,
+    ) -> Decimal | None:
+        quote = await sdk.get_swap_quote(
+            sell_amount=hop.sell_amount,
+            sell_instrument=hop.raw_quote.sell_instrument,
+            buy_instrument=hop.raw_quote.buy_instrument,
+        )
+        network_fee_instrument = getattr(quote.fees.network_fee.instrument, "id", "")
+        if network_fee_instrument != CC_SYMBOL:
+            return None
+        return quote.fees.network_fee.amount
+
+    async def _wait_for_hop_balance_settlement(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        previous_balances: dict[str, Decimal],
+        hop: RouteHop,
+        tx_result: dict[str, Any],
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+    ) -> dict[str, Decimal]:
+        wait_seconds = max(self.config.runtime.retry_base_delay, 1.0)
+        max_polls = max(3, self.config.runtime.max_retries * 2)
+        last_balances = previous_balances
+        for poll_index in range(max_polls):
+            self._raise_if_stop_requested()
+            info = await sdk.get_account_info()
+            balances = self._balances_by_symbol(info)
+            last_balances = balances
+            if self._hop_execution_observed(
+                previous_balances=previous_balances,
+                current_balances=balances,
+                hop=hop,
+            ):
+                return balances
+            if poll_index < max_polls - 1:
+                logger.info(
+                    "Menunggu settlement hop %s/%s | poll %s/%s",
+                    hop.sell_symbol,
+                    hop.buy_symbol,
+                    poll_index + 1,
+                    max_polls,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"? Waiting hop settlement {hop.sell_symbol}->{hop.buy_symbol} ({poll_index + 1}/{max_polls})",
+                )
+                await self._sleep_or_stop(wait_seconds)
+        return last_balances
+
+    def _hop_execution_observed(
+        self,
+        *,
+        previous_balances: dict[str, Decimal],
+        current_balances: dict[str, Decimal],
+        hop: RouteHop,
+    ) -> bool:
+        watched_symbols = {hop.sell_symbol, hop.buy_symbol, hop.network_fee_symbol}
+        for symbol in watched_symbols:
+            previous_amount = previous_balances.get(symbol, Decimal("0"))
+            current_amount = current_balances.get(symbol, Decimal("0"))
+            if abs(current_amount - previous_amount) > dust_for_symbol(symbol):
+                return True
+        return False
+
+    def _extract_actual_successful_hop_fees(
+        self,
+        *,
+        hop: RouteHop,
+        tx_result: dict[str, Any],
+        balances_before: dict[str, Decimal],
+        balances_after: dict[str, Decimal],
+    ) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
+        actual_input_amount = self._parse_decimal_like(tx_result.get("input_amount")) or hop.sell_amount
+        actual_output_amount = self._parse_decimal_like(tx_result.get("output_amount")) or hop.returned_amount
+        actual_admin_fee = self._parse_decimal_like(tx_result.get("admin_fee_amount")) or hop.admin_fee_amount
+        actual_liquidity_fee = (
+            self._parse_decimal_like(tx_result.get("liquidity_fee_amount")) or hop.liquidity_fee_amount
+        )
+
+        swap_fee_total = actual_admin_fee + actual_liquidity_fee
+        actual_swap_fee: dict[str, Decimal] = {}
+        if swap_fee_total > 0:
+            actual_swap_fee[hop.fee_symbol] = swap_fee_total
+
+        observed_delta = (
+            balances_after.get(hop.network_fee_symbol, Decimal("0"))
+            - balances_before.get(hop.network_fee_symbol, Decimal("0"))
+        )
+        expected_delta_without_network_fee = Decimal("0")
+        if hop.sell_symbol == hop.network_fee_symbol:
+            expected_delta_without_network_fee -= actual_input_amount
+        if hop.buy_symbol == hop.network_fee_symbol:
+            expected_delta_without_network_fee += actual_output_amount
+        inferred_network_fee = -(observed_delta - expected_delta_without_network_fee)
+        if inferred_network_fee <= dust_for_symbol(hop.network_fee_symbol):
+            inferred_network_fee = hop.network_fee_amount
+        if inferred_network_fee < 0:
+            inferred_network_fee = hop.network_fee_amount
+
+        actual_network_fee: dict[str, Decimal] = {}
+        if inferred_network_fee > 0:
+            actual_network_fee[hop.network_fee_symbol] = inferred_network_fee
+
+        return actual_network_fee, actual_swap_fee
+
     async def _swap_hop_with_retry(
         self,
         *,
@@ -2188,8 +2433,8 @@ class AutoswapBot:
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
         free_fee_sequential_account_name: str | None = None,
+        allow_network_fee_cap_bypass: bool = False,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        max_attempts = max(1, self.config.runtime.max_retries)
         confirm_timeout = max(float(hop.estimated_time_seconds) * 3.0, 30.0)
         lock_acquired = False
         if free_fee_sequential_account_name is not None:
@@ -2200,73 +2445,88 @@ class AutoswapBot:
                 monitor_card=monitor_card,
             )
         try:
-            for attempt in range(1, max_attempts + 1):
-                self._raise_if_stop_requested()
-                try:
-                    event = await sdk.swap_and_confirm(
-                        sell_amount=hop.sell_amount,
-                        sell_instrument=hop.raw_quote.sell_instrument,
-                        buy_instrument=hop.raw_quote.buy_instrument,
-                        timeout=confirm_timeout,
-                    )
-                    await self.monitor.record_tx_success(monitor_card)
-                    return (
-                        {
-                            "id": getattr(event, "event_id", ""),
-                            "ledger_created_at": getattr(event, "ledger_created_at", ""),
-                            "output_amount": getattr(event, "output_amount", None),
-                            "output_instrument": getattr(getattr(event, "output_instrument", None), "id", ""),
-                            "raw": getattr(event, "raw", {}),
-                        },
-                        None,
-                    )
-                except Exception as exc:
-                    if self._is_signature_verification_error(exc):
-                        await self.monitor.record_tx_failure(monitor_card)
-                        raise RuntimeError(
-                            "Signature verification failed untuk swap intent. "
-                            "Kemungkinan CANTEX_TRADING_KEY tidak cocok dengan intent account wallet ini."
-                        ) from exc
-                    if self._is_min_ticket_error(exc):
-                        logger.warning(
-                            "Swap hop %s/%s round %s gagal karena minimum ticket size: %s",
-                            hop_index,
-                            hop_total,
-                            round_number,
-                            exc,
-                        )
-                        await self.monitor.record_tx_failure(monitor_card)
-                        await self.monitor.log_event(
-                            monitor_card,
-                            f"⏭️ Hop {hop_index}/{hop_total} skipped: minimum ticket size",
-                            force=True,
-                        )
-                        return None, "MIN_TICKET_SIZE"
+            self._raise_if_stop_requested()
+            fee_cap = self.config.runtime.max_network_fee_cc_per_execution
+            if fee_cap is not None and not allow_network_fee_cap_bypass:
+                current_network_fee = await self._quote_current_hop_network_fee(
+                    sdk=sdk,
+                    hop=hop,
+                )
+                if current_network_fee is not None and current_network_fee > fee_cap:
                     logger.warning(
-                        "Swap gagal pada hop %s/%s round %s percobaan %s/%s: %s",
+                        "Swap hop %s/%s round %s dibatalkan sebelum submit karena fee terkini %s CC > batas %s CC",
+                        hop_index,
+                        hop_total,
+                        round_number,
+                        current_network_fee,
+                        fee_cap,
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        (
+                            f"? Hop {hop_index}/{hop_total} skipped: "
+                            f"current fee {current_network_fee} CC > limit {fee_cap} CC"
+                        ),
+                        force=True,
+                    )
+                    return None, "NETWORK_FEE_ABOVE_LIMIT"
+
+            event = await sdk.swap_and_confirm(
+                sell_amount=hop.sell_amount,
+                sell_instrument=hop.raw_quote.sell_instrument,
+                buy_instrument=hop.raw_quote.buy_instrument,
+                timeout=confirm_timeout,
+            )
+            await self.monitor.record_tx_success(monitor_card)
+            return (
+                {
+                    "id": getattr(event, "event_id", ""),
+                    "ledger_created_at": getattr(event, "ledger_created_at", ""),
+                    "input_amount": getattr(event, "input_amount", None),
+                    "output_amount": getattr(event, "output_amount", None),
+                    "output_instrument": getattr(getattr(event, "output_instrument", None), "id", ""),
+                    "admin_fee_amount": getattr(event, "admin_fee_amount", None),
+                    "liquidity_fee_amount": getattr(event, "liquidity_fee_amount", None),
+                    "raw": getattr(event, "raw", {}),
+                },
+                None,
+            )
+        except Exception as exc:
+            if self._is_signature_verification_error(exc):
+                await self.monitor.record_tx_failure(monitor_card)
+                raise RuntimeError(
+                    "Signature verification failed untuk swap intent. "
+                    "Kemungkinan CANTEX_TRADING_KEY tidak cocok dengan intent account wallet ini."
+                ) from exc
+            if self._is_min_ticket_error(exc):
+                logger.warning(
+                    "Swap hop %s/%s round %s gagal karena minimum ticket size: %s",
                     hop_index,
                     hop_total,
                     round_number,
-                    attempt,
-                        max_attempts,
-                        exc,
-                    )
-                    if attempt >= max_attempts:
-                        await self.monitor.record_tx_failure(monitor_card)
-                        await self.monitor.log_event(
-                            monitor_card,
-                            f"❌ Hop {hop_index}/{hop_total} failed after {max_attempts} attempts: {exc}",
-                            force=True,
-                        )
-                        return None, "SWAP_RETRY_EXHAUSTED"
-
-                    wait_seconds = max(self.config.runtime.retry_base_delay, 1.0) * attempt
-                    await self.monitor.log_event(
-                        monitor_card,
-                        f"🔁 Retry hop {hop_index}/{hop_total} attempt {attempt + 1}/{max_attempts} in {int(wait_seconds)}s",
-                    )
-                    await self._sleep_or_stop(wait_seconds)
-            return None, "SWAP_RETRY_EXHAUSTED"
+                    exc,
+                )
+                await self.monitor.record_tx_failure(monitor_card)
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏭️ Hop {hop_index}/{hop_total} skipped: minimum ticket size",
+                    force=True,
+                )
+                return None, "MIN_TICKET_SIZE"
+            logger.warning(
+                "Swap hop %s/%s round %s gagal, tidak di-retry: %s",
+                hop_index,
+                hop_total,
+                round_number,
+                exc,
+            )
+            await self.monitor.record_tx_failure(monitor_card)
+            await self.monitor.log_event(
+                monitor_card,
+                f"? Hop {hop_index}/{hop_total} failed without retry: {exc}",
+                force=True,
+            )
+            return None, "SWAP_EXECUTION_FAILED"
         finally:
             await self._release_free_fee_sequence_slot(
                 lock_acquired=lock_acquired,
@@ -2274,7 +2534,6 @@ class AutoswapBot:
                 monitor_card=monitor_card,
                 apply_delay=free_fee_sequential_account_name is not None,
             )
-
     async def _wait_for_network_fee_below_cap(
         self,
         *,
@@ -2291,6 +2550,7 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
         current_route: RoutePlan,
         account_name: str | None = None,
+        strict_amount: bool = False,
     ) -> tuple[RoutePlan, PlanIssue | None, DailyFreeFeeStatus | None]:
         fee_cap = self.config.runtime.max_network_fee_cc_per_execution
         if fee_cap is None:
@@ -2448,6 +2708,7 @@ class AutoswapBot:
                     proposed_amount=actual_amount,
                     round_number=round_number,
                     cc_reserve=cc_reserve,
+                    strict_amount=strict_amount,
                 )
             except RuntimeError as exc:
                 if not self._is_retryable_route_error(exc):
@@ -2500,7 +2761,7 @@ class AutoswapBot:
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"â³ Free fee queue: waiting turn for {account_name}",
+                f"⏳ Free fee queue: waiting turn for {account_name}",
             )
         await self._free_fee_swap_lock.acquire()
         logger.info(
@@ -2535,7 +2796,7 @@ class AutoswapBot:
                 )
                 await self.monitor.log_event(
                     monitor_card,
-                    f"â³ Free fee queue cooldown {int(wait_seconds)}s",
+                    f"⏳ Free fee queue cooldown {int(wait_seconds)}s",
                 )
                 try:
                     await self._sleep_or_stop(wait_seconds)
@@ -2838,6 +3099,7 @@ class AutoswapBot:
             )
             recovery_failed = False
             for hop_index, hop in enumerate(route.hops, start=1):
+                hop_balances_before = dict(balances)
                 tx_result, failure_reason = await self._swap_hop_with_retry(
                     sdk=sdk,
                     hop=hop,
@@ -2856,8 +3118,29 @@ class AutoswapBot:
                     )
                     break
                 total_tx += 1
-                used_network_fee[hop.network_fee_symbol] += hop.network_fee_amount
-                used_swap_fee[hop.fee_symbol] += hop.admin_fee_amount + hop.liquidity_fee_amount
+                settled_balances = await self._wait_for_hop_balance_settlement(
+                    sdk=sdk,
+                    previous_balances=hop_balances_before,
+                    hop=hop,
+                    tx_result=tx_result,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                )
+                actual_network_fee, actual_swap_fee = self._extract_actual_successful_hop_fees(
+                    hop=hop,
+                    tx_result=tx_result,
+                    balances_before=hop_balances_before,
+                    balances_after=settled_balances,
+                )
+                balances = settled_balances
+                await self.monitor.update_balances(
+                    monitor_card,
+                    balances,
+                )
+                for symbol, amount in actual_network_fee.items():
+                    used_network_fee[symbol] += amount
+                for symbol, amount in actual_swap_fee.items():
+                    used_swap_fee[symbol] += amount
                 await self.monitor.update_fee_totals(
                     monitor_card,
                     total_network_fee=dict(used_network_fee),
@@ -3739,6 +4022,7 @@ class AutoswapBot:
         proposed_amount: Decimal,
         round_number: int,
         cc_reserve: Decimal,
+        strict_amount: bool = False,
     ) -> tuple[RoutePlan, PlanIssue | None]:
         effective_cc_reserve = cc_reserve
         route = await router.choose_best_route(sell_symbol, buy_symbol, proposed_amount)
@@ -3751,7 +4035,7 @@ class AutoswapBot:
         if issue is None:
             return route, None
 
-        if sell_symbol == CC_SYMBOL:
+        if sell_symbol == CC_SYMBOL and not strict_amount:
             fee_buffer = route.total_network_fee_by_symbol.get(CC_SYMBOL, Decimal("0"))
             adjusted_amount = max(
                 Decimal("0"),
