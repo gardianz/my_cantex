@@ -2710,6 +2710,12 @@ class AutoswapBot:
             balances_before=balances_before,
             balances_after=balances_after,
         )
+        ws_network_fee = self._extract_actual_network_fee_from_ws_funding_events(
+            hop=hop,
+            tx_result=tx_result,
+        )
+        if ws_network_fee is not None:
+            return {hop.network_fee_symbol: ws_network_fee}, actual_swap_fee, balances_after
         if actual_network_fee:
             return actual_network_fee, actual_swap_fee, balances_after
 
@@ -2741,6 +2747,29 @@ class AutoswapBot:
                     )
                 return candidate_network_fee, candidate_swap_fee, candidate_balances
 
+        funding_network_fee = await self._fetch_actual_network_fee_from_funding_history(
+            sdk=sdk,
+            hop=hop,
+            tx_result=tx_result,
+            logger=logger,
+        )
+        if funding_network_fee is not None:
+            logger.info(
+                "Network fee hop %s -> %s diambil dari funding history: %s %s",
+                hop.sell_symbol,
+                hop.buy_symbol,
+                funding_network_fee,
+                hop.network_fee_symbol,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                (
+                    f"ℹ️ Network fee from funding history "
+                    f"{hop.sell_symbol}->{hop.buy_symbol}: {funding_network_fee} {hop.network_fee_symbol}"
+                ),
+            )
+            return {hop.network_fee_symbol: funding_network_fee}, actual_swap_fee, last_balances
+
         logger.warning(
             "Network fee aktual belum terdeteksi setelah swap sukses | %s -> %s | fee token=%s",
             hop.sell_symbol,
@@ -2756,6 +2785,174 @@ class AutoswapBot:
             force=True,
         )
         return actual_network_fee, actual_swap_fee, last_balances
+
+    def _serialize_funding_events(self, events: list[Any]) -> list[dict[str, Any]]:
+        serialized: list[dict[str, Any]] = []
+        for event in events:
+            instrument = getattr(event, "instrument", None)
+            serialized.append(
+                {
+                    "event_type": getattr(event, "event_type", ""),
+                    "event_id": getattr(event, "event_id", ""),
+                    "amount": str(getattr(event, "amount", "")),
+                    "instrument_id": getattr(instrument, "id", ""),
+                    "instrument_admin": getattr(instrument, "admin", ""),
+                    "sender": getattr(event, "sender", ""),
+                    "receiver": getattr(event, "receiver", ""),
+                    "ledger_created_at": getattr(event, "ledger_created_at", ""),
+                    "created_at": getattr(event, "created_at", ""),
+                    "raw": getattr(event, "raw", {}),
+                }
+            )
+        return serialized
+
+    def _extract_actual_network_fee_from_ws_funding_events(
+        self,
+        *,
+        hop: RouteHop,
+        tx_result: dict[str, Any],
+    ) -> Decimal | None:
+        if hop.network_fee_symbol != CC_SYMBOL:
+            return None
+        raw_events = tx_result.get("funding_events")
+        if not isinstance(raw_events, list):
+            return None
+
+        ledger_time = self._parse_datetime_like(tx_result.get("ledger_created_at"))
+        candidates: list[tuple[float, Decimal]] = []
+        for event in raw_events:
+            if not isinstance(event, dict):
+                continue
+            if not self._is_network_fee_funding_item(event):
+                continue
+            amount = self._extract_funding_history_cc_amount(event)
+            if amount is None or amount <= dust_for_symbol(CC_SYMBOL):
+                continue
+            if not self._observed_network_fee_is_plausible(symbol=CC_SYMBOL, amount=amount):
+                continue
+            timestamp = (
+                self._parse_datetime_like(event.get("ledger_created_at"))
+                or self._parse_datetime_like(event.get("created_at"))
+            )
+            distance = (
+                abs((timestamp - ledger_time).total_seconds())
+                if timestamp is not None and ledger_time is not None
+                else 0.0
+            )
+            candidates.append((distance, amount))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[0][1]
+
+    async def _fetch_actual_network_fee_from_funding_history(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        hop: RouteHop,
+        tx_result: dict[str, Any],
+        logger: AccountLoggerAdapter,
+    ) -> Decimal | None:
+        if hop.network_fee_symbol != CC_SYMBOL:
+            return None
+        try:
+            _, payload = await sdk.get_funding_history_payload()
+        except Exception as exc:
+            logger.debug("Gagal mengambil funding history untuk network fee fallback: %s", exc)
+            return None
+        if payload is None:
+            return None
+        return self._extract_network_fee_from_funding_history_payload(
+            payload,
+            tx_result=tx_result,
+        )
+
+    def _extract_network_fee_from_funding_history_payload(
+        self,
+        payload: Any,
+        *,
+        tx_result: dict[str, Any],
+    ) -> Decimal | None:
+        items = self._extract_funding_history_items(payload)
+        if not items:
+            return None
+
+        ledger_time = self._parse_datetime_like(tx_result.get("ledger_created_at"))
+        now_utc = datetime.now(timezone.utc)
+        lower_bound = (ledger_time or now_utc) - timedelta(minutes=5)
+        upper_bound = now_utc + timedelta(minutes=2)
+        if ledger_time is not None:
+            upper_bound = max(upper_bound, ledger_time + timedelta(minutes=10))
+
+        candidates: list[tuple[float, Decimal]] = []
+        for item in items:
+            if self._is_failed_history_item(item):
+                continue
+            timestamp = self._extract_item_timestamp(item)
+            if timestamp is not None and not (lower_bound <= timestamp <= upper_bound):
+                continue
+            if not self._is_network_fee_funding_item(item):
+                continue
+            amount = self._extract_funding_history_cc_amount(item)
+            if amount is None or amount <= dust_for_symbol(CC_SYMBOL):
+                continue
+            if not self._observed_network_fee_is_plausible(symbol=CC_SYMBOL, amount=amount):
+                continue
+            distance = (
+                abs((timestamp - ledger_time).total_seconds())
+                if timestamp is not None and ledger_time is not None
+                else 999999.0
+            )
+            candidates.append((distance, amount))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[0][1]
+
+    def _is_network_fee_funding_item(self, item: dict[str, Any]) -> bool:
+        try:
+            text = json.dumps(item, default=str).lower()
+        except Exception:
+            text = str(item).lower()
+        if any(token in text for token in ("pool-custodian", "pool custodian", "pool_custodian")):
+            return False
+        if "validator" in text:
+            return True
+        type_text = str(
+            self._find_value(item, {"type", "transaction_type", "kind", "category"}) or ""
+        ).strip().lower()
+        message_text = str(
+            self._find_value(item, {"message", "memo", "description", "note"}) or ""
+        ).strip().lower()
+        return any(token in f"{type_text} {message_text}" for token in ("network fee", "gas fee"))
+
+    def _extract_funding_history_cc_amount(self, item: dict[str, Any]) -> Decimal | None:
+        raw_symbol = self._find_value(
+            item,
+            {
+                "coin",
+                "currency",
+                "symbol",
+                "instrument_symbol",
+                "instrument_id",
+                "instrumentId",
+                "token_symbol",
+            },
+        )
+        if raw_symbol not in {None, ""}:
+            symbol_text = json.dumps(raw_symbol, default=str).lower()
+            if not any(token in symbol_text for token in ("cc", "canton", "amulet")):
+                return None
+        raw_amount = self._find_value(
+            item,
+            {"amount", "display_amount", "cc_amount", "amount_cc", "quantity", "value"},
+        )
+        amount = self._parse_decimal_like(raw_amount)
+        if amount is None:
+            return None
+        return abs(amount)
 
     def _observed_network_fee_is_plausible(
         self,
@@ -2892,9 +3089,10 @@ class AutoswapBot:
             submit_response = await sdk.submit_built_intent(build_payload)
 
             try:
-                event = await sdk.wait_for_swap_confirmation(
+                event, funding_events = await sdk.wait_for_swap_confirmation_with_funding_events(
                     ws,
                     timeout=confirm_timeout,
+                    funding_grace_timeout=3.0,
                 )
             finally:
                 if ws is not None and not keep_private_ws:
@@ -2912,6 +3110,7 @@ class AutoswapBot:
                     "admin_fee_amount": getattr(event, "admin_fee_amount", None),
                     "liquidity_fee_amount": getattr(event, "liquidity_fee_amount", None),
                     "build_network_fee_amount": build_network_fee,
+                    "funding_events": self._serialize_funding_events(funding_events),
                     "submit_response": submit_response,
                     "raw": getattr(event, "raw", {}),
                 },

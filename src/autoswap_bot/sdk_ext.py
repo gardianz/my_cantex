@@ -11,6 +11,7 @@ from cantex_sdk import (
     CantexError,
     CantexSDK,
     CantexTimeoutError,
+    FundingEvent,
     InstrumentId,
     SwapExecutedEvent,
     SwapFailedEvent,
@@ -197,6 +198,48 @@ class ExtendedCantexSDK(CantexSDK):
 
         try:
             return await asyncio.wait_for(_wait_for_confirmation(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise CantexTimeoutError(
+                f"Swap confirmation timed out after {timeout}s"
+            ) from None
+
+    async def wait_for_swap_confirmation_with_funding_events(
+        self,
+        ws: Any,
+        *,
+        timeout: float,
+        funding_grace_timeout: float = 3.0,
+    ) -> tuple[SwapExecutedEvent, list[FundingEvent]]:
+        funding_events: list[FundingEvent] = []
+
+        async def _wait_for_execution() -> SwapExecutedEvent:
+            async for event in ws:
+                if isinstance(event, FundingEvent):
+                    funding_events.append(event)
+                    continue
+                if isinstance(event, SwapPendingEvent):
+                    continue
+                if isinstance(event, SwapExecutedEvent):
+                    return event
+                if isinstance(event, SwapFailedEvent):
+                    raise CantexError(f"Swap failed: {event.error}")
+            raise CantexError("WebSocket closed before swap confirmation")
+
+        async def _collect_funding_events() -> None:
+            async for event in ws:
+                if isinstance(event, FundingEvent):
+                    funding_events.append(event)
+
+        try:
+            executed = await asyncio.wait_for(_wait_for_execution(), timeout=timeout)
+            try:
+                await asyncio.wait_for(
+                    _collect_funding_events(),
+                    timeout=max(0.1, funding_grace_timeout),
+                )
+            except asyncio.TimeoutError:
+                pass
+            return executed, funding_events
         except asyncio.TimeoutError:
             raise CantexTimeoutError(
                 f"Swap confirmation timed out after {timeout}s"
