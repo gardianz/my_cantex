@@ -184,7 +184,6 @@ class AutoswapBot:
         )
         self.runtime_state.ensure_account(account.name)
         sdk = self._build_sdk(account)
-        private_ws_holder: dict[str, Any] = {"ws": None}
 
         try:
             async with sdk:
@@ -213,13 +212,13 @@ class AutoswapBot:
                     monitor_card=monitor_card,
                     force_log=True,
                 )
-                synced_completed_rounds = await self._sync_round_progress_from_history(
+                synced_completed_rounds = await self._wait_for_activity_round_progress(
                     sdk=sdk,
                     account=account,
                     prepared_run=prepared_run,
                     logger=logger,
                     monitor_card=monitor_card,
-                    fallback_completed_rounds=result.completed_rounds,
+                    previous_completed_rounds=0,
                     force_log=True,
                 )
                 result.completed_rounds = synced_completed_rounds
@@ -233,7 +232,7 @@ class AutoswapBot:
                     )
                     if self._weekly_refill_due_utc():
                         logger.info("Weekly refill sudah jatuh tempo; skip tunggu quota harian")
-                    elif self.config.runtime.full_24h_auto_restart:
+                    else:
                         await self._wait_until_next_utc_day_after_quota(
                             logger=logger,
                             monitor_card=monitor_card,
@@ -396,7 +395,6 @@ class AutoswapBot:
                             result=result,
                             session_end_utc=session_end_utc,
                             schedule=schedule,
-                            private_ws_holder=private_ws_holder,
                         )
                         if result.stop_reason:
                             break
@@ -422,7 +420,6 @@ class AutoswapBot:
                         used_network_fee=used_network_fee,
                         used_swap_fee=used_swap_fee,
                         result=result,
-                        private_ws_holder=private_ws_holder,
                     )
 
                 final_info = await sdk.get_account_info()
@@ -1054,7 +1051,6 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
         used_network_fee: defaultdict[str, Decimal],
         used_swap_fee: defaultdict[str, Decimal],
-        private_ws_holder: dict[str, Any] | None = None,
     ) -> RoundExecutionResult:
         return await self._execute_round_dynamic(
             sdk=sdk,
@@ -1068,7 +1064,6 @@ class AutoswapBot:
             monitor_card=monitor_card,
             used_network_fee=used_network_fee,
             used_swap_fee=used_swap_fee,
-            private_ws_holder=private_ws_holder,
         )
 
     async def _execute_round_dynamic(
@@ -1085,7 +1080,6 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
         used_network_fee: defaultdict[str, Decimal],
         used_swap_fee: defaultdict[str, Decimal],
-        private_ws_holder: dict[str, Any] | None = None,
     ) -> RoundExecutionResult:
         tx_count = 0
         sell_symbol = "-"
@@ -1106,7 +1100,6 @@ class AutoswapBot:
             monitor_card=monitor_card,
             used_network_fee=used_network_fee,
             used_swap_fee=used_swap_fee,
-            private_ws_holder=private_ws_holder,
         )
         try:
             info = await sdk.get_account_info()
@@ -1620,7 +1613,6 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
         used_network_fee: defaultdict[str, Decimal],
         used_swap_fee: defaultdict[str, Decimal],
-        private_ws_holder: dict[str, Any] | None = None,
     ) -> RoundExecutionResult:
         tx_count = 0
         sell_symbol = "-"
@@ -1964,7 +1956,6 @@ class AutoswapBot:
                 allow_network_fee_cap_bypass=(
                     daily_free_fee_status is not None and hop_index == 1
                 ),
-                private_ws_holder=private_ws_holder,
             )
             if tx_result is None:
                 await self.monitor.log_event(
@@ -2494,94 +2485,6 @@ class AutoswapBot:
             return Decimal("0")
         return route.final_amount
 
-    def _extract_network_fee_from_intent_build(
-        self,
-        payload: Any,
-    ) -> Decimal | None:
-        candidates: list[Decimal] = []
-        fee_markers = (
-            "network_fee",
-            "networkfee",
-            "gas_fee",
-            "gasfee",
-            "execution_fee",
-            "executionfee",
-        )
-
-        def visit(value: Any, path: tuple[str, ...]) -> None:
-            path_text = ".".join(path).lower()
-            if isinstance(value, dict):
-                if any(marker in path_text for marker in fee_markers):
-                    for amount_key in (
-                        "amount",
-                        "network_fee_amount",
-                        "networkFeeAmount",
-                        "gas_fee_amount",
-                        "gasFeeAmount",
-                        "execution_fee_amount",
-                        "executionFeeAmount",
-                    ):
-                        amount = self._parse_decimal_like(value.get(amount_key))
-                        if amount is not None and amount > 0:
-                            candidates.append(amount)
-                for key, child in value.items():
-                    visit(child, (*path, str(key)))
-                return
-            if isinstance(value, list):
-                for index, child in enumerate(value):
-                    visit(child, (*path, str(index)))
-                return
-            if any(marker in path_text for marker in fee_markers):
-                amount = self._parse_decimal_like(value)
-                if amount is not None and amount > 0:
-                    candidates.append(amount)
-
-        visit(payload, ())
-        if not candidates:
-            return None
-        return max(candidates)
-
-    async def _ensure_private_ws(
-        self,
-        *,
-        sdk: ExtendedCantexSDK,
-        holder: dict[str, Any],
-    ) -> Any:
-        ws = holder.get("ws")
-        if ws is not None and not getattr(ws, "closed", False):
-            return ws
-        ws = await sdk.open_private_ws()
-        holder["ws"] = ws
-        return ws
-
-    async def _close_private_ws_holder(self, holder: dict[str, Any] | None) -> None:
-        if holder is None:
-            return
-        ws = holder.get("ws")
-        holder["ws"] = None
-        if ws is None:
-            return
-        try:
-            await ws.close()
-        except Exception:
-            return
-
-    async def _quote_current_hop_network_fee(
-        self,
-        *,
-        sdk: ExtendedCantexSDK,
-        hop: RouteHop,
-    ) -> Decimal | None:
-        quote = await sdk.get_swap_quote(
-            sell_amount=hop.sell_amount,
-            sell_instrument=hop.raw_quote.sell_instrument,
-            buy_instrument=hop.raw_quote.buy_instrument,
-        )
-        network_fee_instrument = getattr(quote.fees.network_fee.instrument, "id", "")
-        if network_fee_instrument != CC_SYMBOL:
-            return None
-        return quote.fees.network_fee.amount
-
     async def _wait_for_hop_balance_settlement(
         self,
         *,
@@ -2639,12 +2542,7 @@ class AutoswapBot:
         if not sell_observed or not buy_observed:
             return False
 
-        if hop.network_fee_symbol in {hop.sell_symbol, hop.buy_symbol}:
-            return True
-
-        fee_previous = previous_balances.get(hop.network_fee_symbol, Decimal("0"))
-        fee_current = current_balances.get(hop.network_fee_symbol, Decimal("0"))
-        return fee_current < (fee_previous - dust_for_symbol(hop.network_fee_symbol))
+        return True
 
     def _extract_actual_successful_hop_fees(
         self,
@@ -2654,8 +2552,6 @@ class AutoswapBot:
         balances_before: dict[str, Decimal],
         balances_after: dict[str, Decimal],
     ) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
-        actual_input_amount = self._parse_decimal_like(tx_result.get("input_amount")) or hop.sell_amount
-        actual_output_amount = self._parse_decimal_like(tx_result.get("output_amount")) or hop.returned_amount
         actual_admin_fee = self._parse_decimal_like(tx_result.get("admin_fee_amount")) or hop.admin_fee_amount
         actual_liquidity_fee = (
             self._parse_decimal_like(tx_result.get("liquidity_fee_amount")) or hop.liquidity_fee_amount
@@ -2666,30 +2562,9 @@ class AutoswapBot:
         if swap_fee_total > 0:
             actual_swap_fee[hop.fee_symbol] = swap_fee_total
 
-        observed_delta = (
-            balances_after.get(hop.network_fee_symbol, Decimal("0"))
-            - balances_before.get(hop.network_fee_symbol, Decimal("0"))
-        )
-        fallback_network_fee = self._parse_decimal_like(tx_result.get("build_network_fee_amount"))
-        expected_delta_without_network_fee = Decimal("0")
-        if hop.sell_symbol == hop.network_fee_symbol:
-            expected_delta_without_network_fee -= actual_input_amount
-        if hop.buy_symbol == hop.network_fee_symbol:
-            expected_delta_without_network_fee += actual_output_amount
-        inferred_network_fee = -(observed_delta - expected_delta_without_network_fee)
-        if inferred_network_fee <= dust_for_symbol(hop.network_fee_symbol):
-            inferred_network_fee = fallback_network_fee or Decimal("0")
-        if inferred_network_fee < 0:
-            inferred_network_fee = fallback_network_fee or Decimal("0")
-        if not self._observed_network_fee_is_plausible(
-            symbol=hop.network_fee_symbol,
-            amount=inferred_network_fee,
-        ):
-            inferred_network_fee = Decimal("0")
-
         actual_network_fee: dict[str, Decimal] = {}
-        if inferred_network_fee > 0:
-            actual_network_fee[hop.network_fee_symbol] = inferred_network_fee
+        if hop.network_fee_amount > 0:
+            actual_network_fee[hop.network_fee_symbol] = hop.network_fee_amount
 
         return actual_network_fee, actual_swap_fee
 
@@ -2710,265 +2585,13 @@ class AutoswapBot:
             balances_before=balances_before,
             balances_after=balances_after,
         )
-        ws_network_fee = self._extract_actual_network_fee_from_ws_funding_events(
-            hop=hop,
-            tx_result=tx_result,
-        )
-        if ws_network_fee is not None:
-            return {hop.network_fee_symbol: ws_network_fee}, actual_swap_fee, balances_after
-        if actual_network_fee:
-            return actual_network_fee, actual_swap_fee, balances_after
-
-        # Account balances can lag behind SwapExecuted. If we move on too early,
-        # this hop logs net=- and the delayed CC fee can leak into the next hop.
-        wait_seconds = max(0.5, min(self.config.runtime.retry_base_delay, 1.0))
-        max_polls = max(8, self.config.runtime.max_retries * 4)
-        last_balances = balances_after
-        for poll_index in range(max_polls):
-            self._raise_if_stop_requested()
-            await self._sleep_or_stop(wait_seconds)
-            info = await sdk.get_account_info()
-            candidate_balances = self._balances_by_symbol(info)
-            candidate_network_fee, candidate_swap_fee = self._extract_actual_successful_hop_fees(
-                hop=hop,
-                tx_result=tx_result,
-                balances_before=balances_before,
-                balances_after=candidate_balances,
-            )
-            last_balances = candidate_balances
-            if candidate_network_fee:
-                if poll_index > 0:
-                    logger.info(
-                        "Network fee settlement hop %s -> %s muncul setelah poll %s/%s",
-                        hop.sell_symbol,
-                        hop.buy_symbol,
-                        poll_index + 1,
-                        max_polls,
-                    )
-                return candidate_network_fee, candidate_swap_fee, candidate_balances
-
-        funding_network_fee = await self._fetch_actual_network_fee_from_funding_history(
-            sdk=sdk,
-            hop=hop,
-            tx_result=tx_result,
-            logger=logger,
-        )
-        if funding_network_fee is not None:
-            logger.info(
-                "Network fee hop %s -> %s diambil dari funding history: %s %s",
-                hop.sell_symbol,
-                hop.buy_symbol,
-                funding_network_fee,
-                hop.network_fee_symbol,
-            )
-            await self.monitor.log_event(
-                monitor_card,
-                (
-                    f"ℹ️ Network fee from funding history "
-                    f"{hop.sell_symbol}->{hop.buy_symbol}: {funding_network_fee} {hop.network_fee_symbol}"
-                ),
-            )
-            return {hop.network_fee_symbol: funding_network_fee}, actual_swap_fee, last_balances
-
-        logger.warning(
-            "Network fee aktual belum terdeteksi setelah swap sukses | %s -> %s | fee token=%s",
+        logger.info(
+            "Network fee hop %s -> %s dicatat dari quote swap: %s",
             hop.sell_symbol,
             hop.buy_symbol,
-            hop.network_fee_symbol,
+            self._format_amount_map(actual_network_fee),
         )
-        await self.monitor.log_event(
-            monitor_card,
-            (
-                f"⚠️ Network fee pending after {hop.sell_symbol}->{hop.buy_symbol}; "
-                "balance settlement belum menampilkan fee"
-            ),
-            force=True,
-        )
-        return actual_network_fee, actual_swap_fee, last_balances
-
-    def _serialize_funding_events(self, events: list[Any]) -> list[dict[str, Any]]:
-        serialized: list[dict[str, Any]] = []
-        for event in events:
-            instrument = getattr(event, "instrument", None)
-            serialized.append(
-                {
-                    "event_type": getattr(event, "event_type", ""),
-                    "event_id": getattr(event, "event_id", ""),
-                    "amount": str(getattr(event, "amount", "")),
-                    "instrument_id": getattr(instrument, "id", ""),
-                    "instrument_admin": getattr(instrument, "admin", ""),
-                    "sender": getattr(event, "sender", ""),
-                    "receiver": getattr(event, "receiver", ""),
-                    "ledger_created_at": getattr(event, "ledger_created_at", ""),
-                    "created_at": getattr(event, "created_at", ""),
-                    "raw": getattr(event, "raw", {}),
-                }
-            )
-        return serialized
-
-    def _extract_actual_network_fee_from_ws_funding_events(
-        self,
-        *,
-        hop: RouteHop,
-        tx_result: dict[str, Any],
-    ) -> Decimal | None:
-        if hop.network_fee_symbol != CC_SYMBOL:
-            return None
-        raw_events = tx_result.get("funding_events")
-        if not isinstance(raw_events, list):
-            return None
-
-        ledger_time = self._parse_datetime_like(tx_result.get("ledger_created_at"))
-        candidates: list[tuple[float, Decimal]] = []
-        for event in raw_events:
-            if not isinstance(event, dict):
-                continue
-            if not self._is_network_fee_funding_item(event):
-                continue
-            amount = self._extract_funding_history_cc_amount(event)
-            if amount is None or amount <= dust_for_symbol(CC_SYMBOL):
-                continue
-            if not self._observed_network_fee_is_plausible(symbol=CC_SYMBOL, amount=amount):
-                continue
-            timestamp = (
-                self._parse_datetime_like(event.get("ledger_created_at"))
-                or self._parse_datetime_like(event.get("created_at"))
-            )
-            distance = (
-                abs((timestamp - ledger_time).total_seconds())
-                if timestamp is not None and ledger_time is not None
-                else 0.0
-            )
-            candidates.append((distance, amount))
-
-        if not candidates:
-            return None
-        candidates.sort(key=lambda item: (item[0], item[1]))
-        return candidates[0][1]
-
-    async def _fetch_actual_network_fee_from_funding_history(
-        self,
-        *,
-        sdk: ExtendedCantexSDK,
-        hop: RouteHop,
-        tx_result: dict[str, Any],
-        logger: AccountLoggerAdapter,
-    ) -> Decimal | None:
-        if hop.network_fee_symbol != CC_SYMBOL:
-            return None
-        try:
-            _, payload = await sdk.get_funding_history_payload()
-        except Exception as exc:
-            logger.debug("Gagal mengambil funding history untuk network fee fallback: %s", exc)
-            return None
-        if payload is None:
-            return None
-        return self._extract_network_fee_from_funding_history_payload(
-            payload,
-            tx_result=tx_result,
-        )
-
-    def _extract_network_fee_from_funding_history_payload(
-        self,
-        payload: Any,
-        *,
-        tx_result: dict[str, Any],
-    ) -> Decimal | None:
-        items = self._extract_funding_history_items(payload)
-        if not items:
-            return None
-
-        ledger_time = self._parse_datetime_like(tx_result.get("ledger_created_at"))
-        now_utc = datetime.now(timezone.utc)
-        lower_bound = (ledger_time or now_utc) - timedelta(minutes=5)
-        upper_bound = now_utc + timedelta(minutes=2)
-        if ledger_time is not None:
-            upper_bound = max(upper_bound, ledger_time + timedelta(minutes=10))
-
-        candidates: list[tuple[float, Decimal]] = []
-        for item in items:
-            if self._is_failed_history_item(item):
-                continue
-            timestamp = self._extract_item_timestamp(item)
-            if timestamp is not None and not (lower_bound <= timestamp <= upper_bound):
-                continue
-            if not self._is_network_fee_funding_item(item):
-                continue
-            amount = self._extract_funding_history_cc_amount(item)
-            if amount is None or amount <= dust_for_symbol(CC_SYMBOL):
-                continue
-            if not self._observed_network_fee_is_plausible(symbol=CC_SYMBOL, amount=amount):
-                continue
-            distance = (
-                abs((timestamp - ledger_time).total_seconds())
-                if timestamp is not None and ledger_time is not None
-                else 999999.0
-            )
-            candidates.append((distance, amount))
-
-        if not candidates:
-            return None
-        candidates.sort(key=lambda item: (item[0], item[1]))
-        return candidates[0][1]
-
-    def _is_network_fee_funding_item(self, item: dict[str, Any]) -> bool:
-        try:
-            text = json.dumps(item, default=str).lower()
-        except Exception:
-            text = str(item).lower()
-        if any(token in text for token in ("pool-custodian", "pool custodian", "pool_custodian")):
-            return False
-        if "validator" in text:
-            return True
-        type_text = str(
-            self._find_value(item, {"type", "transaction_type", "kind", "category"}) or ""
-        ).strip().lower()
-        message_text = str(
-            self._find_value(item, {"message", "memo", "description", "note"}) or ""
-        ).strip().lower()
-        return any(token in f"{type_text} {message_text}" for token in ("network fee", "gas fee"))
-
-    def _extract_funding_history_cc_amount(self, item: dict[str, Any]) -> Decimal | None:
-        raw_symbol = self._find_value(
-            item,
-            {
-                "coin",
-                "currency",
-                "symbol",
-                "instrument_symbol",
-                "instrument_id",
-                "instrumentId",
-                "token_symbol",
-            },
-        )
-        if raw_symbol not in {None, ""}:
-            symbol_text = json.dumps(raw_symbol, default=str).lower()
-            if not any(token in symbol_text for token in ("cc", "canton", "amulet")):
-                return None
-        raw_amount = self._find_value(
-            item,
-            {"amount", "display_amount", "cc_amount", "amount_cc", "quantity", "value"},
-        )
-        amount = self._parse_decimal_like(raw_amount)
-        if amount is None:
-            return None
-        return abs(amount)
-
-    def _observed_network_fee_is_plausible(
-        self,
-        *,
-        symbol: str,
-        amount: Decimal,
-    ) -> bool:
-        if amount <= 0:
-            return True
-        if symbol != CC_SYMBOL:
-            return True
-        fee_cap = self.config.runtime.max_network_fee_cc_per_execution
-        threshold = Decimal("2")
-        if fee_cap is not None:
-            threshold = max(threshold, fee_cap * Decimal("5"))
-        return amount <= threshold
+        return actual_network_fee, actual_swap_fee, balances_after
 
     async def _swap_hop_with_retry(
         self,
@@ -2982,12 +2605,9 @@ class AutoswapBot:
         monitor_card: TelegramCardState | None,
         free_fee_sequential_account_name: str | None = None,
         allow_network_fee_cap_bypass: bool = False,
-        private_ws_holder: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         confirm_timeout = max(float(hop.estimated_time_seconds) * 3.0, 30.0)
         lock_acquired = False
-        ws_open_task: asyncio.Task[Any] | None = None
-        keep_private_ws = private_ws_holder is not None
         if free_fee_sequential_account_name is not None:
             lock_acquired = await self._acquire_free_fee_sequence_slot(
                 account_name=free_fee_sequential_account_name,
@@ -2998,35 +2618,10 @@ class AutoswapBot:
         try:
             self._raise_if_stop_requested()
             fee_cap = self.config.runtime.max_network_fee_cc_per_execution
-            ws = None
-            if private_ws_holder is not None:
-                ws_open_task = asyncio.create_task(
-                    self._ensure_private_ws(
-                        sdk=sdk,
-                        holder=private_ws_holder,
-                    )
-                )
-            build_payload = await sdk.build_swap_intent_payload(
-                sell_amount=hop.sell_amount,
-                sell_instrument=hop.raw_quote.sell_instrument,
-                buy_instrument=hop.raw_quote.buy_instrument,
-            )
-            build_network_fee = self._extract_network_fee_from_intent_build(
-                build_payload,
-            )
             effective_preflight_fee = (
-                build_network_fee
-                if build_network_fee is not None
-                else (
-                    hop.network_fee_amount
-                    if hop.network_fee_symbol == CC_SYMBOL
-                    else None
-                )
-            )
-            build_fee_text = (
-                f"{build_network_fee} CC"
-                if build_network_fee is not None
-                else "-"
+                hop.network_fee_amount
+                if hop.network_fee_symbol == CC_SYMBOL
+                else None
             )
             quote_fee_text = (
                 f"{hop.network_fee_amount} CC"
@@ -3034,11 +2629,10 @@ class AutoswapBot:
                 else "-"
             )
             logger.info(
-                "Swap hop %s/%s round %s fee preflight build=%s | fee quote=%s",
+                "Swap hop %s/%s round %s memakai SDK swap_and_confirm | fee quote=%s",
                 hop_index,
                 hop_total,
                 round_number,
-                build_fee_text,
                 quote_fee_text,
             )
             self._schedule_monitor_call(
@@ -3046,7 +2640,6 @@ class AutoswapBot:
                     monitor_card,
                     (
                         f"[preflight] Hop {hop_index}/{hop_total} "
-                        f"build fee={build_fee_text} | "
                         f"quote fee={quote_fee_text}"
                     ),
                 ),
@@ -3078,26 +2671,12 @@ class AutoswapBot:
                 )
                 return None, "NETWORK_FEE_ABOVE_LIMIT"
 
-            if ws is None:
-                if ws_open_task is not None:
-                    ws = await ws_open_task
-                    ws_open_task = None
-                else:
-                    ws = await sdk.open_private_ws()
-                    keep_private_ws = False
-
-            submit_response = await sdk.submit_built_intent(build_payload)
-
-            try:
-                event, funding_events = await sdk.wait_for_swap_confirmation_with_funding_events(
-                    ws,
-                    timeout=confirm_timeout,
-                    funding_grace_timeout=3.0,
-                )
-            finally:
-                if ws is not None and not keep_private_ws:
-                    await ws.close()
-                    ws = None
+            event = await sdk.swap_and_confirm(
+                sell_amount=hop.sell_amount,
+                sell_instrument=hop.raw_quote.sell_instrument,
+                buy_instrument=hop.raw_quote.buy_instrument,
+                timeout=confirm_timeout,
+            )
 
             await self.monitor.record_tx_success(monitor_card)
             return (
@@ -3109,18 +2688,13 @@ class AutoswapBot:
                     "output_instrument": getattr(getattr(event, "output_instrument", None), "id", ""),
                     "admin_fee_amount": getattr(event, "admin_fee_amount", None),
                     "liquidity_fee_amount": getattr(event, "liquidity_fee_amount", None),
-                    "build_network_fee_amount": build_network_fee,
-                    "funding_events": self._serialize_funding_events(funding_events),
-                    "submit_response": submit_response,
+                    "quote_network_fee_amount": hop.network_fee_amount,
+                    "quote_network_fee_symbol": hop.network_fee_symbol,
                     "raw": getattr(event, "raw", {}),
                 },
                 None,
             )
         except Exception as exc:
-            if private_ws_holder is not None:
-                await self._close_private_ws_holder(private_ws_holder)
-                ws = None
-                keep_private_ws = False
             if self._is_signature_verification_error(exc):
                 await self.monitor.record_tx_failure(monitor_card)
                 raise RuntimeError(
@@ -3157,18 +2731,6 @@ class AutoswapBot:
             )
             return None, "SWAP_EXECUTION_FAILED"
         finally:
-            if ws_open_task is not None:
-                if ws_open_task.done():
-                    try:
-                        await ws_open_task
-                    except Exception:
-                        pass
-                else:
-                    ws_open_task.cancel()
-            if private_ws_holder is not None and ws is not None and getattr(ws, "closed", False):
-                private_ws_holder["ws"] = None
-            if ws is not None and not keep_private_ws:
-                await ws.close()
             await self._release_free_fee_sequence_slot(
                 lock_acquired=lock_acquired,
                 logger=logger,
@@ -3848,7 +3410,6 @@ class AutoswapBot:
         used_network_fee: defaultdict[str, Decimal],
         used_swap_fee: defaultdict[str, Decimal],
         result: AccountResult,
-        private_ws_holder: dict[str, Any] | None = None,
     ) -> None:
         while result.completed_rounds < prepared_run.rounds:
             self._raise_if_stop_requested()
@@ -3861,6 +3422,26 @@ class AutoswapBot:
                     used_network_fee=used_network_fee,
                     used_swap_fee=used_swap_fee,
                     result=result,
+                )
+                return
+            result.completed_rounds = await self._wait_for_activity_round_progress(
+                sdk=sdk,
+                account=account,
+                prepared_run=prepared_run,
+                logger=logger,
+                monitor_card=monitor_card,
+                previous_completed_rounds=result.completed_rounds,
+            )
+            result.swap_transactions = result.completed_rounds
+            self._persist_round_session_progress(
+                account=account,
+                prepared_run=prepared_run,
+                result=result,
+            )
+            if result.completed_rounds >= prepared_run.rounds:
+                await self._wait_until_next_utc_day_after_quota(
+                    logger=logger,
+                    monitor_card=monitor_card,
                 )
                 return
             current_round_number = result.completed_rounds + 1
@@ -3915,22 +3496,29 @@ class AutoswapBot:
                 monitor_card=monitor_card,
                 used_network_fee=used_network_fee,
                 used_swap_fee=used_swap_fee,
-                private_ws_holder=private_ws_holder,
             )
             if round_result.completed:
-                result.completed_rounds += 1
-                result.swap_transactions += 1
+                result.completed_rounds = await self._wait_for_activity_round_progress(
+                    sdk=sdk,
+                    account=account,
+                    prepared_run=prepared_run,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    previous_completed_rounds=result.completed_rounds,
+                    require_increment=True,
+                    force_log=True,
+                )
+                result.swap_transactions = result.completed_rounds
                 self._persist_round_session_progress(
                     account=account,
                     prepared_run=prepared_run,
                     result=result,
                 )
                 if result.completed_rounds >= prepared_run.rounds:
-                    if self.config.runtime.full_24h_auto_restart:
-                        await self._wait_until_next_utc_day_after_quota(
-                            logger=logger,
-                            monitor_card=monitor_card,
-                        )
+                    await self._wait_until_next_utc_day_after_quota(
+                        logger=logger,
+                        monitor_card=monitor_card,
+                    )
                     return
                 await self._sleep_after_direct_24h_success(
                     logger=logger,
@@ -3969,7 +3557,6 @@ class AutoswapBot:
         result: AccountResult,
         session_end_utc: datetime,
         schedule: tuple[ScheduledRound, ...],
-        private_ws_holder: dict[str, Any] | None = None,
     ) -> None:
         for scheduled_round in schedule:
             self._raise_if_stop_requested()
@@ -3985,6 +3572,26 @@ class AutoswapBot:
                 )
                 return
             if result.completed_rounds >= prepared_run.rounds:
+                return
+            result.completed_rounds = await self._wait_for_activity_round_progress(
+                sdk=sdk,
+                account=account,
+                prepared_run=prepared_run,
+                logger=logger,
+                monitor_card=monitor_card,
+                previous_completed_rounds=result.completed_rounds,
+            )
+            result.swap_transactions = result.completed_rounds
+            self._persist_round_session_progress(
+                account=account,
+                prepared_run=prepared_run,
+                result=result,
+            )
+            if result.completed_rounds >= prepared_run.rounds:
+                await self._wait_until_next_utc_day_after_quota(
+                    logger=logger,
+                    monitor_card=monitor_card,
+                )
                 return
             now_utc = datetime.now(timezone.utc)
             if now_utc >= session_end_utc:
@@ -4052,16 +3659,30 @@ class AutoswapBot:
                 monitor_card=monitor_card,
                 used_network_fee=used_network_fee,
                 used_swap_fee=used_swap_fee,
-                private_ws_holder=private_ws_holder,
             )
             if round_result.completed:
-                result.completed_rounds += 1
-                result.swap_transactions += 1
+                result.completed_rounds = await self._wait_for_activity_round_progress(
+                    sdk=sdk,
+                    account=account,
+                    prepared_run=prepared_run,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    previous_completed_rounds=result.completed_rounds,
+                    require_increment=True,
+                    force_log=True,
+                )
+                result.swap_transactions = result.completed_rounds
                 self._persist_round_session_progress(
                     account=account,
                     prepared_run=prepared_run,
                     result=result,
                 )
+                if result.completed_rounds >= prepared_run.rounds:
+                    await self._wait_until_next_utc_day_after_quota(
+                        logger=logger,
+                        monitor_card=monitor_card,
+                    )
+                    return
             elif not round_result.skipped and round_result.stop_reason is not None:
                 result.stop_reason = round_result.stop_reason
                 return
@@ -4367,7 +3988,7 @@ class AutoswapBot:
             )
         return synced_status
 
-    async def _sync_round_progress_from_history(
+    async def _wait_for_activity_round_progress(
         self,
         *,
         sdk: ExtendedCantexSDK,
@@ -4375,51 +3996,100 @@ class AutoswapBot:
         prepared_run: PreparedAccountRun,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
-        fallback_completed_rounds: int,
+        previous_completed_rounds: int,
+        require_increment: bool = False,
         force_log: bool = False,
     ) -> int:
+        target_minimum = max(min(previous_completed_rounds, prepared_run.rounds), 0)
+        if require_increment:
+            target_minimum = min(previous_completed_rounds + 1, prepared_run.rounds)
+        if previous_completed_rounds >= prepared_run.rounds:
+            target_minimum = prepared_run.rounds
+
+        while True:
+            synced_completed_rounds = await self._sync_round_progress_from_activity(
+                sdk=sdk,
+                account=account,
+                prepared_run=prepared_run,
+                logger=logger,
+                monitor_card=monitor_card,
+                previous_completed_rounds=previous_completed_rounds,
+                force_log=force_log,
+            )
+            if synced_completed_rounds is not None and (
+                synced_completed_rounds >= target_minimum
+                or synced_completed_rounds >= prepared_run.rounds
+            ):
+                return synced_completed_rounds
+
+            wait_seconds = self._sample_network_fee_poll_seconds()
+            displayed_rounds = synced_completed_rounds
+            if displayed_rounds is None:
+                displayed_rounds = max(min(previous_completed_rounds, prepared_run.rounds), 0)
+            logger.info(
+                "Menunggu activity 24h update | current=%s | target_min=%s | tunggu=%.0fs",
+                displayed_rounds,
+                target_minimum,
+                wait_seconds,
+            )
+            await self.monitor.update_status(
+                monitor_card,
+                phase="WAITING",
+                next_wait_seconds=wait_seconds,
+                clear_route=True,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                (
+                    f"⏳ Waiting activity 24h swaps update "
+                    f"({displayed_rounds}/{prepared_run.rounds})"
+                ),
+                force=force_log,
+            )
+            await self._sleep_or_stop(wait_seconds)
+
+    async def _sync_round_progress_from_activity(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        account: AccountConfig,
+        prepared_run: PreparedAccountRun,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        previous_completed_rounds: int,
+        force_log: bool = False,
+    ) -> int | None:
         synced_completed_rounds = min(
-            max(int(fallback_completed_rounds), 0),
+            max(int(previous_completed_rounds), 0),
             prepared_run.rounds,
         )
         try:
-            source_path, payload = await sdk.get_trading_history_payload()
+            source_path, activity_payload = await sdk.get_activity_payload()
+            activity_count = self._count_activity_payload_swaps_24h(activity_payload)
         except Exception as exc:
-            logger.warning("Gagal mengambil trading history untuk round sync: %s", exc)
+            logger.warning("Gagal mengambil activity untuk round sync: %s", exc)
             await self.monitor.sync_round_progress(
                 monitor_card,
                 completed_rounds=synced_completed_rounds,
                 force=force_log,
             )
-            return synced_completed_rounds
+            return None
 
-        if payload is None:
+        if activity_count is None:
+            logger.warning("Activity 24h swaps belum tersedia untuk round sync")
             await self.monitor.sync_round_progress(
                 monitor_card,
                 completed_rounds=synced_completed_rounds,
                 force=force_log,
             )
-            return synced_completed_rounds
-
-        history_today_count = self._count_today_trading_history_swaps(payload)
-        if history_today_count is None:
-            await self.monitor.sync_round_progress(
-                monitor_card,
-                completed_rounds=synced_completed_rounds,
-                force=force_log,
-            )
-            return synced_completed_rounds
+            return None
 
         await self.monitor.sync_daily_ok_tx_from_history(
             monitor_card,
-            ok_tx_count=history_today_count,
+            ok_tx_count=activity_count,
             force=force_log,
         )
-        history_completed_rounds = min(max(history_today_count, 0), prepared_run.rounds)
-        synced_completed_rounds = max(
-            min(max(int(fallback_completed_rounds), 0), prepared_run.rounds),
-            history_completed_rounds,
-        )
+        synced_completed_rounds = min(max(activity_count, 0), prepared_run.rounds)
         self.runtime_state.update_round_session_progress(
             account.name,
             strategy_name=prepared_run.strategy_name,
@@ -4431,25 +4101,18 @@ class AutoswapBot:
             completed_rounds=synced_completed_rounds,
             force=force_log,
         )
-        if force_log or synced_completed_rounds != fallback_completed_rounds:
+        if force_log or synced_completed_rounds != previous_completed_rounds:
             logger.info(
-                "Round sync | source=%s | history_swap_hari_ini=%s | fallback=%s | progress=%s/%s",
+                "Round sync | source=%s | activity_swap_24h=%s | progress=%s/%s",
                 source_path or "-",
-                history_today_count,
-                fallback_completed_rounds,
+                activity_count,
                 synced_completed_rounds,
                 prepared_run.rounds,
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"🔁 Round sync from history: {synced_completed_rounds}/{prepared_run.rounds}",
+                f"🔁 Round sync from activity: {synced_completed_rounds}/{prepared_run.rounds}",
                 force=force_log,
-            )
-        if history_completed_rounds < fallback_completed_rounds:
-            logger.info(
-                "Round sync menjaga progress lokal | history=%s < local=%s",
-                history_completed_rounds,
-                fallback_completed_rounds,
             )
         return synced_completed_rounds
 
@@ -4491,6 +4154,24 @@ class AutoswapBot:
         normalized = dt.astimezone(timezone.utc)
         next_day = normalized.date() + timedelta(days=1)
         return datetime.combine(next_day, datetime.min.time(), tzinfo=timezone.utc)
+
+    def _count_activity_payload_swaps_24h(self, payload: Any) -> int | None:
+        if payload is None:
+            return None
+        raw_count = self._find_value(
+            payload,
+            {
+                "count_24h",
+                "swaps_24h",
+                "swaps24h",
+                "24h_swaps",
+                "twenty_four_hour_swaps",
+            },
+        )
+        count = self._parse_decimal_like(raw_count)
+        if count is None:
+            return None
+        return max(int(count), 0)
 
     def _count_today_trading_history_swaps(self, payload: Any) -> int | None:
         items = self._extract_trading_history_items(payload)

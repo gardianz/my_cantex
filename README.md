@@ -11,7 +11,7 @@ Fitur utama:
 - Validasi balance, minimum protocol, dan fee sebelum submit swap
 - Reserve `CC` berbasis `reserve_fee` per account
 - Optimasi route `direct` vs `1-hop`
-- `1 swap sukses = 1 round selesai`
+- Progress round disinkronkan dari activity 24h Cantex; `1 swap sukses = 1 round selesai`
 - Bot selalu berjalan dalam mode 24 jam berbasis UTC
 - Saat start bot selalu meminta pilihan mode startup `1-4`
 - Monitor Telegram gabungan dalam 1 pesan
@@ -167,8 +167,8 @@ auto_create_intent_account = true
   - Cantex saat ini memberi `3x free fee swap` per account per hari UTC
   - Bot otomatis mencoba memakai jatah ini mulai `01:00 UTC`
   - Hanya hop pertama yang benar-benar memakai jatah free swap harian boleh bypass batas fee ini
-  - Bot akan mencoba menyinkronkan pemakaian jatah ini dari endpoint history trading lebih dulu
-  - Jika history hari ini sudah menunjukkan `3` swap, bot akan menganggap jatah free swap hari itu sudah habis
+  - Progress round harian memakai angka activity `24 HOURS ... SWAPS` dari Cantex
+  - Jika activity 24h sudah menunjukkan swap >= `rounds`, bot menunggu hari UTC berikutnya
   - State lokal tetap disimpan sebagai fallback agar restart bot tidak mengulang jatah yang sudah terpakai walaupun endpoint history sedang tidak tersedia
   - Contoh:
     - jika nilai setting `0.12`
@@ -422,7 +422,7 @@ Arti mode:
   - Dasar hitung utamanya: `rounds.max`, `reserve_fee`, `reserve_kritis`, `amounts.CC.max`, `strategy`, dan `max_network_fee_cc_per_execution`
   - Estimasi memakai angka konservatif
   - Benefit `free swap` harian tidak dikurangkan
-  - Trading history yang saat ini dipakai bot belum memberi breakdown fee terpisah per trade, jadi mode ini tidak memakai fee real dari history sebagai sumber utama
+  - Network fee runtime memakai data quote swap sebagai sumber utama karena fee real dari history/funding sering telat atau tidak lengkap
 
 Perilaku umum mode 24 jam:
 
@@ -548,9 +548,10 @@ Bot memakai endpoint ini untuk:
 - `24h swaps`
 - `24h volume`
 - `CC rebates` seperti `Yesterday` dan `This Week`
+- sinkronisasi progress round dari `count_24h` activity sebagai satu-satunya sumber batas round harian
 - sinkronisasi history trading harian untuk jatah `3x free fee swap`
 
-Jika data activity belum tersedia atau belum terindeks, bot tetap lanjut dengan log yang aman.
+Jika data activity 24h belum tersedia atau belum terindeks, bot menunggu sampai activity tersedia/update sebelum membuat round berikutnya.
 
 ## File State Lokal
 
@@ -559,7 +560,7 @@ Bot menyimpan state lokal di folder `config/`:
 - `.autoswap_bot_runtime_state.json`
   - menyimpan jatah `3x free fee swap` harian per account
   - dipakai sebagai fallback lokal dan cache sinkronisasi
-  - saat tersedia, bot akan mencocokkan pemakaian free swap dengan endpoint history trading hari ini
+  - progress round harian tidak memakai state lokal sebagai fallback; bot menunggu activity 24h tersedia/update
   - reset harian mengikuti UTC
   - window pemakaian free swap tetap baru terbuka pada `01:00 UTC`
 - `.autoswap_telegram_state.json`
