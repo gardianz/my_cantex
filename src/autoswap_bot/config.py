@@ -190,6 +190,7 @@ class RuntimeConfig:
     full_24h_startup_mode: str
     full_24h_min_gap_minutes: float
     full_24h_auto_restart: bool
+    weekly_refill_on_monday_utc: bool
     full_24h_schedule_log_limit: int
     random_seed: int | None
     telegram_enabled: bool
@@ -303,6 +304,7 @@ def load_config(path: str | Path) -> BotConfig:
         ),
         full_24h_min_gap_minutes=float(settings.get("full_24h_min_gap_minutes", 5.0)),
         full_24h_auto_restart=bool(settings.get("full_24h_auto_restart", False)),
+        weekly_refill_on_monday_utc=bool(settings.get("weekly_refill_on_monday_utc", True)),
         full_24h_schedule_log_limit=int(settings.get("full_24h_schedule_log_limit", 12)),
         random_seed=(
             int(settings["random_seed"])

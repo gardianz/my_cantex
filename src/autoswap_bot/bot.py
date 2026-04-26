@@ -231,7 +231,9 @@ class AutoswapBot:
                         result.completed_rounds,
                         prepared_run.rounds,
                     )
-                    if self.config.runtime.full_24h_auto_restart:
+                    if self._weekly_refill_due_utc():
+                        logger.info("Weekly refill sudah jatuh tempo; skip tunggu quota harian")
+                    elif self.config.runtime.full_24h_auto_restart:
                         await self._wait_until_next_utc_day_after_quota(
                             logger=logger,
                             monitor_card=monitor_card,
@@ -304,6 +306,42 @@ class AutoswapBot:
                 used_network_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 used_swap_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 strategy_state = StrategyRuntimeState()
+                if self._weekly_refill_due_utc():
+                    await self._perform_weekly_refill_to_cc(
+                        sdk=sdk,
+                        router=router,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                        used_network_fee=used_network_fee,
+                        used_swap_fee=used_swap_fee,
+                        result=result,
+                    )
+                    final_info = await sdk.get_account_info()
+                    result.final_balances = self._balances_by_symbol(final_info)
+                    result.used_network_fee_by_symbol = dict(used_network_fee)
+                    result.used_swap_fee_by_symbol = dict(used_swap_fee)
+                    result.activity_summary = await self._fetch_activity_summary(sdk, logger)
+                    self._log_balances(logger, final_info, "Balance akhir")
+                    await self.monitor.update_balances(
+                        monitor_card,
+                        result.final_balances,
+                        force=True,
+                    )
+                    await self.monitor.update_activity(
+                        monitor_card,
+                        result.activity_summary,
+                        force=True,
+                    )
+                    await self.monitor.log_event(
+                        monitor_card,
+                        f"â›” Session stopped: {self._message_for_stop_reason(result.stop_reason or 'WEEKLY_REFILL_COMPLETE')}",
+                        force=True,
+                    )
+                    await self.monitor.finalize(
+                        monitor_card,
+                        phase=f"STOPPED_{result.stop_reason or 'WEEKLY_REFILL_COMPLETE'}",
+                    )
+                    return result
                 await self.monitor.log_event(
                     monitor_card,
                     (
@@ -315,6 +353,17 @@ class AutoswapBot:
                 )
                 if self._startup_mode_is_planned():
                     while result.completed_rounds < prepared_run.rounds:
+                        if self._weekly_refill_due_utc():
+                            await self._perform_weekly_refill_to_cc(
+                                sdk=sdk,
+                                router=router,
+                                logger=logger,
+                                monitor_card=monitor_card,
+                                used_network_fee=used_network_fee,
+                                used_swap_fee=used_swap_fee,
+                                result=result,
+                            )
+                            break
                         session_start_utc = datetime.now(timezone.utc)
                         session_end_utc = self._next_utc_midnight(session_start_utc)
                         remaining_rounds = prepared_run.rounds - result.completed_rounds
@@ -1448,11 +1497,14 @@ class AutoswapBot:
                 logger=logger,
                 monitor_card=monitor_card,
             )
-            actual_network_fee, actual_swap_fee = self._extract_actual_successful_hop_fees(
+            actual_network_fee, actual_swap_fee, settled_balances = await self._resolve_actual_successful_hop_fees(
+                sdk=sdk,
                 hop=hop,
                 tx_result=tx_result,
                 balances_before=hop_balances_before,
                 balances_after=settled_balances,
+                logger=logger,
+                monitor_card=monitor_card,
             )
             balances = settled_balances
             await self.monitor.update_balances(
@@ -1939,11 +1991,14 @@ class AutoswapBot:
                 logger=logger,
                 monitor_card=monitor_card,
             )
-            actual_network_fee, actual_swap_fee = self._extract_actual_successful_hop_fees(
+            actual_network_fee, actual_swap_fee, settled_balances = await self._resolve_actual_successful_hop_fees(
+                sdk=sdk,
                 hop=hop,
                 tx_result=tx_result,
                 balances_before=hop_balances_before,
                 balances_after=settled_balances,
+                logger=logger,
+                monitor_card=monitor_card,
             )
             balances = settled_balances
             await self.monitor.update_balances(
@@ -2206,6 +2261,89 @@ class AutoswapBot:
                 "⏭️ Refill CC belum cukup, lanjut ke step berikutnya",
             )
         return recovered_tx, balances, refill_satisfied
+
+    def _weekly_refill_due_utc(self) -> bool:
+        if not self.config.runtime.weekly_refill_on_monday_utc:
+            return False
+        return datetime.now(timezone.utc).weekday() == 0
+
+    def _non_cc_balances_remaining(self, balances: dict[str, Decimal]) -> dict[str, Decimal]:
+        remaining: dict[str, Decimal] = {}
+        for symbol in TRACKED_SYMBOLS:
+            if symbol == CC_SYMBOL:
+                continue
+            amount = balances.get(symbol, Decimal("0"))
+            if amount > dust_for_symbol(symbol):
+                remaining[symbol] = amount
+        return remaining
+
+    async def _perform_weekly_refill_to_cc(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        router: RouteOptimizer,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        used_network_fee: defaultdict[str, Decimal],
+        used_swap_fee: defaultdict[str, Decimal],
+        result: AccountResult,
+    ) -> None:
+        logger.info("Weekly refill Senin UTC dimulai; semua token akan dikembalikan ke CC")
+        await self.monitor.update_status(
+            monitor_card,
+            phase="WEEKLY-REFILL",
+            clear_route=True,
+            force=True,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            "🗓️ Weekly refill started: converting all tokens to CC",
+            force=True,
+        )
+
+        total_tx = 0
+        refill_complete = True
+        while True:
+            balances = self._balances_by_symbol(await sdk.get_account_info())
+            remaining = self._non_cc_balances_remaining(balances)
+            if not remaining:
+                break
+
+            recovered_tx = await self._recover_to_symbol(
+                sdk=sdk,
+                router=router,
+                target_symbol=CC_SYMBOL,
+                cc_reserve=Decimal("0"),
+                logger=logger,
+                monitor_card=monitor_card,
+                used_network_fee=used_network_fee,
+                used_swap_fee=used_swap_fee,
+            )
+            total_tx += recovered_tx
+            if recovered_tx <= 0:
+                refill_complete = False
+                logger.warning(
+                    "Weekly refill belum bisa mengosongkan token non-CC: %s",
+                    self._format_amount_map(remaining),
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    (
+                        "⚠️ Weekly refill stopped: token non-CC tersisa "
+                        f"{self._format_amount_map(remaining)}"
+                    ),
+                    force=True,
+                )
+                break
+
+        result.swap_transactions += total_tx
+        result.stop_reason = "WEEKLY_REFILL_COMPLETE" if refill_complete else "WEEKLY_REFILL_INCOMPLETE"
+        if refill_complete:
+            await self.monitor.log_event(
+                monitor_card,
+                f"✅ Weekly refill complete: {total_tx} refill swap(s)",
+                force=True,
+            )
 
     def _sample_execution_amount(
         self,
@@ -2554,6 +2692,70 @@ class AutoswapBot:
             actual_network_fee[hop.network_fee_symbol] = inferred_network_fee
 
         return actual_network_fee, actual_swap_fee
+
+    async def _resolve_actual_successful_hop_fees(
+        self,
+        *,
+        sdk: ExtendedCantexSDK,
+        hop: RouteHop,
+        tx_result: dict[str, Any],
+        balances_before: dict[str, Decimal],
+        balances_after: dict[str, Decimal],
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+    ) -> tuple[dict[str, Decimal], dict[str, Decimal], dict[str, Decimal]]:
+        actual_network_fee, actual_swap_fee = self._extract_actual_successful_hop_fees(
+            hop=hop,
+            tx_result=tx_result,
+            balances_before=balances_before,
+            balances_after=balances_after,
+        )
+        if actual_network_fee:
+            return actual_network_fee, actual_swap_fee, balances_after
+
+        # Account balances can lag behind SwapExecuted. If we move on too early,
+        # this hop logs net=- and the delayed CC fee can leak into the next hop.
+        wait_seconds = max(0.5, min(self.config.runtime.retry_base_delay, 1.0))
+        max_polls = max(8, self.config.runtime.max_retries * 4)
+        last_balances = balances_after
+        for poll_index in range(max_polls):
+            self._raise_if_stop_requested()
+            await self._sleep_or_stop(wait_seconds)
+            info = await sdk.get_account_info()
+            candidate_balances = self._balances_by_symbol(info)
+            candidate_network_fee, candidate_swap_fee = self._extract_actual_successful_hop_fees(
+                hop=hop,
+                tx_result=tx_result,
+                balances_before=balances_before,
+                balances_after=candidate_balances,
+            )
+            last_balances = candidate_balances
+            if candidate_network_fee:
+                if poll_index > 0:
+                    logger.info(
+                        "Network fee settlement hop %s -> %s muncul setelah poll %s/%s",
+                        hop.sell_symbol,
+                        hop.buy_symbol,
+                        poll_index + 1,
+                        max_polls,
+                    )
+                return candidate_network_fee, candidate_swap_fee, candidate_balances
+
+        logger.warning(
+            "Network fee aktual belum terdeteksi setelah swap sukses | %s -> %s | fee token=%s",
+            hop.sell_symbol,
+            hop.buy_symbol,
+            hop.network_fee_symbol,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            (
+                f"⚠️ Network fee pending after {hop.sell_symbol}->{hop.buy_symbol}; "
+                "balance settlement belum menampilkan fee"
+            ),
+            force=True,
+        )
+        return actual_network_fee, actual_swap_fee, last_balances
 
     def _observed_network_fee_is_plausible(
         self,
@@ -3387,11 +3589,14 @@ class AutoswapBot:
                     logger=logger,
                     monitor_card=monitor_card,
                 )
-                actual_network_fee, actual_swap_fee = self._extract_actual_successful_hop_fees(
+                actual_network_fee, actual_swap_fee, settled_balances = await self._resolve_actual_successful_hop_fees(
+                    sdk=sdk,
                     hop=hop,
                     tx_result=tx_result,
                     balances_before=hop_balances_before,
                     balances_after=settled_balances,
+                    logger=logger,
+                    monitor_card=monitor_card,
                 )
                 balances = settled_balances
                 await self.monitor.update_balances(
@@ -3448,6 +3653,17 @@ class AutoswapBot:
     ) -> None:
         while result.completed_rounds < prepared_run.rounds:
             self._raise_if_stop_requested()
+            if self._weekly_refill_due_utc():
+                await self._perform_weekly_refill_to_cc(
+                    sdk=sdk,
+                    router=router,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    used_network_fee=used_network_fee,
+                    used_swap_fee=used_swap_fee,
+                    result=result,
+                )
+                return
             current_round_number = result.completed_rounds + 1
 
             if self._startup_mode_is_free_only():
@@ -3558,6 +3774,17 @@ class AutoswapBot:
     ) -> None:
         for scheduled_round in schedule:
             self._raise_if_stop_requested()
+            if self._weekly_refill_due_utc():
+                await self._perform_weekly_refill_to_cc(
+                    sdk=sdk,
+                    router=router,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    used_network_fee=used_network_fee,
+                    used_swap_fee=used_swap_fee,
+                    result=result,
+                )
+                return
             if result.completed_rounds >= prepared_run.rounds:
                 return
             now_utc = datetime.now(timezone.utc)
@@ -3596,6 +3823,17 @@ class AutoswapBot:
                     f"⏳ Next swap in {int(wait_seconds)}s",
                 )
                 await self._sleep_or_stop(wait_seconds)
+                if self._weekly_refill_due_utc():
+                    await self._perform_weekly_refill_to_cc(
+                        sdk=sdk,
+                        router=router,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                        used_network_fee=used_network_fee,
+                        used_swap_fee=used_swap_fee,
+                        result=result,
+                    )
+                    return
             else:
                 logger.info(
                     "Round %s sudah melewati jadwal %.0f detik, dieksekusi sekarang",
@@ -4834,6 +5072,8 @@ class AutoswapBot:
             "MIN_TICKET_SIZE": "Round di-skip karena nominal di bawah minimum ticket size",
             "USER_CONFIG_MIN_NOT_MET": "Round di-skip karena nominal belum memenuhi amount minimum",
             "ROUND_STOPPED": "Eksekusi berhenti di tengah sesi",
+            "WEEKLY_REFILL_COMPLETE": "Weekly refill Senin UTC selesai; semua akun berhenti",
+            "WEEKLY_REFILL_INCOMPLETE": "Weekly refill Senin UTC berhenti dengan sisa token non-CC",
         }
         return mapping.get(stop_reason, f"Eksekusi berhenti: {stop_reason}")
 
