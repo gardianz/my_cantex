@@ -213,7 +213,7 @@ class AutoswapBot:
                     monitor_card=monitor_card,
                     force_log=True,
                 )
-                synced_completed_rounds = await self._wait_for_activity_round_progress(
+                synced_completed_rounds = await self._wait_for_trading_history_round_progress(
                     sdk=sdk,
                     account=account,
                     prepared_run=prepared_run,
@@ -258,7 +258,6 @@ class AutoswapBot:
                 router = RouteOptimizer(
                     sdk,
                     instruments_by_symbol,
-                    route_mode=self.config.runtime.route_mode,
                     max_network_fee_cc=self.config.runtime.max_network_fee_cc_per_execution,
                 )
 
@@ -3505,7 +3504,7 @@ class AutoswapBot:
                     result=result,
                 )
                 return
-            result.completed_rounds = await self._wait_for_activity_round_progress(
+            result.completed_rounds = await self._wait_for_trading_history_round_progress(
                 sdk=sdk,
                 account=account,
                 prepared_run=prepared_run,
@@ -3590,7 +3589,7 @@ class AutoswapBot:
                 used_swap_fee=used_swap_fee,
             )
             if round_result.completed:
-                result.completed_rounds = await self._wait_for_activity_round_progress(
+                result.completed_rounds = await self._wait_for_trading_history_round_progress(
                     sdk=sdk,
                     account=account,
                     prepared_run=prepared_run,
@@ -3672,7 +3671,7 @@ class AutoswapBot:
                 return
             if result.completed_rounds >= prepared_run.rounds:
                 return
-            result.completed_rounds = await self._wait_for_activity_round_progress(
+            result.completed_rounds = await self._wait_for_trading_history_round_progress(
                 sdk=sdk,
                 account=account,
                 prepared_run=prepared_run,
@@ -3767,7 +3766,7 @@ class AutoswapBot:
                 used_swap_fee=used_swap_fee,
             )
             if round_result.completed:
-                result.completed_rounds = await self._wait_for_activity_round_progress(
+                result.completed_rounds = await self._wait_for_trading_history_round_progress(
                     sdk=sdk,
                     account=account,
                     prepared_run=prepared_run,
@@ -3915,7 +3914,7 @@ class AutoswapBot:
                 )
                 return
 
-            synced_completed_rounds = await self._sync_round_progress_from_activity(
+            synced_completed_rounds = await self._sync_round_progress_from_trading_history(
                 sdk=sdk,
                 account=account,
                 prepared_run=prepared_run,
@@ -3944,14 +3943,14 @@ class AutoswapBot:
 
             if result.completed_rounds < prepared_run.rounds:
                 logger.info(
-                    "Activity 24h sudah turun di bawah target | progress=%s/%s",
+                    "Trading history hari ini sudah di bawah target | progress=%s/%s",
                     result.completed_rounds,
                     prepared_run.rounds,
                 )
                 await self.monitor.log_event(
                     monitor_card,
                     (
-                        "Activity 24h window refreshed: "
+                        "Trading history daily window refreshed: "
                         f"{result.completed_rounds}/{prepared_run.rounds}"
                     ),
                     force=True,
@@ -3961,7 +3960,7 @@ class AutoswapBot:
             wait_seconds = max(60.0, self._sample_network_fee_poll_seconds())
             next_check_utc = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
             logger.info(
-                "Quota activity 24h masih tercapai | progress=%s/%s | cek ulang %s UTC",
+                "Quota trading history harian masih tercapai | progress=%s/%s | cek ulang %s UTC",
                 result.completed_rounds,
                 prepared_run.rounds,
                 self._format_utc(next_check_utc),
@@ -3977,7 +3976,7 @@ class AutoswapBot:
             await self.monitor.log_event(
                 monitor_card,
                 (
-                    "Daily quota reached, polling activity 24h "
+                    "Daily quota reached, polling trading history "
                     f"({result.completed_rounds}/{prepared_run.rounds})"
                 ),
                 force=first_wait,
@@ -4256,7 +4255,7 @@ class AutoswapBot:
             )
         return synced_status
 
-    async def _wait_for_activity_round_progress(
+    async def _wait_for_trading_history_round_progress(
         self,
         *,
         sdk: ExtendedCantexSDK,
@@ -4277,16 +4276,16 @@ class AutoswapBot:
         while True:
             if self._weekly_stop_due_utc():
                 logger.info(
-                    "Weekly stop jatuh tempo saat menunggu activity; keluar dari wait activity"
+                    "Weekly stop jatuh tempo saat menunggu trading history; keluar dari wait history"
                 )
                 await self.monitor.log_event(
                     monitor_card,
-                    "🛑 Weekly stop due, leaving activity wait",
+                    "🛑 Weekly stop due, leaving trading history wait",
                     force=True,
                 )
                 return max(min(previous_completed_rounds, prepared_run.rounds), 0)
 
-            synced_completed_rounds = await self._sync_round_progress_from_activity(
+            synced_completed_rounds = await self._sync_round_progress_from_trading_history(
                 sdk=sdk,
                 account=account,
                 prepared_run=prepared_run,
@@ -4295,18 +4294,21 @@ class AutoswapBot:
                 previous_completed_rounds=previous_completed_rounds,
                 force_log=force_log,
             )
-            if synced_completed_rounds is not None and (
-                synced_completed_rounds >= target_minimum
-                or synced_completed_rounds >= prepared_run.rounds
-            ):
-                return synced_completed_rounds
+            if synced_completed_rounds is not None:
+                if not require_increment:
+                    return synced_completed_rounds
+                if (
+                    synced_completed_rounds >= target_minimum
+                    or synced_completed_rounds >= prepared_run.rounds
+                ):
+                    return synced_completed_rounds
 
             wait_seconds = self._sample_network_fee_poll_seconds()
             displayed_rounds = synced_completed_rounds
             if displayed_rounds is None:
                 displayed_rounds = max(min(previous_completed_rounds, prepared_run.rounds), 0)
             logger.info(
-                "Menunggu activity 24h update | current=%s | target_min=%s | tunggu=%.0fs",
+                "Menunggu trading history harian update | current=%s | target_min=%s | tunggu=%.0fs",
                 displayed_rounds,
                 target_minimum,
                 wait_seconds,
@@ -4320,14 +4322,14 @@ class AutoswapBot:
             await self.monitor.log_event(
                 monitor_card,
                 (
-                    f"⏳ Waiting activity 24h swaps update "
+                    f"⏳ Waiting trading history swaps update "
                     f"({displayed_rounds}/{prepared_run.rounds})"
                 ),
                 force=force_log,
             )
             await self._sleep_or_stop(wait_seconds)
 
-    async def _sync_round_progress_from_activity(
+    async def _sync_round_progress_from_trading_history(
         self,
         *,
         sdk: ExtendedCantexSDK,
@@ -4338,37 +4340,43 @@ class AutoswapBot:
         previous_completed_rounds: int,
         force_log: bool = False,
     ) -> int | None:
-        synced_completed_rounds = min(
-            max(int(previous_completed_rounds), 0),
-            prepared_run.rounds,
-        )
+        fallback_completed_rounds = min(max(int(previous_completed_rounds), 0), prepared_run.rounds)
         try:
-            source_path, activity_payload = await sdk.get_activity_payload()
-            activity_count = self._count_activity_payload_swaps_24h(activity_payload)
+            source_path, history_payload = await sdk.get_trading_history_payload()
         except Exception as exc:
-            logger.warning("Gagal mengambil activity untuk round sync: %s", exc)
+            logger.warning("Gagal mengambil trading history untuk round sync: %s", exc)
             await self.monitor.sync_round_progress(
                 monitor_card,
-                completed_rounds=synced_completed_rounds,
+                completed_rounds=fallback_completed_rounds,
                 force=force_log,
             )
             return None
 
-        if activity_count is None:
-            logger.warning("Activity 24h swaps belum tersedia untuk round sync")
+        if history_payload is None:
+            logger.warning("Trading history belum tersedia untuk round sync")
             await self.monitor.sync_round_progress(
                 monitor_card,
-                completed_rounds=synced_completed_rounds,
+                completed_rounds=fallback_completed_rounds,
+                force=force_log,
+            )
+            return None
+
+        history_today_count = self._count_today_trading_history_swaps(history_payload)
+        if history_today_count is None:
+            logger.warning("Trading history harian tidak bisa diparse untuk round sync")
+            await self.monitor.sync_round_progress(
+                monitor_card,
+                completed_rounds=fallback_completed_rounds,
                 force=force_log,
             )
             return None
 
         await self.monitor.sync_daily_ok_tx_from_history(
             monitor_card,
-            ok_tx_count=activity_count,
+            ok_tx_count=history_today_count,
             force=force_log,
         )
-        synced_completed_rounds = min(max(activity_count, 0), prepared_run.rounds)
+        synced_completed_rounds = min(max(history_today_count, 0), prepared_run.rounds)
         self.runtime_state.update_round_session_progress(
             account.name,
             strategy_name=prepared_run.strategy_name,
@@ -4382,15 +4390,15 @@ class AutoswapBot:
         )
         if force_log or synced_completed_rounds != previous_completed_rounds:
             logger.info(
-                "Round sync | source=%s | activity_swap_24h=%s | progress=%s/%s",
+                "Round sync | source=%s | trading_swap_today=%s | progress=%s/%s",
                 source_path or "-",
-                activity_count,
+                history_today_count,
                 synced_completed_rounds,
                 prepared_run.rounds,
             )
             await self.monitor.log_event(
                 monitor_card,
-                f"🔁 Round sync from activity: {synced_completed_rounds}/{prepared_run.rounds}",
+                f"🔁 Round sync from trading history: {synced_completed_rounds}/{prepared_run.rounds}",
                 force=force_log,
             )
         return synced_completed_rounds
@@ -4455,6 +4463,8 @@ class AutoswapBot:
     def _count_today_trading_history_swaps(self, payload: Any) -> int | None:
         items = self._extract_trading_history_items(payload)
         if not items:
+            if self._payload_has_empty_collection(payload):
+                return 0
             return None
         today_utc = datetime.now(timezone.utc).date()
         identified_trade_keys: set[str] = set()
@@ -4473,6 +4483,26 @@ class AutoswapBot:
         if identified_trade_keys:
             return len(identified_trade_keys)
         return fallback_count
+
+    def _payload_has_empty_collection(self, payload: Any) -> bool:
+        if payload in (None, ""):
+            return False
+        if isinstance(payload, (list, tuple)):
+            return len(payload) == 0
+        if isinstance(payload, dict):
+            for key in (
+                "data",
+                "items",
+                "results",
+                "rows",
+                "history",
+                "trades",
+                "transactions",
+            ):
+                value = payload.get(key)
+                if isinstance(value, (list, tuple)) and len(value) == 0:
+                    return True
+        return False
 
     def _history_trade_key(self, item: dict[str, Any]) -> str | None:
         for key in (

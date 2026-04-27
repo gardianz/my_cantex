@@ -206,7 +206,6 @@ class RuntimeConfig:
     activity_items_limit: int
     dry_run: bool
     log_level: str
-    route_mode: str
     default_continue_on_low_balance: bool
     max_retries: int
     retry_base_delay: float
@@ -351,7 +350,6 @@ def load_config(path: str | Path) -> BotConfig:
         activity_items_limit=int(settings.get("activity_items_limit", 5)),
         dry_run=bool(settings.get("dry_run", False)),
         log_level=str(settings.get("log_level", "INFO")).upper(),
-        route_mode=str(settings.get("route_mode", "auto")).lower(),
         default_continue_on_low_balance=bool(
             settings.get("default_continue_on_low_balance", False)
         ),
@@ -361,8 +359,6 @@ def load_config(path: str | Path) -> BotConfig:
 
     if runtime.execution_mode not in {"sequential", "concurrent"}:
         raise ValueError("settings.execution_mode harus 'sequential' atau 'concurrent'")
-    if runtime.route_mode not in {"auto", "direct"}:
-        raise ValueError("settings.route_mode harus 'auto' atau 'direct'")
     if runtime.max_concurrency < 1:
         raise ValueError("settings.max_concurrency minimal 1")
     if runtime.activity_items_limit < 1:

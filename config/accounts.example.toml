@@ -24,7 +24,6 @@ activity_enabled = false
 activity_items_limit = 5
 dry_run = false
 log_level = "INFO"
-route_mode = "auto"
 default_continue_on_low_balance = true
 max_retries = 3
 retry_base_delay = 5.0

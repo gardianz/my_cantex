@@ -16,12 +16,10 @@ class RouteOptimizer:
         sdk,
         instruments_by_symbol: dict[str, InstrumentId],
         *,
-        route_mode: str = "auto",
         max_network_fee_cc: Decimal | None = None,
     ) -> None:
         self._sdk = sdk
         self._instruments_by_symbol = instruments_by_symbol
-        self._route_mode = route_mode
         self._max_network_fee_cc = max_network_fee_cc
 
     async def choose_best_route(
@@ -36,13 +34,11 @@ class RouteOptimizer:
             direct_result = await self._quote_path(direct_path, sell_amount)
             if {sell_symbol, buy_symbol} == {"USDCx", "CBTC"}:
                 return direct_result
-            if self._route_mode != "auto" or not self._has_network_fee_cap_violation(direct_result):
+            if not self._has_network_fee_cap_violation(direct_result):
                 return direct_result
         except Exception as exc:
             direct_result = exc
             if {sell_symbol, buy_symbol} == {"USDCx", "CBTC"}:
-                raise
-            if self._route_mode != "auto":
                 raise
 
         candidate_paths: list[tuple[str, ...]] = []

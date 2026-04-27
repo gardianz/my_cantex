@@ -11,7 +11,7 @@ Fitur utama:
 - Validasi balance, minimum protocol, dan fee sebelum submit swap
 - Reserve `CC` berbasis `reserve_fee` per account
 - Optimasi route `direct` vs `1-hop`
-- Progress round disinkronkan dari activity 24h Cantex; `1 swap sukses = 1 round selesai`
+- Progress round harian disinkronkan dari history trading Cantex; `1 swap sukses = 1 round selesai`
 - Bot selalu berjalan dalam mode 24 jam berbasis UTC
 - Saat start bot selalu meminta pilihan mode startup `1-6`
 - Monitor Telegram gabungan dalam 1 pesan
@@ -167,9 +167,9 @@ auto_create_intent_account = true
   - Cantex saat ini memberi `3x free fee swap` per account per hari UTC
   - Bot otomatis mencoba memakai jatah ini mulai `01:00 UTC`
   - Hanya hop pertama yang benar-benar memakai jatah free swap harian boleh bypass batas fee ini
-  - Progress round harian memakai angka activity `24 HOURS ... SWAPS` dari Cantex
-  - Jika activity 24h sudah menunjukkan swap >= `rounds`, bot tetap refresh activity dan menunggu sampai angka 24h turun di bawah target
-  - State lokal tetap disimpan sebagai fallback agar restart bot tidak mengulang jatah yang sudah terpakai walaupun endpoint history sedang tidak tersedia
+  - Progress round harian memakai history trading hari UTC berjalan dari Cantex
+  - Jika history trading hari ini sudah menunjukkan swap >= `rounds`, bot tidak membuat swap baru sampai hari UTC berganti
+  - State lokal tetap disimpan untuk cache UI/runtime, tetapi batas round mengikuti history trading harian
   - Contoh:
     - jika nilai setting `0.12`
     - lalu quote menunjukkan network fee `0.15 CC`
@@ -436,7 +436,7 @@ Perilaku umum mode 24 jam:
 
 - semua jadwal memakai acuan UTC
 - pada mode `planned`, target sesi adalah selesai sebelum `00:00 UTC`
-- pada mode non-plan, bot terus mencoba sampai quota `rounds` sukses terpenuhi; jika quota selesai lebih cepat dan `full_24h_auto_restart = true`, bot tetap polling activity 24h sampai angka Cantex turun di bawah target
+- pada mode non-plan, bot terus mencoba sampai quota `rounds` sukses terpenuhi; jika quota selesai lebih cepat dan `full_24h_auto_restart = true`, bot tetap polling history trading sampai hari UTC berganti
 - jika `full_24h_auto_restart = true`, sesi berikutnya dimulai lagi untuk hari UTC berikutnya
 - jika `weekly_stop_on_monday_utc = true`, bot yang sedang berjalan akan stop saat memasuki hari Senin UTC tanpa refill otomatis
 - jika bot dijalankan ulang pada hari Senin UTC, bot berjalan normal lagi sesuai mode yang dipilih
@@ -558,14 +558,14 @@ Saat inspeksi frontend Cantex secara langsung, data activity akun dan history ya
 
 Bot memakai endpoint ini untuk:
 
-- `24h swaps`
+- `24h swaps` dari activity sebagai metrik tampilan
 - `24h volume`
 - `CC rebates` seperti `Yesterday` dan `This Week`
 - total `Funding` per account dari deposit `CC` masuk, dengan reward distribution/rebates dikeluarkan dari hitungan
-- sinkronisasi progress round dari `count_24h` activity sebagai satu-satunya sumber batas round harian
+- sinkronisasi progress round dari history trading hari UTC berjalan sebagai satu-satunya sumber batas round harian
 - sinkronisasi history trading harian untuk jatah `3x free fee swap`
 
-Jika data activity 24h belum tersedia, belum terindeks, atau masih membawa swap dari window sebelumnya, bot menunggu sampai activity tersedia/update sebelum membuat round berikutnya.
+Jika data history trading belum tersedia atau belum terindeks setelah swap sukses, bot menunggu sampai history trading update sebelum membuat round berikutnya.
 
 ## File State Lokal
 
@@ -574,7 +574,7 @@ Bot menyimpan state lokal di folder `config/`:
 - `.autoswap_bot_runtime_state.json`
   - menyimpan jatah `3x free fee swap` harian per account
   - dipakai sebagai fallback lokal dan cache sinkronisasi
-  - progress round harian tidak memakai state lokal sebagai fallback; bot menunggu activity 24h tersedia/update
+  - progress round harian tidak memakai activity sebagai batas; bot menunggu history trading harian tersedia/update
   - reset harian mengikuti UTC
   - window pemakaian free swap tetap baru terbuka pada `01:00 UTC`
 - `.autoswap_telegram_state.json`
