@@ -168,7 +168,7 @@ auto_create_intent_account = true
   - Bot otomatis mencoba memakai jatah ini mulai `01:00 UTC`
   - Hanya hop pertama yang benar-benar memakai jatah free swap harian boleh bypass batas fee ini
   - Progress round harian memakai angka activity `24 HOURS ... SWAPS` dari Cantex
-  - Jika activity 24h sudah menunjukkan swap >= `rounds`, bot menunggu hari UTC berikutnya
+  - Jika activity 24h sudah menunjukkan swap >= `rounds`, bot tetap refresh activity dan menunggu sampai angka 24h turun di bawah target
   - State lokal tetap disimpan sebagai fallback agar restart bot tidak mengulang jatah yang sudah terpakai walaupun endpoint history sedang tidak tersedia
   - Contoh:
     - jika nilai setting `0.12`
@@ -435,7 +435,7 @@ Perilaku umum mode 24 jam:
 
 - semua jadwal memakai acuan UTC
 - pada mode `planned`, target sesi adalah selesai sebelum `00:00 UTC`
-- pada mode non-plan, bot terus mencoba sampai quota `rounds` sukses terpenuhi; jika quota selesai lebih cepat dan `full_24h_auto_restart = true`, bot akan idle sampai `00:00 UTC` berikutnya
+- pada mode non-plan, bot terus mencoba sampai quota `rounds` sukses terpenuhi; jika quota selesai lebih cepat dan `full_24h_auto_restart = true`, bot tetap polling activity 24h sampai angka Cantex turun di bawah target
 - jika `full_24h_auto_restart = true`, sesi berikutnya dimulai lagi untuk hari UTC berikutnya
 - jika `weekly_stop_on_monday_utc = true`, bot yang sedang berjalan akan stop saat memasuki hari Senin UTC tanpa refill otomatis
 - jika bot dijalankan ulang pada hari Senin UTC, bot berjalan normal lagi sesuai mode yang dipilih
@@ -562,7 +562,7 @@ Bot memakai endpoint ini untuk:
 - sinkronisasi progress round dari `count_24h` activity sebagai satu-satunya sumber batas round harian
 - sinkronisasi history trading harian untuk jatah `3x free fee swap`
 
-Jika data activity 24h belum tersedia atau belum terindeks, bot menunggu sampai activity tersedia/update sebelum membuat round berikutnya.
+Jika data activity 24h belum tersedia, belum terindeks, atau masih membawa swap dari window sebelumnya, bot menunggu sampai activity tersedia/update sebelum membuat round berikutnya.
 
 ## File State Lokal
 

@@ -231,13 +231,14 @@ class AutoswapBot:
                         result.completed_rounds,
                         prepared_run.rounds,
                     )
-                    if self._weekly_stop_due_utc():
-                        logger.info("Weekly stop sudah jatuh tempo; skip tunggu quota harian")
-                    else:
-                        await self._wait_until_next_utc_day_after_quota(
-                            logger=logger,
-                            monitor_card=monitor_card,
-                        )
+                    await self._wait_until_next_utc_day_after_quota(
+                        sdk=sdk,
+                        account=account,
+                        prepared_run=prepared_run,
+                        result=result,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                    )
 
                 if account.auto_create_intent_account:
                     created = await sdk.ensure_intent_trading_account()
@@ -3462,13 +3463,12 @@ class AutoswapBot:
                 return
             if result.completed_rounds >= prepared_run.rounds:
                 await self._wait_until_next_utc_day_after_quota(
-                    logger=logger,
-                    monitor_card=monitor_card,
-                )
-                self._reset_result_round_progress_for_new_activity_window(
+                    sdk=sdk,
                     account=account,
                     prepared_run=prepared_run,
                     result=result,
+                    logger=logger,
+                    monitor_card=monitor_card,
                 )
                 continue
             current_round_number = result.completed_rounds + 1
@@ -3505,7 +3505,7 @@ class AutoswapBot:
                     continue
                 if daily_free_fee_status.remaining <= 0:
                     if self.config.runtime.full_24h_auto_restart:
-                        await self._wait_until_next_utc_day_after_quota(
+                        await self._wait_until_next_utc_day_for_free_fee(
                             logger=logger,
                             monitor_card=monitor_card,
                         )
@@ -3550,13 +3550,12 @@ class AutoswapBot:
                     return
                 if result.completed_rounds >= prepared_run.rounds:
                     await self._wait_until_next_utc_day_after_quota(
-                        logger=logger,
-                        monitor_card=monitor_card,
-                    )
-                    self._reset_result_round_progress_for_new_activity_window(
+                        sdk=sdk,
                         account=account,
                         prepared_run=prepared_run,
                         result=result,
+                        logger=logger,
+                        monitor_card=monitor_card,
                     )
                     continue
                 await self._sleep_after_direct_24h_success(
@@ -3631,13 +3630,12 @@ class AutoswapBot:
                 return
             if result.completed_rounds >= prepared_run.rounds:
                 await self._wait_until_next_utc_day_after_quota(
-                    logger=logger,
-                    monitor_card=monitor_card,
-                )
-                self._reset_result_round_progress_for_new_activity_window(
+                    sdk=sdk,
                     account=account,
                     prepared_run=prepared_run,
                     result=result,
+                    logger=logger,
+                    monitor_card=monitor_card,
                 )
                 return
             now_utc = datetime.now(timezone.utc)
@@ -3729,13 +3727,12 @@ class AutoswapBot:
                     return
                 if result.completed_rounds >= prepared_run.rounds:
                     await self._wait_until_next_utc_day_after_quota(
-                        logger=logger,
-                        monitor_card=monitor_card,
-                    )
-                    self._reset_result_round_progress_for_new_activity_window(
+                        sdk=sdk,
                         account=account,
                         prepared_run=prepared_run,
                         result=result,
+                        logger=logger,
+                        monitor_card=monitor_card,
                     )
                     return
             elif not round_result.skipped and round_result.stop_reason is not None:
@@ -3835,9 +3832,132 @@ class AutoswapBot:
     async def _wait_until_next_utc_day_after_quota(
         self,
         *,
+        sdk: ExtendedCantexSDK,
+        account: AccountConfig,
+        prepared_run: PreparedAccountRun,
+        result: AccountResult,
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
     ) -> None:
+        first_wait = True
+        while True:
+            if self._weekly_stop_due_utc():
+                logger.info("Weekly stop jatuh tempo; tidak menunggu quota harian")
+                await self.monitor.log_event(
+                    monitor_card,
+                    "Weekly stop due, skip daily quota wait",
+                    force=True,
+                )
+                return
+
+            synced_completed_rounds = await self._sync_round_progress_from_activity(
+                sdk=sdk,
+                account=account,
+                prepared_run=prepared_run,
+                logger=logger,
+                monitor_card=monitor_card,
+                previous_completed_rounds=result.completed_rounds,
+                force_log=first_wait,
+            )
+            if synced_completed_rounds is not None:
+                result.completed_rounds = synced_completed_rounds
+                result.swap_transactions = synced_completed_rounds
+                self._persist_round_session_progress(
+                    account=account,
+                    prepared_run=prepared_run,
+                    result=result,
+                )
+
+            activity_summary = await self._fetch_activity_summary(sdk, logger)
+            if activity_summary is not None:
+                result.activity_summary = activity_summary
+                await self.monitor.update_activity(
+                    monitor_card,
+                    activity_summary,
+                    force=first_wait,
+                )
+
+            if result.completed_rounds < prepared_run.rounds:
+                logger.info(
+                    "Activity 24h sudah turun di bawah target | progress=%s/%s",
+                    result.completed_rounds,
+                    prepared_run.rounds,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    (
+                        "Activity 24h window refreshed: "
+                        f"{result.completed_rounds}/{prepared_run.rounds}"
+                    ),
+                    force=True,
+                )
+                return
+
+            wait_seconds = max(60.0, self._sample_network_fee_poll_seconds())
+            next_check_utc = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
+            logger.info(
+                "Quota activity 24h masih tercapai | progress=%s/%s | cek ulang %s UTC",
+                result.completed_rounds,
+                prepared_run.rounds,
+                self._format_utc(next_check_utc),
+            )
+            await self.monitor.update_status(
+                monitor_card,
+                phase="WAITING_NEXT_DAY",
+                next_scheduled_utc=next_check_utc,
+                next_wait_seconds=wait_seconds,
+                clear_route=True,
+                force=first_wait,
+            )
+            await self.monitor.log_event(
+                monitor_card,
+                (
+                    "Daily quota reached, polling activity 24h "
+                    f"({result.completed_rounds}/{prepared_run.rounds})"
+                ),
+                force=first_wait,
+            )
+            first_wait = False
+            await self._sleep_or_stop(wait_seconds)
+
+    async def _wait_until_next_utc_day_for_free_fee(
+        self,
+        *,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+    ) -> None:
+        if self._weekly_stop_due_utc():
+            logger.info("Weekly stop jatuh tempo; tidak menunggu free fee harian")
+            await self.monitor.log_event(
+                monitor_card,
+                "Weekly stop due, skip free fee wait",
+                force=True,
+            )
+            return
+        now_utc = datetime.now(timezone.utc)
+        next_midnight_utc = self._next_utc_midnight(now_utc)
+        wait_seconds = max(0.0, (next_midnight_utc - now_utc).total_seconds())
+        if wait_seconds <= 0:
+            return
+        logger.info(
+            "Jatah free fee harian habis, menunggu sampai %s UTC",
+            self._format_utc(next_midnight_utc),
+        )
+        await self.monitor.update_status(
+            monitor_card,
+            phase="WAITING_NEXT_DAY",
+            next_scheduled_utc=next_midnight_utc,
+            next_wait_seconds=wait_seconds,
+            clear_route=True,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            f"Free fee quota used, waiting until {self._format_utc(next_midnight_utc)} UTC",
+            force=True,
+        )
+        await self._sleep_or_stop(wait_seconds)
+        return
+
         if self._weekly_stop_due_utc():
             logger.info("Weekly stop jatuh tempo; tidak menunggu quota harian")
             await self.monitor.log_event(
