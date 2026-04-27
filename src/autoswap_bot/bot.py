@@ -259,6 +259,7 @@ class AutoswapBot:
                     sdk,
                     instruments_by_symbol,
                     route_mode=self.config.runtime.route_mode,
+                    max_network_fee_cc=self.config.runtime.max_network_fee_cc_per_execution,
                 )
 
                 logger.info(
@@ -882,6 +883,11 @@ class AutoswapBot:
             return actual_amount, amount_range.min_value, None, min_ticket_reason
 
         if action.amount_mode == "max":
+            if (
+                account.strategy().key == "strategy_4_reserve"
+                and {action.sell_symbol, action.buy_symbol} == {"USDCx", "CBTC"}
+            ):
+                return available_amount, None, None, None
             actual_amount, min_ticket_reason = await self._normalize_amount_for_min_ticket(
                 router=router,
                 sell_symbol=action.sell_symbol,
@@ -941,6 +947,7 @@ class AutoswapBot:
         return stop_reason in {
             "WAIT_SOURCE_BALANCE",
             "MIN_TICKET_SIZE",
+            "SERVER_INSUFFICIENT_BALANCE",
             "USER_CONFIG_MIN_NOT_MET",
         }
 
@@ -1716,6 +1723,20 @@ class AutoswapBot:
                     cc_reserve=self._effective_cc_reserve(account, action.cc_reserve_override),
                     strict_amount=action.strict_amount,
                 )
+                if (
+                    issue is not None
+                    and account.strategy().key == "strategy_4_reserve"
+                    and {sell_symbol, buy_symbol} == {"USDCx", "CBTC"}
+                ):
+                    logger.info(
+                        "Putaran %s submit recycle max tanpa blok preflight lokal | %s -> %s | %s",
+                        round_number,
+                        sell_symbol,
+                        buy_symbol,
+                        issue.reason,
+                    )
+                    issue = None
+
                 if issue is not None:
                     last_invalid_reason = issue.reason
                     last_invalid_stop_reason = "ROUND_AFFORDABILITY_CHECK_FAILED"
@@ -2408,6 +2429,17 @@ class AutoswapBot:
             or "10 cc" in message
         )
 
+    def _is_server_insufficient_balance_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "insufficient balance" in message
+            or "not enough balance" in message
+            or "not enough funds" in message
+            or "balance too low" in message
+            or "saldo kurang" in message
+            or "insufficient funds" in message
+        )
+
     def _is_signature_verification_error(self, exc: Exception) -> bool:
         return "signature verification failed" in str(exc).lower()
 
@@ -2626,7 +2658,7 @@ class AutoswapBot:
         free_fee_sequential_account_name: str | None = None,
         allow_network_fee_cap_bypass: bool = False,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        confirm_timeout = max(float(hop.estimated_time_seconds) * 3.0, 30.0)
+        confirm_timeout = max(float(hop.estimated_time_seconds) * 4.0, 90.0)
         lock_acquired = False
         if free_fee_sequential_account_name is not None:
             lock_acquired = await self._acquire_free_fee_sequence_slot(
@@ -2721,6 +2753,24 @@ class AutoswapBot:
                     "Signature verification failed untuk swap intent. "
                     "Kemungkinan CANTEX_TRADING_KEY tidak cocok dengan intent account wallet ini."
                 ) from exc
+            if isinstance(exc, CantexTimeoutError):
+                logger.warning(
+                    "Swap hop %s/%s round %s belum terkonfirmasi dalam %.0fs: %s",
+                    hop_index,
+                    hop_total,
+                    round_number,
+                    confirm_timeout,
+                    exc,
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    (
+                        f"⏳ Hop {hop_index}/{hop_total} pending confirmation "
+                        f"after {int(confirm_timeout)}s"
+                    ),
+                    force=True,
+                )
+                return None, "SWAP_CONFIRMATION_TIMEOUT"
             if self._is_min_ticket_error(exc):
                 logger.warning(
                     "Swap hop %s/%s round %s gagal karena minimum ticket size: %s",
@@ -2736,6 +2786,21 @@ class AutoswapBot:
                     force=True,
                 )
                 return None, "MIN_TICKET_SIZE"
+            if self._is_server_insufficient_balance_error(exc):
+                logger.warning(
+                    "Swap hop %s/%s round %s ditolak server karena balance kurang: %s",
+                    hop_index,
+                    hop_total,
+                    round_number,
+                    exc,
+                )
+                await self.monitor.record_tx_failure(monitor_card)
+                await self.monitor.log_event(
+                    monitor_card,
+                    f"⏭️ Hop {hop_index}/{hop_total} pending: server insufficient balance",
+                    force=True,
+                )
+                return None, "SERVER_INSUFFICIENT_BALANCE"
             logger.warning(
                 "Swap hop %s/%s round %s gagal, tidak di-retry: %s",
                 hop_index,
@@ -4771,13 +4836,19 @@ class AutoswapBot:
                 combined_spend += hop.network_fee_amount
 
             if spendable_sell < combined_spend:
-                return PlanIssue(
-                    round_number=round_number,
-                    sell_symbol=hop.sell_symbol,
-                    requested_amount=combined_spend,
-                    available_amount=spendable_sell,
-                    reason="balance sell token tidak cukup setelah fee",
-                )
+                if (
+                    hop.sell_symbol != CC_SYMBOL
+                    and spendable_sell + dust_for_symbol(hop.sell_symbol) >= hop.sell_amount
+                ):
+                    pass
+                else:
+                    return PlanIssue(
+                        round_number=round_number,
+                        sell_symbol=hop.sell_symbol,
+                        requested_amount=combined_spend,
+                        available_amount=spendable_sell,
+                        reason="balance sell token tidak cukup setelah fee",
+                    )
 
             if hop.sell_symbol != hop.network_fee_symbol:
                 network_fee_balance = simulated.get(hop.network_fee_symbol, Decimal("0"))

@@ -17,10 +17,12 @@ class RouteOptimizer:
         instruments_by_symbol: dict[str, InstrumentId],
         *,
         route_mode: str = "auto",
+        max_network_fee_cc: Decimal | None = None,
     ) -> None:
         self._sdk = sdk
         self._instruments_by_symbol = instruments_by_symbol
         self._route_mode = route_mode
+        self._max_network_fee_cc = max_network_fee_cc
 
     async def choose_best_route(
         self,
@@ -28,32 +30,74 @@ class RouteOptimizer:
         buy_symbol: str,
         sell_amount: Decimal,
     ) -> RoutePlan:
-        candidate_paths = [(sell_symbol, buy_symbol)]
-        if self._route_mode == "auto":
-            for intermediate in TRACKED_SYMBOLS:
-                if intermediate in {sell_symbol, buy_symbol}:
-                    continue
-                if intermediate in self._instruments_by_symbol:
-                    candidate_paths.append((sell_symbol, intermediate, buy_symbol))
+        direct_path = (sell_symbol, buy_symbol)
+        direct_result: RoutePlan | Exception
+        try:
+            direct_result = await self._quote_path(direct_path, sell_amount)
+            if {sell_symbol, buy_symbol} == {"USDCx", "CBTC"}:
+                return direct_result
+            if self._route_mode != "auto" or not self._has_network_fee_cap_violation(direct_result):
+                return direct_result
+        except Exception as exc:
+            direct_result = exc
+            if {sell_symbol, buy_symbol} == {"USDCx", "CBTC"}:
+                raise
+            if self._route_mode != "auto":
+                raise
+
+        candidate_paths: list[tuple[str, ...]] = []
+        for intermediate in TRACKED_SYMBOLS:
+            if intermediate in {sell_symbol, buy_symbol}:
+                continue
+            if intermediate in self._instruments_by_symbol:
+                candidate_paths.append((sell_symbol, intermediate, buy_symbol))
 
         results = await asyncio.gather(
             *(self._quote_path(path, sell_amount) for path in candidate_paths),
             return_exceptions=True,
         )
-        valid_routes = [result for result in results if isinstance(result, RoutePlan)]
+        valid_routes = [
+            result
+            for result in (direct_result, *results)
+            if isinstance(result, RoutePlan)
+        ]
         if not valid_routes:
-            for result in results:
+            for result in (direct_result, *results):
                 if isinstance(result, Exception):
                     raise result
             raise RuntimeError(f"Tidak ada route valid untuk {sell_symbol} -> {buy_symbol}")
 
-        return max(
+        eligible_routes = [
+            route
+            for route in valid_routes
+            if not self._has_network_fee_cap_violation(route)
+        ]
+        if eligible_routes:
+            return min(
+                eligible_routes,
+                key=lambda route: (
+                    route.tx_count,
+                    route.total_network_fee_cc,
+                    -route.final_amount,
+                ),
+            )
+
+        return min(
             valid_routes,
             key=lambda route: (
-                route.final_amount,
-                -route.total_network_fee_cc,
-                -route.tx_count,
+                route.total_network_fee_cc,
+                route.tx_count,
+                -route.final_amount,
             ),
+        )
+
+    def _has_network_fee_cap_violation(self, route: RoutePlan) -> bool:
+        if self._max_network_fee_cc is None:
+            return False
+        return any(
+            hop.network_fee_symbol == CC_SYMBOL
+            and hop.network_fee_amount > self._max_network_fee_cc
+            for hop in route.hops
         )
 
     async def _quote_path(

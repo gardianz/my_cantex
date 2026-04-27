@@ -319,6 +319,7 @@ Catatan:
   - saat `CC` tidak cukup untuk swap keluar, bot masuk fase recycle: `USDCx -> CBTC (50%)`, `CBTC -> USDCx (50%)`, `CBTC -> CC (max)`, `USDCx -> CC (max)`
 - Strategi `4` memakai mode reserve:
   - bot mencoba fase recycle dulu: `USDCx -> CBTC` atau `CBTC -> USDCx` dengan `amount max`
+  - route `USDCx <-> CBTC` dipaksa direct 1-hop agar submit lebih cepat dan tidak memakai jalur antara
   - jika balance `USDCx` / `CBTC` belum cukup untuk minimum ticket protocol, bot fallback ke `CC -> USDCx` memakai `amounts.CC` sambil tetap menjaga `reserve_fee`
   - jika balance `USDCx` / `CBTC` sudah cukup untuk bolak-balik, fase awal `CC -> USDCx` akan di-skip
   - jika `CC <= reserve_kritis`, bot masuk fase recovery dan mengosongkan `USDCx` serta `CBTC` kembali ke `CC`
@@ -448,6 +449,8 @@ Perilaku umum mode 24 jam:
 - retry fee dilakukan sampai tersisa `30 detik` menuju jadwal round berikutnya
 - jika sampai batas itu fee tidak turun, slot round saat itu dilewati dan bot lanjut ke slot berikutnya
 - account tidak dianggap gagal hanya karena fee sedang tinggi
+- untuk source `USDCx` / `CBTC`, preflight balance tidak lagi memblokir karena estimasi fee lokal yang terlalu konservatif; bot submit dulu dan mengikuti error balance dari server jika benar-benar kurang
+- timeout konfirmasi swap minimal `90 detik` agar transaksi yang sudah tersubmit tidak cepat salah ditandai gagal saat WebSocket/ledger lambat
 
 Catatan penting:
 
