@@ -89,6 +89,7 @@ class AutoswapBot:
         self.repo_root = repo_root
         self.startup_mode = startup_mode
         self.log = logging.getLogger("autoswap_bot")
+        self.startup_utc_date = datetime.now(timezone.utc).date()
         self._prompt_lock = asyncio.Lock()
         self._free_fee_swap_lock = asyncio.Lock()
         self._rng = random.Random(self.config.runtime.random_seed)
@@ -230,8 +231,8 @@ class AutoswapBot:
                         result.completed_rounds,
                         prepared_run.rounds,
                     )
-                    if self._weekly_refill_due_utc():
-                        logger.info("Weekly refill sudah jatuh tempo; skip tunggu quota harian")
+                    if self._weekly_stop_due_utc():
+                        logger.info("Weekly stop sudah jatuh tempo; skip tunggu quota harian")
                     else:
                         await self._wait_until_next_utc_day_after_quota(
                             logger=logger,
@@ -305,7 +306,7 @@ class AutoswapBot:
                 used_network_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 used_swap_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 strategy_state = StrategyRuntimeState()
-                if self._startup_mode_is_refill_cc() or self._weekly_refill_due_utc():
+                if self._startup_mode_is_refill_cc():
                     await self._perform_weekly_refill_to_cc(
                         sdk=sdk,
                         router=router,
@@ -352,14 +353,10 @@ class AutoswapBot:
                 )
                 if self._startup_mode_is_planned():
                     while result.completed_rounds < prepared_run.rounds:
-                        if self._weekly_refill_due_utc():
-                            await self._perform_weekly_refill_to_cc(
-                                sdk=sdk,
-                                router=router,
+                        if self._weekly_stop_due_utc():
+                            await self._perform_weekly_stop(
                                 logger=logger,
                                 monitor_card=monitor_card,
-                                used_network_fee=used_network_fee,
-                                used_swap_fee=used_swap_fee,
                                 result=result,
                             )
                             break
@@ -2253,10 +2250,32 @@ class AutoswapBot:
             )
         return recovered_tx, balances, refill_satisfied
 
-    def _weekly_refill_due_utc(self) -> bool:
-        if not self.config.runtime.weekly_refill_on_monday_utc:
+    def _weekly_stop_due_utc(self) -> bool:
+        if not self.config.runtime.weekly_stop_on_monday_utc:
             return False
-        return datetime.now(timezone.utc).weekday() == 0
+        now_utc = datetime.now(timezone.utc)
+        return now_utc.weekday() == 0 and now_utc.date() != self.startup_utc_date
+
+    async def _perform_weekly_stop(
+        self,
+        *,
+        logger: AccountLoggerAdapter,
+        monitor_card: TelegramCardState | None,
+        result: AccountResult,
+    ) -> None:
+        result.stop_reason = "WEEKLY_STOP"
+        logger.info("Weekly stop Senin UTC tercapai; sesi dihentikan tanpa refill")
+        await self.monitor.update_status(
+            monitor_card,
+            phase="WEEKLY-STOP",
+            clear_route=True,
+            force=True,
+        )
+        await self.monitor.log_event(
+            monitor_card,
+            "🛑 Weekly stop Monday UTC reached",
+            force=True,
+        )
 
     def _non_cc_balances_remaining(self, balances: dict[str, Decimal]) -> dict[str, Decimal]:
         remaining: dict[str, Decimal] = {}
@@ -3413,14 +3432,10 @@ class AutoswapBot:
     ) -> None:
         while result.completed_rounds < prepared_run.rounds:
             self._raise_if_stop_requested()
-            if self._weekly_refill_due_utc():
-                await self._perform_weekly_refill_to_cc(
-                    sdk=sdk,
-                    router=router,
+            if self._weekly_stop_due_utc():
+                await self._perform_weekly_stop(
                     logger=logger,
                     monitor_card=monitor_card,
-                    used_network_fee=used_network_fee,
-                    used_swap_fee=used_swap_fee,
                     result=result,
                 )
                 return
@@ -3438,14 +3453,10 @@ class AutoswapBot:
                 prepared_run=prepared_run,
                 result=result,
             )
-            if self._weekly_refill_due_utc():
-                await self._perform_weekly_refill_to_cc(
-                    sdk=sdk,
-                    router=router,
+            if self._weekly_stop_due_utc():
+                await self._perform_weekly_stop(
                     logger=logger,
                     monitor_card=monitor_card,
-                    used_network_fee=used_network_fee,
-                    used_swap_fee=used_swap_fee,
                     result=result,
                 )
                 return
@@ -3530,14 +3541,10 @@ class AutoswapBot:
                     prepared_run=prepared_run,
                     result=result,
                 )
-                if self._weekly_refill_due_utc():
-                    await self._perform_weekly_refill_to_cc(
-                        sdk=sdk,
-                        router=router,
+                if self._weekly_stop_due_utc():
+                    await self._perform_weekly_stop(
                         logger=logger,
                         monitor_card=monitor_card,
-                        used_network_fee=used_network_fee,
-                        used_swap_fee=used_swap_fee,
                         result=result,
                     )
                     return
@@ -3592,14 +3599,10 @@ class AutoswapBot:
     ) -> None:
         for scheduled_round in schedule:
             self._raise_if_stop_requested()
-            if self._weekly_refill_due_utc():
-                await self._perform_weekly_refill_to_cc(
-                    sdk=sdk,
-                    router=router,
+            if self._weekly_stop_due_utc():
+                await self._perform_weekly_stop(
                     logger=logger,
                     monitor_card=monitor_card,
-                    used_network_fee=used_network_fee,
-                    used_swap_fee=used_swap_fee,
                     result=result,
                 )
                 return
@@ -3619,14 +3622,10 @@ class AutoswapBot:
                 prepared_run=prepared_run,
                 result=result,
             )
-            if self._weekly_refill_due_utc():
-                await self._perform_weekly_refill_to_cc(
-                    sdk=sdk,
-                    router=router,
+            if self._weekly_stop_due_utc():
+                await self._perform_weekly_stop(
                     logger=logger,
                     monitor_card=monitor_card,
-                    used_network_fee=used_network_fee,
-                    used_swap_fee=used_swap_fee,
                     result=result,
                 )
                 return
@@ -3677,14 +3676,10 @@ class AutoswapBot:
                     f"⏳ Next swap in {int(wait_seconds)}s",
                 )
                 await self._sleep_or_stop(wait_seconds)
-                if self._weekly_refill_due_utc():
-                    await self._perform_weekly_refill_to_cc(
-                        sdk=sdk,
-                        router=router,
+                if self._weekly_stop_due_utc():
+                    await self._perform_weekly_stop(
                         logger=logger,
                         monitor_card=monitor_card,
-                        used_network_fee=used_network_fee,
-                        used_swap_fee=used_swap_fee,
                         result=result,
                     )
                     return
@@ -3725,14 +3720,10 @@ class AutoswapBot:
                     prepared_run=prepared_run,
                     result=result,
                 )
-                if self._weekly_refill_due_utc():
-                    await self._perform_weekly_refill_to_cc(
-                        sdk=sdk,
-                        router=router,
+                if self._weekly_stop_due_utc():
+                    await self._perform_weekly_stop(
                         logger=logger,
                         monitor_card=monitor_card,
-                        used_network_fee=used_network_fee,
-                        used_swap_fee=used_swap_fee,
                         result=result,
                     )
                     return
@@ -3847,11 +3838,11 @@ class AutoswapBot:
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
     ) -> None:
-        if self._weekly_refill_due_utc():
-            logger.info("Weekly refill jatuh tempo; tidak menunggu quota harian")
+        if self._weekly_stop_due_utc():
+            logger.info("Weekly stop jatuh tempo; tidak menunggu quota harian")
             await self.monitor.log_event(
                 monitor_card,
-                "🗓️ Weekly refill due, skip daily quota wait",
+                "🛑 Weekly stop due, skip daily quota wait",
                 force=True,
             )
             return
@@ -4099,13 +4090,13 @@ class AutoswapBot:
             target_minimum = prepared_run.rounds
 
         while True:
-            if self._weekly_refill_due_utc():
+            if self._weekly_stop_due_utc():
                 logger.info(
-                    "Weekly refill jatuh tempo saat menunggu activity; keluar dari wait activity"
+                    "Weekly stop jatuh tempo saat menunggu activity; keluar dari wait activity"
                 )
                 await self.monitor.log_event(
                     monitor_card,
-                    "🗓️ Weekly refill due, leaving activity wait",
+                    "🛑 Weekly stop due, leaving activity wait",
                     force=True,
                 )
                 return max(min(previous_completed_rounds, prepared_run.rounds), 0)
@@ -4412,7 +4403,98 @@ class AutoswapBot:
         return (
             "cantex-rewards" in counterparty_text
             or "cantex app rebate" in message_text
+            or "rebate" in counterparty_text
+            or "rebate" in message_text
+            or "reward" in counterparty_text
+            or "reward" in message_text
         )
+
+    def _extract_external_funding_total_from_funding_history(self, payload: Any) -> str | None:
+        if payload is None:
+            return None
+
+        total = Decimal("0")
+        found = False
+        for item in self._extract_funding_history_items(payload):
+            if not self._is_external_cc_funding_item(item):
+                continue
+            amount = self._extract_funding_amount_decimal(item)
+            if amount is None:
+                continue
+            total += abs(amount)
+            found = True
+
+        if not found:
+            return None
+        return f"{self._compact_decimal_text(total, places=4)} CC"
+
+    def _is_external_cc_funding_item(self, item: dict[str, Any]) -> bool:
+        if self._is_failed_history_item(item):
+            return False
+        if self._is_distributed_reward_funding_item(item):
+            return False
+
+        type_text = str(
+            self._find_value(item, {"type", "transaction_type", "kind"}) or ""
+        ).strip().lower()
+        if type_text and "deposit" not in type_text:
+            return False
+
+        status_text = str(
+            self._find_value(item, {"status", "state", "result"}) or ""
+        ).strip().lower()
+        if status_text and not any(
+            token in status_text for token in ("complete", "completed", "confirm", "success", "paid")
+        ):
+            return False
+
+        symbol = self._extract_funding_symbol(item)
+        if symbol is not None and symbol != CC_SYMBOL:
+            return False
+
+        amount = self._extract_funding_amount_decimal(item)
+        return amount is not None and amount > Decimal("0")
+
+    def _extract_funding_symbol(self, item: dict[str, Any]) -> str | None:
+        raw_symbol = self._find_value(
+            item,
+            {
+                "instrument_symbol",
+                "instrumentSymbol",
+                "token_symbol",
+                "tokenSymbol",
+                "symbol",
+                "token",
+                "instrument",
+                "token_instrument_id",
+                "tokenInstrumentId",
+            },
+        )
+        if isinstance(raw_symbol, dict):
+            raw_symbol = self._find_value(
+                raw_symbol,
+                {
+                    "instrument_symbol",
+                    "instrumentSymbol",
+                    "token_symbol",
+                    "tokenSymbol",
+                    "symbol",
+                    "instrument_id",
+                    "instrumentId",
+                },
+        )
+        symbol = self._history_symbol(raw_symbol)
+        normalized_symbol = str(symbol or "").strip().lower()
+        if normalized_symbol in {"cc", "amulet", "canton coin"} or "canton coin" in normalized_symbol:
+            return CC_SYMBOL
+        return symbol
+
+    def _extract_funding_amount_decimal(self, item: dict[str, Any]) -> Decimal | None:
+        raw_amount = self._find_value(
+            item,
+            {"amount", "display_amount", "cc_amount", "amount_cc", "quantity"},
+        )
+        return self._parse_decimal_like(raw_amount)
 
     def _extract_funding_amount_text(self, item: dict[str, Any]) -> str | None:
         raw_amount = self._find_value(
@@ -4702,6 +4784,7 @@ class AutoswapBot:
         distributed_reward, distributed_update_id, distributed_timestamp = (
             self._extract_distributed_reward_from_funding_history(funding_payload)
         )
+        funding_total = self._extract_external_funding_total_from_funding_history(funding_payload)
         raw_preview = json.dumps(effective_payload, default=str)[:400]
         return ActivitySummary(
             source_path=source_path,
@@ -4718,6 +4801,7 @@ class AutoswapBot:
             distributed_reward=distributed_reward,
             distributed_update_id=distributed_update_id,
             distributed_timestamp=distributed_timestamp,
+            funding_total=funding_total,
             rebates=rebates,
             recent_items=tuple(recent_items[: self.config.runtime.activity_items_limit]),
             raw_preview=raw_preview,
@@ -4764,6 +4848,7 @@ class AutoswapBot:
         distributed_reward, distributed_update_id, distributed_timestamp = (
             self._extract_distributed_reward_from_funding_history(funding_payload)
         )
+        funding_total = self._extract_external_funding_total_from_funding_history(funding_payload)
 
         return ActivitySummary(
             source_path=source_path,
@@ -4787,6 +4872,7 @@ class AutoswapBot:
             distributed_reward=distributed_reward,
             distributed_update_id=distributed_update_id,
             distributed_timestamp=distributed_timestamp,
+            funding_total=funding_total,
             rebates=rebates,
             recent_items=tuple(recent_items[: self.config.runtime.activity_items_limit]),
             raw_preview=raw_preview,
@@ -4959,6 +5045,8 @@ class AutoswapBot:
                 summary.distributed_update_id or "-",
                 summary.distributed_timestamp or "-",
             )
+        if summary.funding_total is not None:
+            logger.info("External funding total | amount=%s", summary.funding_total)
         for item in summary.recent_items:
             logger.info("Trading recent | %s", item)
 
@@ -5055,6 +5143,7 @@ class AutoswapBot:
             "MIN_TICKET_SIZE": "Round di-skip karena nominal di bawah minimum ticket size",
             "USER_CONFIG_MIN_NOT_MET": "Round di-skip karena nominal belum memenuhi amount minimum",
             "ROUND_STOPPED": "Eksekusi berhenti di tengah sesi",
+            "WEEKLY_STOP": "Weekly stop Senin UTC tercapai; bot berhenti tanpa refill",
             "WEEKLY_REFILL_COMPLETE": "Weekly refill Senin UTC selesai; semua akun berhenti",
             "WEEKLY_REFILL_INCOMPLETE": "Weekly refill Senin UTC berhenti dengan sisa token non-CC",
         }

@@ -124,7 +124,7 @@ swap_delay_seconds = { min = 20.0, max = 100.0 }
 max_network_fee_cc_per_execution = "0.12"
 network_fee_poll_seconds = { min = 20.0, max = 40.0 }
 full_24h_auto_restart = true
-weekly_refill_on_monday_utc = true
+weekly_stop_on_monday_utc = true
 telegram_enabled = false
 terminal_dashboard_enabled = true
 terminal_dashboard_logs_limit = 20
@@ -194,11 +194,12 @@ auto_create_intent_account = true
 - `full_24h_auto_restart`
   - Jika `true`, setelah sesi harian selesai bot akan lanjut ke hari UTC berikutnya
 
-- `weekly_refill_on_monday_utc`
-  - Jika `true`, saat masuk hari Senin UTC bot berhenti membuat round baru
-  - Bot akan refill semua token non-CC (`USDCx`, `CBTC`) kembali ke `CC`
-  - Refill tetap mematuhi `max_network_fee_cc_per_execution`
-  - Setelah semua akun selesai refill ke `CC`, bot berhenti total
+- `weekly_stop_on_monday_utc`
+  - Jika `true`, bot yang sedang berjalan akan berhenti saat memasuki hari Senin UTC
+  - Bot tidak melakukan refill otomatis pada weekly stop
+  - Jika bot dijalankan ulang pada hari Senin UTC, bot berjalan normal
+  - Refill manual tetap tersedia lewat mode `6`
+  - Config lama `weekly_refill_on_monday_utc` masih dibaca sebagai fallback
 
 - `full_24h_min_gap_minutes`
   - Jarak minimum antar jadwal swap pada mode 24 jam
@@ -436,7 +437,8 @@ Perilaku umum mode 24 jam:
 - pada mode `planned`, target sesi adalah selesai sebelum `00:00 UTC`
 - pada mode non-plan, bot terus mencoba sampai quota `rounds` sukses terpenuhi; jika quota selesai lebih cepat dan `full_24h_auto_restart = true`, bot akan idle sampai `00:00 UTC` berikutnya
 - jika `full_24h_auto_restart = true`, sesi berikutnya dimulai lagi untuk hari UTC berikutnya
-- jika `weekly_refill_on_monday_utc = true`, auto restart harian berhenti saat hari Senin UTC; bot masuk weekly refill ke `CC`, lalu berhenti total
+- jika `weekly_stop_on_monday_utc = true`, bot yang sedang berjalan akan stop saat memasuki hari Senin UTC tanpa refill otomatis
+- jika bot dijalankan ulang pada hari Senin UTC, bot berjalan normal lagi sesuai mode yang dipilih
 - jatah `3x free fee swap` harian per account akan reset saat hari UTC berganti, tetapi baru boleh dipakai mulai `01:00 UTC`
 - jadi bot tidak akan memakai free swap tepat setelah `00:00 UTC`, melainkan menunggu `+1 jam`
 - `max_network_fee_cc_per_execution` berlaku untuk semua swap normal, recovery, refill, dan hop lanjutan
@@ -502,6 +504,7 @@ Isi pesan gabungan per account meliputi:
 - metrik `24h`
 - reward `yesterday`
 - reward `this week`
+- funding masuk non-reward/non-rebate
 - gas fee hari ini
 - progress `free swap`
 - ringkasan update terbaru tanpa mengirim dashboard terminal mentah
@@ -544,16 +547,18 @@ Catatan:
 
 ## Sumber Activity
 
-Saat inspeksi frontend Cantex secara langsung, data activity akun dan history trading yang dipakai bot mengikuti endpoint berikut:
+Saat inspeksi frontend Cantex secara langsung, data activity akun dan history yang dipakai bot mengikuti endpoint berikut:
 
 - `https://api.cantex.io/v1/account/reward_activity`
 - `https://api.cantex.io/v1/history/trading`
+- `https://api.cantex.io/v1/history/funding`
 
 Bot memakai endpoint ini untuk:
 
 - `24h swaps`
 - `24h volume`
 - `CC rebates` seperti `Yesterday` dan `This Week`
+- total `Funding` per account dari deposit `CC` masuk, dengan reward distribution/rebates dikeluarkan dari hitungan
 - sinkronisasi progress round dari `count_24h` activity sebagai satu-satunya sumber batas round harian
 - sinkronisasi history trading harian untuk jatah `3x free fee swap`
 

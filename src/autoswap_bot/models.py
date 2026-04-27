@@ -92,6 +92,7 @@ class ActivitySummary:
     distributed_reward: str | None = None
     distributed_update_id: str | None = None
     distributed_timestamp: str | None = None
+    funding_total: str | None = None
     rebates: dict[str, str] = field(default_factory=dict)
     recent_items: tuple[str, ...] = ()
     raw_preview: str | None = None
@@ -117,4 +118,12 @@ class AccountResult:
 
     @property
     def ok(self) -> bool:
-        return self.error is None and not self.aborted and self.stop_reason is None
+        normal_stop_reasons = {
+            "WEEKLY_STOP",
+            "WEEKLY_REFILL_COMPLETE",
+        }
+        return (
+            self.error is None
+            and not self.aborted
+            and (self.stop_reason is None or self.stop_reason in normal_stop_reasons)
+        )
