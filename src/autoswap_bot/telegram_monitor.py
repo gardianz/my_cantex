@@ -709,9 +709,9 @@ class TelegramMonitor:
 
     def _dashboard_progress(self, card: TelegramCardState) -> str:
         completed_total = self._progress_completed_total(card)
-        current_round = max(card.current_round_number, completed_total)
-        ok_total = self._current_day_ok_tx_total(card)
-        return f"R{current_round}/{card.total_rounds} ok{ok_total}"
+        activity_24h_count = self._activity_24h_swap_count(card.activity_summary)
+        ok_total = activity_24h_count if activity_24h_count is not None else completed_total
+        return f"R{completed_total}/{card.total_rounds} ok{ok_total}"
 
     def _dashboard_plan(self, card: TelegramCardState) -> str:
         strategy = self._build_strategy_line(card).split(":", 1)[-1].strip()
@@ -1582,7 +1582,15 @@ class TelegramMonitor:
         return merged
 
     def _progress_completed_total(self, card: TelegramCardState) -> int:
-        return max(card.progress_completed_base, 0) + max(card.swap_transactions, 0)
+        return max(card.progress_completed_base, 0)
+
+    def _activity_24h_swap_count(self, summary: ActivitySummary | None) -> int | None:
+        if summary is None:
+            return None
+        decimal_value = self._to_decimal_like(summary.swaps_24h)
+        if decimal_value is None:
+            return None
+        return max(int(decimal_value), 0)
 
     def _current_day_swap_total(self, card: TelegramCardState) -> int:
         return card.daily_swap_base + max(card.swap_transactions - card.day_session_swap_offset, 0)
