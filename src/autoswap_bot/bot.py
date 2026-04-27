@@ -305,7 +305,7 @@ class AutoswapBot:
                 used_network_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 used_swap_fee: defaultdict[str, Decimal] = defaultdict(Decimal)
                 strategy_state = StrategyRuntimeState()
-                if self._weekly_refill_due_utc():
+                if self._startup_mode_is_refill_cc() or self._weekly_refill_due_utc():
                     await self._perform_weekly_refill_to_cc(
                         sdk=sdk,
                         router=router,
@@ -3438,12 +3438,28 @@ class AutoswapBot:
                 prepared_run=prepared_run,
                 result=result,
             )
+            if self._weekly_refill_due_utc():
+                await self._perform_weekly_refill_to_cc(
+                    sdk=sdk,
+                    router=router,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    used_network_fee=used_network_fee,
+                    used_swap_fee=used_swap_fee,
+                    result=result,
+                )
+                return
             if result.completed_rounds >= prepared_run.rounds:
                 await self._wait_until_next_utc_day_after_quota(
                     logger=logger,
                     monitor_card=monitor_card,
                 )
-                return
+                self._reset_result_round_progress_for_new_activity_window(
+                    account=account,
+                    prepared_run=prepared_run,
+                    result=result,
+                )
+                continue
             current_round_number = result.completed_rounds + 1
 
             if self._startup_mode_is_free_only():
@@ -3514,12 +3530,28 @@ class AutoswapBot:
                     prepared_run=prepared_run,
                     result=result,
                 )
+                if self._weekly_refill_due_utc():
+                    await self._perform_weekly_refill_to_cc(
+                        sdk=sdk,
+                        router=router,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                        used_network_fee=used_network_fee,
+                        used_swap_fee=used_swap_fee,
+                        result=result,
+                    )
+                    return
                 if result.completed_rounds >= prepared_run.rounds:
                     await self._wait_until_next_utc_day_after_quota(
                         logger=logger,
                         monitor_card=monitor_card,
                     )
-                    return
+                    self._reset_result_round_progress_for_new_activity_window(
+                        account=account,
+                        prepared_run=prepared_run,
+                        result=result,
+                    )
+                    continue
                 await self._sleep_after_direct_24h_success(
                     logger=logger,
                     monitor_card=monitor_card,
@@ -3587,10 +3619,26 @@ class AutoswapBot:
                 prepared_run=prepared_run,
                 result=result,
             )
+            if self._weekly_refill_due_utc():
+                await self._perform_weekly_refill_to_cc(
+                    sdk=sdk,
+                    router=router,
+                    logger=logger,
+                    monitor_card=monitor_card,
+                    used_network_fee=used_network_fee,
+                    used_swap_fee=used_swap_fee,
+                    result=result,
+                )
+                return
             if result.completed_rounds >= prepared_run.rounds:
                 await self._wait_until_next_utc_day_after_quota(
                     logger=logger,
                     monitor_card=monitor_card,
+                )
+                self._reset_result_round_progress_for_new_activity_window(
+                    account=account,
+                    prepared_run=prepared_run,
+                    result=result,
                 )
                 return
             now_utc = datetime.now(timezone.utc)
@@ -3677,10 +3725,26 @@ class AutoswapBot:
                     prepared_run=prepared_run,
                     result=result,
                 )
+                if self._weekly_refill_due_utc():
+                    await self._perform_weekly_refill_to_cc(
+                        sdk=sdk,
+                        router=router,
+                        logger=logger,
+                        monitor_card=monitor_card,
+                        used_network_fee=used_network_fee,
+                        used_swap_fee=used_swap_fee,
+                        result=result,
+                    )
+                    return
                 if result.completed_rounds >= prepared_run.rounds:
                     await self._wait_until_next_utc_day_after_quota(
                         logger=logger,
                         monitor_card=monitor_card,
+                    )
+                    self._reset_result_round_progress_for_new_activity_window(
+                        account=account,
+                        prepared_run=prepared_run,
+                        result=result,
                     )
                     return
             elif not round_result.skipped and round_result.stop_reason is not None:
@@ -3783,6 +3847,14 @@ class AutoswapBot:
         logger: AccountLoggerAdapter,
         monitor_card: TelegramCardState | None,
     ) -> None:
+        if self._weekly_refill_due_utc():
+            logger.info("Weekly refill jatuh tempo; tidak menunggu quota harian")
+            await self.monitor.log_event(
+                monitor_card,
+                "🗓️ Weekly refill due, skip daily quota wait",
+                force=True,
+            )
+            return
         now_utc = datetime.now(timezone.utc)
         next_midnight_utc = self._next_utc_midnight(now_utc)
         wait_seconds = max(0.0, (next_midnight_utc - now_utc).total_seconds())
@@ -3805,6 +3877,22 @@ class AutoswapBot:
             force=True,
         )
         await self._sleep_or_stop(wait_seconds)
+
+    def _reset_result_round_progress_for_new_activity_window(
+        self,
+        *,
+        account: AccountConfig,
+        prepared_run: PreparedAccountRun,
+        result: AccountResult,
+    ) -> None:
+        result.completed_rounds = 0
+        result.swap_transactions = 0
+        self.runtime_state.update_round_session_progress(
+            account.name,
+            strategy_name=prepared_run.strategy_name,
+            requested_rounds=prepared_run.rounds,
+            completed_rounds=0,
+        )
 
     async def _sleep_after_direct_24h_success(
         self,
@@ -3877,6 +3965,7 @@ class AutoswapBot:
             "free_then_swap": "free-then-swap",
             "swap_only": "swap-only",
             "planned_fee": "planned-fee",
+            "refill_cc": "refill-cc",
         }
         return labels.get(self.startup_mode, self.startup_mode)
 
@@ -3885,6 +3974,9 @@ class AutoswapBot:
 
     def _startup_mode_is_free_only(self) -> bool:
         return self.startup_mode == "free_only"
+
+    def _startup_mode_is_refill_cc(self) -> bool:
+        return self.startup_mode == "refill_cc"
 
     def _startup_mode_uses_free_swap(self) -> bool:
         return self.startup_mode in {"free_only", "free_then_swap"}
@@ -4007,6 +4099,17 @@ class AutoswapBot:
             target_minimum = prepared_run.rounds
 
         while True:
+            if self._weekly_refill_due_utc():
+                logger.info(
+                    "Weekly refill jatuh tempo saat menunggu activity; keluar dari wait activity"
+                )
+                await self.monitor.log_event(
+                    monitor_card,
+                    "🗓️ Weekly refill due, leaving activity wait",
+                    force=True,
+                )
+                return max(min(previous_completed_rounds, prepared_run.rounds), 0)
+
             synced_completed_rounds = await self._sync_round_progress_from_activity(
                 sdk=sdk,
                 account=account,

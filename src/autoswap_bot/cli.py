@@ -19,6 +19,7 @@ STARTUP_MODE_CHOICES = {
     "3": "swap_only",
     "4": "planned_fee",
     "5": "estimate_cc",
+    "6": "refill_cc",
 }
 
 
@@ -39,9 +40,10 @@ def _prompt_startup_mode() -> str:
     print("3. Mode swap sesuai batas swap dan fee swap yang ditentukan", flush=True)
     print("4. Mode swap sesuai jam plan dan batas fee yang ditentukan", flush=True)
     print("5. Mode hitung estimasi kebutuhan CC dari config saat ini", flush=True)
+    print("6. Mode refill semua token selain CC ke CC lalu berhenti", flush=True)
 
     while True:
-        print("Masukkan pilihan (1/2/3/4/5): ", end="", flush=True)
+        print("Masukkan pilihan (1/2/3/4/5/6): ", end="", flush=True)
         try:
             answer = input().strip()
         except EOFError:

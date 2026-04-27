@@ -13,7 +13,7 @@ Fitur utama:
 - Optimasi route `direct` vs `1-hop`
 - Progress round disinkronkan dari activity 24h Cantex; `1 swap sukses = 1 round selesai`
 - Bot selalu berjalan dalam mode 24 jam berbasis UTC
-- Saat start bot selalu meminta pilihan mode startup `1-4`
+- Saat start bot selalu meminta pilihan mode startup `1-6`
 - Monitor Telegram gabungan dalam 1 pesan
 - Dashboard terminal live berbentuk tabel per account
 - Best-effort fetch activity user dari endpoint web Cantex
@@ -393,13 +393,14 @@ Catatan:
 
 Bot sekarang selalu berjalan dalam mode 24 jam.
 
-Saat bot dijalankan, akan muncul 5 pilihan mode startup:
+Saat bot dijalankan, akan muncul 6 pilihan mode startup:
 
 1. `Mode hanya ambil free swap`
 2. `Mode ambil free swap lalu lanjut swap sesuai batas swap dan fee swap yang ditentukan`
 3. `Mode swap sesuai batas swap dan fee swap yang ditentukan`
 4. `Mode swap sesuai jam plan dan batas fee yang ditentukan`
 5. `Mode hitung estimasi kebutuhan CC dari config saat ini`
+6. `Mode refill semua token selain CC ke CC lalu berhenti`
 
 Arti mode:
 
@@ -423,6 +424,11 @@ Arti mode:
   - Estimasi memakai angka konservatif
   - Benefit `free swap` harian tidak dikurangkan
   - Network fee runtime memakai data quote swap sebagai sumber utama karena fee real dari history/funding sering telat atau tidak lengkap
+- Mode `6`
+  - Bot tidak menjalankan round harian
+  - Bot langsung swap semua token non-CC (`USDCx`, `CBTC`) ke `CC`
+  - Refill tetap mematuhi `max_network_fee_cc_per_execution`
+  - Setelah refill selesai atau tidak bisa lanjut, bot berhenti
 
 Perilaku umum mode 24 jam:
 
