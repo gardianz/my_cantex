@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 
 DAILY_FREE_FEE_SWAP_LIMIT = 3
 DAILY_FREE_FEE_WINDOW_HOUR_UTC = 1
+MAX_DAILY_TRADING_HISTORY_UPDATE_IDS = 1000
 
 
 @dataclass
@@ -20,6 +21,8 @@ class AccountRuntimeState:
     active_requested_rounds: int = 0
     active_completed_rounds: int = 0
     active_updated_at_utc: str = ""
+    trading_history_utc_date: str = ""
+    trading_history_update_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -204,6 +207,39 @@ class BotRuntimeStateStore:
             resumed=normalized_completed > 0,
         )
 
+    def sync_daily_trading_history_update_ids(
+        self,
+        account_name: str,
+        update_ids: set[str],
+        *,
+        now_utc: datetime | None = None,
+    ) -> int:
+        self._load()
+        normalized_now = self._normalize_now(now_utc)
+        today = normalized_now.date().isoformat()
+        state = self._normalized_state(account_name, normalized_now, persist=False)
+        existing_ids = (
+            set(state.trading_history_update_ids)
+            if state.trading_history_utc_date == today
+            else set()
+        )
+        cleaned_new_ids = {str(update_id).strip() for update_id in update_ids if str(update_id).strip()}
+        merged_ids = existing_ids | cleaned_new_ids
+        if len(merged_ids) > MAX_DAILY_TRADING_HISTORY_UPDATE_IDS:
+            merged_list = sorted(merged_ids)[-MAX_DAILY_TRADING_HISTORY_UPDATE_IDS:]
+        else:
+            merged_list = sorted(merged_ids)
+        should_save = (
+            state.trading_history_utc_date != today
+            or state.trading_history_update_ids != merged_list
+        )
+        state.trading_history_utc_date = today
+        state.trading_history_update_ids = merged_list
+        self._accounts[account_name] = state
+        if should_save:
+            self._save()
+        return len(merged_list)
+
     def clear_round_session(
         self,
         account_name: str,
@@ -259,6 +295,12 @@ class BotRuntimeStateStore:
                 active_requested_rounds=max(int(payload.get("active_requested_rounds", 0)), 0),
                 active_completed_rounds=max(int(payload.get("active_completed_rounds", 0)), 0),
                 active_updated_at_utc=str(payload.get("active_updated_at_utc", "")),
+                trading_history_utc_date=str(payload.get("trading_history_utc_date", "")),
+                trading_history_update_ids=[
+                    str(update_id)
+                    for update_id in payload.get("trading_history_update_ids", [])
+                    if str(update_id).strip()
+                ],
             )
 
     def _normalized_state(
@@ -279,6 +321,8 @@ class BotRuntimeStateStore:
                 active_requested_rounds=0,
                 active_completed_rounds=0,
                 active_updated_at_utc="",
+                trading_history_utc_date=today,
+                trading_history_update_ids=[],
             )
             self._accounts[account_name] = state
             if persist:
@@ -289,7 +333,7 @@ class BotRuntimeStateStore:
 
     def _save(self) -> None:
         payload = {
-            "version": 3,
+            "version": 4,
             "daily_free_fee_swap_limit": DAILY_FREE_FEE_SWAP_LIMIT,
             "window_hour_utc": DAILY_FREE_FEE_WINDOW_HOUR_UTC,
             "accounts": {
@@ -301,6 +345,8 @@ class BotRuntimeStateStore:
                     "active_requested_rounds": state.active_requested_rounds,
                     "active_completed_rounds": state.active_completed_rounds,
                     "active_updated_at_utc": state.active_updated_at_utc,
+                    "trading_history_utc_date": state.trading_history_utc_date,
+                    "trading_history_update_ids": state.trading_history_update_ids,
                 }
                 for account_name, state in sorted(self._accounts.items())
             },

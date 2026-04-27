@@ -567,6 +567,13 @@ Bot memakai endpoint ini untuk:
 
 Jika data history trading belum tersedia atau belum terindeks setelah swap sukses, bot menunggu sampai history trading update sebelum membuat round berikutnya.
 
+Catatan limit history trading:
+
+- endpoint `/v1/history/trading` saat ini mengembalikan 50 row terbaru
+- swap `USDCx <-> CBTC` muncul sebagai 2 row leg dengan `update_id` sama, sehingga 50 row biasanya berarti 25 swap unik
+- bot menyimpan rolling cache `update_id` harian di state lokal agar target seperti `rounds = 26` tetap bisa lewat dari batas 25 swap unik terbaru
+- jika bot baru pertama kali dinyalakan setelah history API sudah melewati 25 swap unik dan state lokal kosong, bot tetap hanya bisa melihat window terbaru dari API
+
 ## File State Lokal
 
 Bot menyimpan state lokal di folder `config/`:
@@ -575,6 +582,7 @@ Bot menyimpan state lokal di folder `config/`:
   - menyimpan jatah `3x free fee swap` harian per account
   - dipakai sebagai fallback lokal dan cache sinkronisasi
   - progress round harian tidak memakai activity sebagai batas; bot menunggu history trading harian tersedia/update
+  - menyimpan rolling cache `update_id` history trading harian agar progress tidak mentok di batas 25 swap unik terbaru
   - reset harian mengikuti UTC
   - window pemakaian free swap tetap baru terbuka pada `01:00 UTC`
 - `.autoswap_telegram_state.json`

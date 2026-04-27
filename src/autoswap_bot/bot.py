@@ -4371,12 +4371,23 @@ class AutoswapBot:
             )
             return None
 
+        cached_history_count: int | None = None
+        history_today_trade_keys = self._today_trading_history_trade_keys(history_payload)
+        if history_today_trade_keys is not None:
+            cached_history_count = self.runtime_state.sync_daily_trading_history_update_ids(
+                account.name,
+                history_today_trade_keys,
+            )
+        effective_history_count = max(
+            history_today_count,
+            cached_history_count if cached_history_count is not None else 0,
+        )
         await self.monitor.sync_daily_ok_tx_from_history(
             monitor_card,
-            ok_tx_count=history_today_count,
+            ok_tx_count=effective_history_count,
             force=force_log,
         )
-        synced_completed_rounds = min(max(history_today_count, 0), prepared_run.rounds)
+        synced_completed_rounds = min(max(effective_history_count, 0), prepared_run.rounds)
         self.runtime_state.update_round_session_progress(
             account.name,
             strategy_name=prepared_run.strategy_name,
@@ -4390,9 +4401,10 @@ class AutoswapBot:
         )
         if force_log or synced_completed_rounds != previous_completed_rounds:
             logger.info(
-                "Round sync | source=%s | trading_swap_today=%s | progress=%s/%s",
+                "Round sync | source=%s | trading_swap_today=%s | cached_today=%s | progress=%s/%s",
                 source_path or "-",
                 history_today_count,
+                cached_history_count if cached_history_count is not None else "-",
                 synced_completed_rounds,
                 prepared_run.rounds,
             )
@@ -4461,14 +4473,36 @@ class AutoswapBot:
         return max(int(count), 0)
 
     def _count_today_trading_history_swaps(self, payload: Any) -> int | None:
+        identified_trade_keys = self._today_trading_history_trade_keys(payload)
+        if identified_trade_keys is not None:
+            return len(identified_trade_keys)
+
         items = self._extract_trading_history_items(payload)
         if not items:
             if self._payload_has_empty_collection(payload):
                 return 0
             return None
         today_utc = datetime.now(timezone.utc).date()
-        identified_trade_keys: set[str] = set()
         fallback_count = 0
+        for item in items:
+            timestamp = self._extract_item_timestamp(item)
+            if timestamp is None or timestamp.date() != today_utc:
+                continue
+            if self._is_failed_history_item(item):
+                continue
+            trade_key = self._history_trade_key(item)
+            if trade_key is None:
+                fallback_count += 1
+        return fallback_count
+
+    def _today_trading_history_trade_keys(self, payload: Any) -> set[str] | None:
+        items = self._extract_trading_history_items(payload)
+        if not items:
+            if self._payload_has_empty_collection(payload):
+                return set()
+            return None
+        today_utc = datetime.now(timezone.utc).date()
+        identified_trade_keys: set[str] = set()
         for item in items:
             timestamp = self._extract_item_timestamp(item)
             if timestamp is None or timestamp.date() != today_utc:
@@ -4478,11 +4512,7 @@ class AutoswapBot:
             trade_key = self._history_trade_key(item)
             if trade_key is not None:
                 identified_trade_keys.add(trade_key)
-                continue
-            fallback_count += 1
-        if identified_trade_keys:
-            return len(identified_trade_keys)
-        return fallback_count
+        return identified_trade_keys if identified_trade_keys else None
 
     def _payload_has_empty_collection(self, payload: Any) -> bool:
         if payload in (None, ""):
